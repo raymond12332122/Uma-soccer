@@ -1,27 +1,56 @@
+class_name FootballPlayer
 extends CharacterBody3D
 
-# ---- Movement ----
-@export var base_speed: float = 5.0
-@export var sprint_speed: float = 8.5
+## Reusable entity for every player on the pitch -- human-controlled,
+## AI-controlled, or goalkeeper. This script owns movement/dribbling/
+## kicking simulation only. It never reads Input or InputState directly;
+## exactly one driver (PlayerController for the human, or TeamController/
+## AIController for everyone else) writes into the intent fields below
+## each physics frame, and this script simulates the result.
+
+# ---- Identity / team ----
+@export var player_data: PlayerData
+@export var team_id: int = 0
+@export var is_goalkeeper: bool = false
+
+## Normalized formation slot (see FormationManager), assigned by
+## MatchManager at spawn time and used by TeamController/AIController and
+## match-reset logic to know where this player belongs.
+var formation_slot: Vector2 = Vector2.ZERO
+
+# ---- Intent, written externally each physics frame ----
+var move_input: Vector2 = Vector2.ZERO
+var sprint_requested: bool = false
+var pass_requested: bool = false
+var shoot_held: bool = false
+
+# ---- Movement tunables (defaults; overridden by player_data in apply_player_data) ----
+var base_speed: float = 5.0
+var sprint_speed: float = 8.5
 @export var acceleration: float = 14.0
 @export var deceleration: float = 20.0
 @export var turn_lerp_speed: float = 12.0
 @export var gravity: float = 20.0
 
+@export var stamina_drain_rate: float = 18.0
+@export var stamina_regen_rate: float = 10.0
+var max_stamina: float = 100.0
+var current_stamina: float = 100.0
+
 # ---- Ball control / dribbling ----
 @export var dribble_distance: float = 0.9
-@export var dribble_accel: float = 24.0
+var dribble_accel: float = 24.0
 @export var dribble_damping_accel: float = 9.0
 @export var dribble_force_accel_clamp: float = 30.0
-@export var control_loss_angle_threshold: float = 1.2
+var control_loss_angle_threshold: float = 1.2
 @export var control_loss_speed_threshold: float = 2.5
 @export var control_loss_duration: float = 0.35
 @export var possession_release_cooldown: float = 0.35
 
 # ---- Pass / Shoot ----
-@export var pass_power: float = 2.4
-@export var shoot_min_power: float = 3.4
-@export var shoot_max_power: float = 7.0
+var pass_power: float = 2.4
+var shoot_min_power: float = 3.4
+var shoot_max_power: float = 7.0
 @export var shoot_charge_time: float = 1.1
 @export var kick_lift: float = 0.35
 @export var momentum_transfer: float = 0.25
@@ -29,6 +58,9 @@ extends CharacterBody3D
 @onready var action_area: Area3D = $ActionArea
 @onready var control_area: Area3D = $ControlArea
 @onready var model: Node3D = $Model
+@onready var mesh_instance: MeshInstance3D = $Model/MeshInstance3D
+@onready var name_label: Label3D = $NameLabel
+@onready var control_indicator: MeshInstance3D = $ControlIndicator
 
 var ball_in_action_range: RigidBody3D = null
 var ball_in_control_range: RigidBody3D = null
@@ -42,9 +74,6 @@ var _possession_cooldown_timer: float = 0.0
 var _shoot_charging: bool = false
 var _shoot_charge_elapsed: float = 0.0
 
-var _space_was_pressed: bool = false
-var _f_was_pressed: bool = false
-
 
 func _ready() -> void:
 	action_area.body_entered.connect(_on_action_area_entered)
@@ -52,13 +81,79 @@ func _ready() -> void:
 	control_area.body_entered.connect(_on_control_area_entered)
 	control_area.body_exited.connect(_on_control_area_exited)
 
+	if player_data:
+		apply_player_data(player_data)
+
+	if control_indicator:
+		control_indicator.visible = false
+
+
+func apply_player_data(data: PlayerData) -> void:
+	player_data = data
+	base_speed = data.movement_speed
+	sprint_speed = data.sprint_speed
+	acceleration = data.acceleration
+
+	max_stamina = data.stamina
+	current_stamina = max_stamina
+
+	pass_power = lerp(1.6, 3.2, data.passing / 100.0)
+	shoot_min_power = lerp(2.4, 4.2, data.shooting / 100.0)
+	shoot_max_power = lerp(5.0, 8.5, data.shooting / 100.0)
+	dribble_accel = lerp(16.0, 30.0, data.dribbling / 100.0)
+	control_loss_angle_threshold = lerp(0.9, 1.5, data.dribbling / 100.0)
+
+	if name_label:
+		name_label.text = data.display_name
+
+	if control_area:
+		var shape_node: CollisionShape3D = control_area.get_node("CollisionShape3D")
+		if shape_node and shape_node.shape:
+			var shape: SphereShape3D = shape_node.shape.duplicate()
+			shape.radius = lerp(0.95, 1.35, data.defensive_ability / 100.0)
+			shape_node.shape = shape
+
+
+func set_team_color(color: Color) -> void:
+	if mesh_instance == null:
+		return
+	var mat: StandardMaterial3D = mesh_instance.get_surface_override_material(0)
+	if mat == null:
+		mat = StandardMaterial3D.new()
+	else:
+		mat = mat.duplicate()
+	mat.albedo_color = color
+	mesh_instance.set_surface_override_material(0, mat)
+
+
+func set_controlled_visual(is_controlled: bool) -> void:
+	if control_indicator:
+		control_indicator.visible = is_controlled
+
+
+## Clears all input intent and cancels any in-progress shot charge. Called
+## when a player stops being human-controlled so it doesn't keep coasting
+## on stale input or fire a phantom shot mid-charge.
+func reset_intent() -> void:
+	move_input = Vector2.ZERO
+	sprint_requested = false
+	shoot_held = false
+	pass_requested = false
+	_shoot_charging = false
+	_shoot_charge_elapsed = 0.0
+
 
 func _physics_process(delta: float) -> void:
-	var input_vector: Vector2 = _get_move_input()
-	var sprinting: bool = _is_sprint_held() and input_vector.length() > 0.1
-	var target_speed: float = sprint_speed if sprinting else base_speed
+	var wants_sprint: bool = sprint_requested and move_input.length() > 0.1
+	var sprinting: bool = wants_sprint and current_stamina > 0.0
 
-	var direction := Vector3(input_vector.x, 0.0, input_vector.y)
+	if sprinting:
+		current_stamina = maxf(0.0, current_stamina - stamina_drain_rate * delta)
+	else:
+		current_stamina = minf(max_stamina, current_stamina + stamina_regen_rate * delta)
+
+	var target_speed: float = sprint_speed if sprinting else base_speed
+	var direction := Vector3(move_input.x, 0.0, move_input.y)
 
 	if direction.length() > 0.01:
 		var target_angle := atan2(direction.x, direction.z)
@@ -94,34 +189,9 @@ func _physics_process(delta: float) -> void:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
 
 
-func _get_move_input() -> Vector2:
-	var input_vector: Vector2 = InputState.move_vector
-	if input_vector == Vector2.ZERO:
-		input_vector = _keyboard_vector()
-	return input_vector.limit_length(1.0)
-
-
-func _keyboard_vector() -> Vector2:
-	var kb := Vector2.ZERO
-	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT):
-		kb.x += 1.0
-	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):
-		kb.x -= 1.0
-	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):
-		kb.y += 1.0
-	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP):
-		kb.y -= 1.0
-	return kb
-
-
-func _is_sprint_held() -> bool:
-	return InputState.sprint_held or Input.is_key_pressed(KEY_SHIFT)
-
-
 func _get_aim_direction() -> Vector3:
-	var input_vector: Vector2 = _get_move_input()
-	if input_vector.length() > 0.15:
-		return Vector3(input_vector.x, 0.0, input_vector.y).normalized()
+	if move_input.length() > 0.15:
+		return Vector3(move_input.x, 0.0, move_input.y).normalized()
 	return Vector3(sin(_facing_angle), 0.0, cos(_facing_angle))
 
 
@@ -161,23 +231,14 @@ func _update_possession(sprinting: bool) -> void:
 
 
 func _process_pass_input() -> void:
-	var f_now := Input.is_key_pressed(KEY_F)
-	var f_just_pressed := f_now and not _f_was_pressed
-	_f_was_pressed = f_now
-
-	var pass_requested := InputState.pass_pressed or f_just_pressed
-	InputState.pass_pressed = false
-
-	if not pass_requested or ball_in_action_range == null:
+	if not pass_requested:
 		return
-
-	_apply_kick_impulse(ball_in_action_range, pass_power, false)
+	pass_requested = false
+	execute_pass()
 
 
 func _process_shoot_input(delta: float) -> void:
-	var shoot_held_now := InputState.shoot_held or Input.is_key_pressed(KEY_SPACE)
-
-	if shoot_held_now:
+	if shoot_held:
 		if not _shoot_charging:
 			_shoot_charging = true
 			_shoot_charge_elapsed = 0.0
@@ -186,11 +247,23 @@ func _process_shoot_input(delta: float) -> void:
 	elif _shoot_charging:
 		_shoot_charging = false
 		var charge_ratio: float = _shoot_charge_elapsed / shoot_charge_time if shoot_charge_time > 0.0 else 1.0
-		var power: float = lerp(shoot_min_power, shoot_max_power, charge_ratio)
 		_shoot_charge_elapsed = 0.0
+		execute_shot(charge_ratio)
 
-		if ball_in_action_range != null:
-			_apply_kick_impulse(ball_in_action_range, power, true)
+
+## Public kick API -- used by the human charge-release flow above and
+## called directly by AIController for AI-driven passes/shots.
+func execute_pass() -> void:
+	if ball_in_action_range == null:
+		return
+	_apply_kick_impulse(ball_in_action_range, pass_power, false)
+
+
+func execute_shot(charge_ratio: float) -> void:
+	if ball_in_action_range == null:
+		return
+	var power: float = lerp(shoot_min_power, shoot_max_power, clampf(charge_ratio, 0.0, 1.0))
+	_apply_kick_impulse(ball_in_action_range, power, true)
 
 
 func _apply_kick_impulse(ball: RigidBody3D, power: float, is_shot: bool) -> void:

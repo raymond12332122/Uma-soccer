@@ -1,3 +1,4 @@
+class_name CameraController
 extends Node3D
 
 @export var target_path: NodePath
@@ -21,6 +22,17 @@ func _ready() -> void:
 		ball = get_node(ball_path)
 	if camera:
 		camera.position = base_camera_offset
+
+
+## Runtime retargeting -- used by MatchManager on player switch, since the
+## human-controlled player (and therefore the camera's follow target) can
+## change at any time.
+func set_target(node: Node3D) -> void:
+	target = node
+
+
+func set_ball(node: Node3D) -> void:
+	ball = node
 
 
 func _process(delta: float) -> void:

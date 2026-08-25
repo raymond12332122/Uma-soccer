@@ -1,3 +1,4 @@
+class_name BallController
 extends RigidBody3D
 
 @export var reset_height: float = -10.0

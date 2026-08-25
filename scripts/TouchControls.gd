@@ -4,6 +4,7 @@ extends CanvasLayer
 @onready var pass_button: Button = $PassButton
 @onready var shoot_button: Button = $ShootButton
 @onready var sprint_button: Button = $SprintButton
+@onready var switch_button: Button = $SwitchButton
 
 
 func _ready() -> void:
@@ -13,6 +14,7 @@ func _ready() -> void:
 	shoot_button.button_up.connect(_on_shoot_up)
 	sprint_button.button_down.connect(_on_sprint_down)
 	sprint_button.button_up.connect(_on_sprint_up)
+	switch_button.button_down.connect(_on_switch_pressed)
 
 
 func _on_joystick_vector_changed(vector: Vector2) -> void:
@@ -37,3 +39,7 @@ func _on_sprint_down() -> void:
 
 func _on_sprint_up() -> void:
 	InputState.sprint_held = false
+
+
+func _on_switch_pressed() -> void:
+	InputState.switch_pressed = true

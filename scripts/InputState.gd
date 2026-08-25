@@ -16,3 +16,8 @@ var shoot_held: bool = false
 
 # Continuous: true while the on-screen SPRINT button is held.
 var sprint_held: bool = false
+
+# One-shot: set true by TouchControls on tap, consumed (and reset) by
+# MatchManager on the next physics frame. Cycles the human-controlled
+# player.
+var switch_pressed: bool = false

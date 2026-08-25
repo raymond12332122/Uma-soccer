@@ -1,14 +1,16 @@
 extends Node3D
 
-# Headless gameplay smoke test. Drives the real Player/Ball/Field scenes
-# through InputState exactly as touch/keyboard input would, and asserts on
-# the resulting physics state. Not part of the shipped game (no autoload
-# references it, main_scene stays Main.tscn) -- run manually via:
+# Headless gameplay smoke test. Drives a real FootballPlayer through a
+# PlayerController exactly as touch/keyboard input would (via InputState),
+# and asserts on the resulting physics state. Validates that V0.2
+# mechanics (dribble/pass/shoot/clamp/reset) still work correctly through
+# the V0.3 FootballPlayer + PlayerController split. Not part of the
+# shipped game -- run manually via:
 #   godot --headless --path . tests/GameplayTest.tscn
 
 const FieldScene := preload("res://scenes/Field.tscn")
 const BallScene := preload("res://scenes/Ball.tscn")
-const PlayerScene := preload("res://scenes/Player.tscn")
+const PlayerScene := preload("res://scenes/FootballPlayer.tscn")
 
 var ok := true
 
@@ -21,13 +23,17 @@ func _run_tests() -> void:
 	var field = FieldScene.instantiate()
 	add_child(field)
 
-	var ball: RigidBody3D = BallScene.instantiate()
+	var ball: BallController = BallScene.instantiate()
 	ball.position = Vector3(0, 1, 0)
 	add_child(ball)
 
-	var player = PlayerScene.instantiate()
+	var player: FootballPlayer = PlayerScene.instantiate()
 	player.position = Vector3(0, 1, -3)
 	add_child(player)
+
+	var controller := PlayerController.new()
+	add_child(controller)
+	controller.set_controlled_player(player)
 
 	for i in range(5):
 		await get_tree().physics_frame
@@ -114,12 +120,50 @@ func _run_tests() -> void:
 			exceeded = true
 	_check("Ball never exceeds max_speed during flight/bounce", not exceeded)
 
-	# --- reset_ball() sanity (used by goal-scoring in Main.gd) ---
-	# Checked in the same frame as the call, before physics re-applies
-	# gravity for the next tick, so this isolates reset_ball()'s own effect.
+	# --- reset_ball() sanity (used by goal-scoring in MatchManager) ---
 	ball.reset_ball()
 	var reset_ok: bool = ball.global_position.distance_to(ball.spawn_position) < 0.05 and ball.linear_velocity.length() < 0.001
 	_check("Ball reset_ball() restores spawn position and zero velocity", reset_ok)
+
+	# --- switching mid-charge cancels the charge cleanly (no phantom shot) ---
+	# Isolated from earlier state: rest the ball, place `player` right next
+	# to it (in action range, not necessarily dribbling it), start a
+	# charge, switch away mid-charge, then confirm the ball never gets an
+	# impulse -- distinguishing a real fix from ambient dribble-force noise.
+	ball.reset_ball()
+	InputState.move_vector = Vector2.ZERO
+	InputState.shoot_held = false
+	for i in range(5):
+		await get_tree().physics_frame
+
+	player.global_position = ball.global_position + Vector3(0, 0, -0.8)
+	ball.linear_velocity = Vector3.ZERO
+	ball.angular_velocity = Vector3.ZERO
+	for i in range(15):
+		await get_tree().physics_frame
+
+	_check("Player is within action range of the ball for the switch test", player.ball_in_action_range == ball)
+
+	var player2: FootballPlayer = PlayerScene.instantiate()
+	player2.position = Vector3(20, 1, 20)
+	add_child(player2)
+	for i in range(3):
+		await get_tree().physics_frame
+
+	InputState.shoot_held = true
+	for i in range(15):
+		await get_tree().physics_frame
+	_check("Charge is in progress before switching", player._shoot_charging)
+
+	controller.set_controlled_player(player2)
+	InputState.shoot_held = false
+
+	var ball_speed_after_switch := 0.0
+	for i in range(20):
+		await get_tree().physics_frame
+		ball_speed_after_switch = maxf(ball_speed_after_switch, ball.linear_velocity.length())
+
+	_check("Switching away mid-charge does not fire a phantom shot", ball_speed_after_switch < 0.5)
 
 	print("TEST_SUMMARY: %s" % ("ALL PASS" if ok else "FAILURES PRESENT"))
 	get_tree().quit(0 if ok else 1)
