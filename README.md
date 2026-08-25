@@ -2,9 +2,10 @@
 
 A 3D soccer prototype built in Godot 4, aimed at an installable Android APK.
 This is the foundation for a much larger football game. Current milestone
-(v0.3): a real 3v3(+GK) team match — two squads, AI teammates and
-opponents, player switching, and a data-driven player/formation system —
-built on top of the v0.2 dribble/pass/shoot core.
+(v0.4): the first real 3D character model (Tokai Teio) integrated through a
+reusable asset pipeline, on top of the v0.3 3v3(+GK) team match (AI
+teammates/opponents, switching, data-driven formations) and the v0.2
+dribble/pass/shoot core.
 
 ## Tech Stack
 
@@ -30,6 +31,8 @@ Each system is a small, single-purpose script (no giant manager):
 | `BallController` | `scripts/BallController.gd` | Ball physics tuning, max-speed clamp, reset |
 | `CameraController` | `scripts/CameraController.gd` | Follow camera, retargetable at runtime (player switching) |
 | `MatchManager` | `scripts/MatchManager.gd` | Top-level orchestrator: spawns both squads, wires the above together, owns scoring/switching/restart |
+| `AnimationController` | `scripts/AnimationController.gd` | Owns whichever visual (real model or placeholder) is displayed for one `FootballPlayer`; translates gameplay state into animation/procedural motion |
+| `CharacterRegistry` | `scripts/data/CharacterRegistry.gd` | Data-driven map from a `PlayerData.visual_id` string to a character model scene |
 
 **How switching works:** `PlayerController` targets exactly one
 `FootballPlayer`. `TeamController` drives every player on its roster
@@ -52,6 +55,10 @@ underlying dribble physics resolves a contested ball.
 uma-soccer/
 ├── project.godot                 # Engine config (mobile renderer, autoloads)
 ├── export_presets.cfg            # Android export preset (arm64-v8a)
+├── assets/
+│   └── characters/
+│       ├── CREDITS.md             # License/attribution for every character model -- read before adding assets
+│       └── tokai_teio/            # First integrated model: tokai_teio.glb + its extracted textures
 ├── scenes/
 │   ├── Main.tscn                  # Entry scene: field, ball, players container, camera, UI
 │   ├── Field.tscn                  # Ground, boundary walls, goals, goal triggers
@@ -60,9 +67,11 @@ uma-soccer/
 │   └── UI/TouchControls.tscn       # Joystick + PASS/SHOOT/SPRINT/SWITCH buttons
 ├── scripts/
 │   ├── data/TestRoster.gd         # Small hand-built 3v3(+GK) test squads (PlayerData instances)
+│   ├── data/CharacterRegistry.gd  # visual_id -> character model scene
 │   ├── InputState.gd               # Autoload singleton bridging touch + gameplay
-│   ├── PlayerData.gd                # Per-character stat Resource
+│   ├── PlayerData.gd                # Per-character stat Resource (incl. visual_id)
 │   ├── FootballPlayer.gd            # Movement, dribbling, passing, shooting (shared by everyone)
+│   ├── AnimationController.gd        # Visual/animation for one player -- real model or fallback
 │   ├── PlayerController.gd          # Human input -> FootballPlayer intent
 │   ├── AIController.gd               # Offense/defense/GK decision logic
 │   ├── TeamController.gd             # Per-team AI driver + human-player exclusion
@@ -73,10 +82,13 @@ uma-soccer/
 │   ├── MatchManager.gd               # Spawns teams, wires systems, scoring/switch/restart
 │   ├── TouchControls.gd             # Wires HUD buttons/joystick to InputState
 │   └── JoystickBase.gd              # Virtual joystick drawing + input
+├── tools/
+│   └── inspect_character_model.gd / InspectCharacterModel.tscn  # Reusable pre-integration model inspector
 └── tests/                        # Headless automated tests (see below)
     ├── gameplay_test.gd / GameplayTest.tscn          # FootballPlayer+PlayerController physics
-    ├── main_scene_test.gd / MainSceneTest.tscn        # Goals, per-team score, restart
-    └── team_system_test.gd / TeamSystemTest.tscn      # Spawning, switching, possession, AI, GK
+    ├── main_scene_test.gd / MainSceneTest.tscn        # Goals, per-team score, restart, celebration
+    ├── team_system_test.gd / TeamSystemTest.tscn      # Spawning, switching, possession, AI, GK
+    └── character_pipeline_test.gd / CharacterPipelineTest.tscn  # Registry, AnimationController, real-model gameplay parity
 ```
 
 ## Controls
@@ -128,6 +140,53 @@ Simple, reactive, no lookahead or tactics:
   shots simply through normal collision — no separate block-detection code
   needed.
 
+## Character Asset Pipeline (v0.4)
+
+`PlayerData.visual_id` is the only connection between gameplay and visuals.
+Empty (the default) means "use the placeholder capsule." Set it to a key
+registered in `CharacterRegistry` and `AnimationController` handles the
+rest automatically:
+
+- **Scale:** downloaded models arrive with wildly inconsistent (sometimes
+  simply wrong) embedded scale conventions. Rather than trusting that,
+  `AnimationController` measures the imported mesh's actual bind-pose
+  height and normalizes it to the game's calibrated ~1.6m character
+  height — no per-model manual scale tuning.
+- **Orientation:** `facing_correction_degrees` (default 0) is a one-line
+  fix if a future model's front doesn't already face the engine's +Z
+  forward convention.
+- **Materials/textures:** handled entirely by Godot's glTF importer. Godot
+  4.3 auto-converts the legacy `KHR_materials_pbrSpecularGlossiness`
+  workflow to its metallic/roughness pipeline (a documented, non-blocking
+  accuracy caveat from Godot itself, not a bug in this project).
+- **Team color:** a real model keeps its own authored textures untouched
+  (`AnimationController.supports_team_tint()` is `false` for it) rather
+  than getting crudely tinted like the placeholder capsule.
+- **Animation:** if a model ships clips, their names are keyword-matched
+  onto gameplay states (`idle`/`walk`/`run`/`sprint`/`dribble`) and actions
+  (`pass`/`shoot`/`celebration`/`tackle`) automatically. If it has none —
+  true for the first model, which has zero animation clips — a lightweight
+  procedural fallback (speed-scaled bob/lean while moving, a dip pulse on
+  pass/shoot, a hop-spin on celebration, a lunge-tilt on a won tackle)
+  keeps the character visibly alive. `FootballPlayer` never knows which
+  path is active.
+
+**Adding another character model:** drop the file under
+`assets/characters/<name>/`, optionally run
+`godot --headless --path . tools/InspectCharacterModel.tscn -- res://assets/characters/<name>/<file>`
+to sanity-check it first (mesh/skeleton/animation/scale summary, and a
+warning if the auto-fit measurement looks degenerate), add one line to
+`CharacterRegistry.MODELS`, set `visual_id` on a `PlayerData` entry, and
+add a license/attribution block to `assets/characters/CREDITS.md`. No
+`FootballPlayer`/`AIController`/gameplay code changes required.
+
+**Licensing:** every character model's source, author, and license lives
+in `assets/characters/CREDITS.md`. Read it before adding or shipping any
+model — a permissively-licensed 3D file does not automatically clear
+rights to a character design that belongs to someone else's IP (see that
+file's note on the first model, which is a fan reproduction of a Cygames
+character).
+
 ## Setup (one-time, on your machine)
 
 1. Install [Godot 4.x](https://godotengine.org/download) (stable release).
@@ -165,39 +224,50 @@ Run them with a local Godot 4.3 binary:
 godot --headless --path . tests/GameplayTest.tscn
 godot --headless --path . tests/MainSceneTest.tscn
 godot --headless --path . tests/TeamSystemTest.tscn
+godot --headless --path . tests/CharacterPipelineTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
 `team_system_test.gd` covers spawning, team assignment, formation
 positioning, switching, possession transfer, AI movement, and goalkeeper
-behavior; the other two re-validate the full v0.2 mechanics (dribble, pass,
-shot power/clamp, goal scoring, restart) now running through the v0.3
-architecture.
+behavior; `character_pipeline_test.gd` covers `CharacterRegistry`,
+`AnimationController`'s real-model and placeholder-fallback paths (scale
+auto-fit, team-tint behavior, all states/actions), and that a real model
+doesn't change any gameplay behavior; the other two re-validate the full
+v0.2/v0.3 mechanics (dribble, pass, shot power/clamp, goal scoring,
+celebration, restart) now running with a real character on the pitch.
+71 assertions total across all four suites, all passing.
 
-## Current Feature Set (v0.3)
+## Current Feature Set (v0.4)
 
-- Everything from v0.2 (movement, dribbling, passing, shooting, camera,
-  tuned ball physics) unchanged in feel, now data-driven per player
-- `PlayerData`: reusable per-character stats that actually affect gameplay
-  (speed/accel/sprint directly; passing/shooting/dribbling/stamina/defense
-  scaled into kick power, dribble control, sprint endurance, and control
-  sensor reach)
-- 3v3(+GK) test match: two full squads, distinct stats per player
-- Player switching (Tab / SWITCH button) between all 4 home players, camera
-  and control indicator follow instantly, previous player becomes AI
-- Simple offense/defense/goalkeeper AI for every non-controlled player
-- `PossessionManager`: live ball-carrier and possessing-team tracking
-- Data-driven formations (`FormationManager`), currently one 3-outfield
-  shape, structured so 4-3-3/4-4-2/etc. are just new data entries later
-- Per-team score ("Home N - N Away"), goal reset, and full match restart
-  (score + all 8 players + ball) via R key
+- Everything from v0.3 (3v3+GK match, AI, switching, formations, possession
+  tracking, per-team score) unchanged in feel
+- First real 3D character integrated (Tokai Teio, glTF binary, CC BY 4.0 —
+  see `assets/characters/CREDITS.md`) via a reusable, data-driven pipeline
+  (`CharacterRegistry` + `AnimationController`) that required zero changes
+  to `FootballPlayer`/`AIController`/`PlayerController`/`TeamController`/
+  `PossessionManager`/`BallController`/`CameraController`/`MatchManager`
+- Automatic scale normalization (measured, not guessed) and orientation
+  handling for downloaded models with inconsistent conventions
+- Procedural fallback animation (bob/lean/pulse) for the common case of a
+  downloaded model with no animation clips, with a clean path to real
+  clips later via keyword-matched state/action names
+- Every other roster slot still uses the original placeholder capsule,
+  proving the fallback and the real-model path coexist correctly
+- Goal celebrations trigger automatically on the scoring team
 
 ## Roadmap Ideas (for expanding into a full game)
 
+- Integrate the remaining downloaded character models (same pipeline)
 - Full 11-a-side rosters and formations
 - AI passing decisions (currently AI ball-carriers dribble + auto-shoot only)
 - Ball trapping/first-touch skill mechanics
 - Match timer, possession stats
-- Character models/animations (currently placeholder capsules)
+- Real animation clips (walk/run/kick cycles) once available, replacing the
+  procedural fallback per character
 - Stadium environment, crowd, audio
 - Formation editor / tactic selection UI
+- Bone-count optimization pass on skinned character models for Android
+  (the first model's ~400+ joints are mostly cosmetic cloth/hair physics
+  chains that currently just sit in bind pose; fine for one character on
+  screen, worth profiling if many are visible at once)

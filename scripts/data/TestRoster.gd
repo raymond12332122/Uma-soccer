@@ -6,12 +6,16 @@ extends RefCounted
 ## drives gameplay differences between characters.
 
 static func home_team() -> Array[PlayerData]:
-	return [
+	var roster: Array[PlayerData] = [
 		_make("home_gk", "Yuki", "GK", 4.2, 12.0, 6.0, 55, 40, 50, 70, 75, "Right"),
 		_make("home_def", "Haru", "DEF", 4.8, 13.0, 7.8, 68, 55, 60, 78, 80, "Right"),
 		_make("home_mid", "Sora", "MID", 5.2, 14.5, 8.6, 78, 68, 75, 82, 62, "Right"),
 		_make("home_fwd", "Rin", "FWD", 5.6, 15.5, 9.2, 65, 85, 80, 75, 45, "Left"),
 	]
+	# First integrated character model (v0.4) -- the default human-controlled
+	# player, so its payoff is visible immediately without needing to switch.
+	roster[2].visual_id = "tokai_teio"
+	return roster
 
 
 static func away_team() -> Array[PlayerData]:

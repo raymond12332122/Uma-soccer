@@ -36,6 +36,9 @@ func _physics_process(_delta: float) -> void:
 				best_dist = d
 				best = p
 
+	if best != null and current_carrier != null and best != current_carrier and best.team_id != current_carrier.team_id:
+		best.notify_possession_won_from_opponent()
+
 	current_carrier = best
 	possessing_team = best.team_id if best else -1
 	is_loose = best == null

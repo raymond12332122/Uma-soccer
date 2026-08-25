@@ -137,17 +137,19 @@ func _set_human_player(player: FootballPlayer) -> void:
 func _on_goal_scored_right(body: Node3D) -> void:
 	if body.is_in_group("ball"):
 		home_score += 1
-		_after_goal()
+		_after_goal(home_players)
 
 
 func _on_goal_scored_left(body: Node3D) -> void:
 	if body.is_in_group("ball"):
 		away_score += 1
-		_after_goal()
+		_after_goal(away_players)
 
 
-func _after_goal() -> void:
+func _after_goal(scoring_team: Array) -> void:
 	_update_score_label()
+	for player in scoring_team:
+		player.play_celebration()
 	ball.reset_ball()
 	_reset_all_players()
 

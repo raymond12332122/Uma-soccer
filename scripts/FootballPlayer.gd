@@ -58,7 +58,7 @@ var shoot_max_power: float = 7.0
 @onready var action_area: Area3D = $ActionArea
 @onready var control_area: Area3D = $ControlArea
 @onready var model: Node3D = $Model
-@onready var mesh_instance: MeshInstance3D = $Model/MeshInstance3D
+@onready var animation_controller: AnimationController = $Model/AnimationController
 @onready var name_label: Label3D = $NameLabel
 @onready var control_indicator: MeshInstance3D = $ControlIndicator
 
@@ -106,6 +106,9 @@ func apply_player_data(data: PlayerData) -> void:
 	if name_label:
 		name_label.text = data.display_name
 
+	if animation_controller:
+		animation_controller.set_visual(data.visual_id)
+
 	if control_area:
 		var shape_node: CollisionShape3D = control_area.get_node("CollisionShape3D")
 		if shape_node and shape_node.shape:
@@ -115,20 +118,27 @@ func apply_player_data(data: PlayerData) -> void:
 
 
 func set_team_color(color: Color) -> void:
-	if mesh_instance == null:
-		return
-	var mat: StandardMaterial3D = mesh_instance.get_surface_override_material(0)
-	if mat == null:
-		mat = StandardMaterial3D.new()
-	else:
-		mat = mat.duplicate()
-	mat.albedo_color = color
-	mesh_instance.set_surface_override_material(0, mat)
+	if animation_controller:
+		animation_controller.set_team_color(color)
 
 
 func set_controlled_visual(is_controlled: bool) -> void:
 	if control_indicator:
 		control_indicator.visible = is_controlled
+
+
+## Called by PossessionManager when this player wins the ball away from an
+## opponent (as opposed to picking up a loose ball) -- a reasonable, cheap
+## proxy for "successfully tackled" without a dedicated tackle mechanic.
+func notify_possession_won_from_opponent() -> void:
+	if animation_controller:
+		animation_controller.play_action("tackle")
+
+
+## Called by MatchManager on every player of the scoring team after a goal.
+func play_celebration() -> void:
+	if animation_controller:
+		animation_controller.play_action("celebration")
 
 
 ## Clears all input intent and cancels any in-progress shot charge. Called
@@ -182,11 +192,30 @@ func _physics_process(delta: float) -> void:
 	_update_possession(sprinting)
 	_process_pass_input()
 	_process_shoot_input(delta)
+	_update_animation_state()
 
 	if _control_lost_timer > 0.0:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
 	if _possession_cooldown_timer > 0.0:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
+
+
+func _update_animation_state() -> void:
+	if animation_controller == null:
+		return
+	var speed: float = Vector2(velocity.x, velocity.z).length()
+	var state: String
+	if speed < 0.3:
+		state = "idle"
+	elif has_possession:
+		state = "dribble"
+	elif speed >= sprint_speed * 0.85:
+		state = "sprint"
+	elif speed >= base_speed * 0.6:
+		state = "run"
+	else:
+		state = "walk"
+	animation_controller.set_state(state)
 
 
 func _get_aim_direction() -> Vector3:
@@ -276,6 +305,9 @@ func _apply_kick_impulse(ball: RigidBody3D, power: float, is_shot: bool) -> void
 	has_possession = false
 	_control_lost_timer = 0.0
 	_possession_cooldown_timer = possession_release_cooldown
+
+	if animation_controller:
+		animation_controller.play_action("shoot" if is_shot else "pass")
 
 
 func _on_action_area_entered(body: Node3D) -> void:

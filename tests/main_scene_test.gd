@@ -39,6 +39,18 @@ func _run_tests() -> void:
 	_check("Score label updates after goal", score_label.text == "Home 1 - 0 Away")
 	_check("Ball auto-resets to spawn after goal", ball.global_position.distance_to(ball.spawn_position) < 0.5)
 
+	var scoring_team_celebrating := true
+	for p in main.home_players:
+		if p.animation_controller._pulse_kind != "celebration":
+			scoring_team_celebrating = false
+	_check("Scoring team's players trigger a celebration on goal", scoring_team_celebrating)
+
+	var conceding_team_not_celebrating := true
+	for p in main.away_players:
+		if p.animation_controller._pulse_kind == "celebration":
+			conceding_team_not_celebrating = false
+	_check("Conceding team's players do not celebrate", conceding_team_not_celebrating)
+
 	# --- score again via the left goal (away scores) ---
 	ball.linear_velocity = Vector3.ZERO
 	ball.global_position = main.get_node("Field/GoalAreaLeft").global_position

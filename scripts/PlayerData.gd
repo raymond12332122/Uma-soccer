@@ -22,3 +22,8 @@ extends Resource
 @export_range(0.0, 100.0) var defensive_ability: float = 60.0
 
 @export_enum("Right", "Left") var preferred_foot: String = "Right"
+
+## Key into CharacterRegistry for the 3D model to display for this
+## character. Empty string = use the placeholder capsule. Swapping in a
+## real model is purely a data change here -- no gameplay code involved.
+@export var visual_id: String = ""
