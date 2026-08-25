@@ -8,12 +8,14 @@ extends RefCounted
 static func home_team() -> Array[PlayerData]:
 	var roster: Array[PlayerData] = [
 		_make("home_gk", "Yuki", "GK", 4.2, 12.0, 6.0, 55, 40, 50, 70, 75, "Right"),
-		_make("home_def", "Haru", "DEF", 4.8, 13.0, 7.8, 68, 55, 60, 78, 80, "Right"),
-		_make("home_mid", "Sora", "MID", 5.2, 14.5, 8.6, 78, 68, 75, 82, 62, "Right"),
+		_make("home_def", "Agnes", "DEF", 4.8, 13.0, 7.8, 68, 55, 60, 78, 80, "Right"),
+		_make("home_mid", "Teio", "MID", 5.2, 14.5, 8.6, 78, 68, 75, 82, 62, "Right"),
 		_make("home_fwd", "Rin", "FWD", 5.6, 15.5, 9.2, 65, 85, 80, 75, 45, "Left"),
 	]
-	# First integrated character model (v0.4) -- the default human-controlled
-	# player, so its payoff is visible immediately without needing to switch.
+	# Integrated character models (v0.4/v0.5) on the home roster so both are
+	# actually reachable through player switching, not just AI-visible.
+	# Display names updated to match so the name label matches the face.
+	roster[1].visual_id = "agnes_digital"
 	roster[2].visual_id = "tokai_teio"
 	return roster
 

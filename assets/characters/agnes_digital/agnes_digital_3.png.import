@@ -1,0 +1,37 @@
+[remap]
+
+importer="texture"
+type="CompressedTexture2D"
+uid="uid://c1dhtqddyptms"
+path="res://.godot/imported/agnes_digital_3.png-f126643741aeab7e89670b4cd20039bd.ctex"
+metadata={
+"vram_texture": false
+}
+generator_parameters={
+"md5": "ab9c22a8985b40aef477f7cfb8e6253c"
+}
+
+[deps]
+
+source_file="res://assets/characters/agnes_digital/agnes_digital_3.png"
+dest_files=["res://.godot/imported/agnes_digital_3.png-f126643741aeab7e89670b4cd20039bd.ctex"]
+
+[params]
+
+compress/mode=0
+compress/high_quality=false
+compress/lossy_quality=0.7
+compress/hdr_compression=1
+compress/normal_map=0
+compress/channel_pack=0
+mipmaps/generate=true
+mipmaps/limit=-1
+roughness/mode=0
+roughness/src_normal=""
+process/fix_alpha_border=true
+process/premult_alpha=false
+process/normal_map_invert_y=false
+process/hdr_as_srgb=false
+process/hdr_clamp_exposure=false
+process/size_limit=0
+detect_3d/compress_to=1

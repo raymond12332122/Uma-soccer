@@ -10,6 +10,7 @@ extends RefCounted
 
 const MODELS := {
 	"tokai_teio": "res://assets/characters/tokai_teio/tokai_teio.glb",
+	"agnes_digital": "res://assets/characters/agnes_digital/agnes_digital.glb",
 }
 
 

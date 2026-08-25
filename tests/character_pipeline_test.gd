@@ -1,9 +1,11 @@
 extends Node3D
 
-# Headless regression test for the V0.4 character asset pipeline:
-# CharacterRegistry, AnimationController (both the real-model path and the
-# placeholder fallback), and that none of it affects FootballPlayer
-# gameplay. Run via:
+# Headless regression test for the character asset pipeline:
+# CharacterRegistry, AnimationController (both every registered real-model
+# path and the placeholder fallback), and that none of it affects
+# FootballPlayer gameplay, switching, or AI control. Data-driven over
+# CharacterRegistry.MODELS so a future model (v0.6+) gets the same battery
+# of checks automatically, with no new test code required. Run via:
 #   godot --headless --path . tests/CharacterPipelineTest.tscn
 
 const FieldScene := preload("res://scenes/Field.tscn")
@@ -20,10 +22,11 @@ func _ready() -> void:
 
 func _run_tests() -> void:
 	# --- CharacterRegistry ---
-	var known_scene: PackedScene = CharacterRegistry.get_scene("tokai_teio")
-	_check("CharacterRegistry resolves a known visual_id to a scene", known_scene != null)
 	_check("CharacterRegistry returns null for an unknown visual_id", CharacterRegistry.get_scene("nonexistent_character") == null)
 	_check("CharacterRegistry returns null for an empty visual_id", CharacterRegistry.get_scene("") == null)
+
+	var registered_ids: Array = CharacterRegistry.MODELS.keys()
+	_check("CharacterRegistry has at least one registered model", registered_ids.size() > 0)
 
 	# --- AnimationController: placeholder fallback path ---
 	var placeholder_ac := AnimationController.new()
@@ -44,52 +47,135 @@ func _run_tests() -> void:
 		await get_tree().process_frame
 	_check("All action triggers can be played on placeholder without error", true)
 
-	# Procedural fallback should actually move the visual during a pulse.
 	placeholder_ac.play_action("celebration")
-	var visual := placeholder_ac.get_child(0)
+	var placeholder_visual := placeholder_ac.get_child(0)
 	var rot_samples: Array[float] = []
 	for i in range(10):
 		await get_tree().process_frame
-		rot_samples.append(visual.rotation.y)
+		rot_samples.append(placeholder_visual.rotation.y)
 	var rotation_changed := false
 	for i in range(1, rot_samples.size()):
 		if not is_equal_approx(rot_samples[i], rot_samples[0]):
 			rotation_changed = true
 	_check("Procedural celebration pulse actually animates the placeholder visual", rotation_changed)
 
-	# --- AnimationController: real model path ---
-	var real_ac := AnimationController.new()
-	add_child(real_ac)
-	real_ac.set_visual("tokai_teio")
-	await get_tree().process_frame
-
-	_check("Real model does not support team tint (keeps authored textures)", not real_ac.supports_team_tint())
-	_check("Real model measured a sane bind-pose height", real_ac.last_measured_height > 0.01 and real_ac.last_measured_height < 10.0)
-
-	var real_visual: Node3D = real_ac.get_child(0)
-	var expected_scale: float = 1.6 / real_ac.last_measured_height
-	_check("Real model auto-fit scale matches target_height / measured_height", is_equal_approx(real_visual.scale.x, expected_scale))
-
-	var skeleton := _find_skeleton(real_visual)
-	_check("Real model has a Skeleton3D (skinned mesh imported correctly)", skeleton != null)
-	_check("Real model skeleton has bones", skeleton != null and skeleton.get_bone_count() > 0)
-
-	for state in ["idle", "walk", "run", "sprint", "dribble"]:
-		real_ac.set_state(state)
-	for action in ["pass", "shoot", "celebration", "tackle"]:
-		real_ac.play_action(action)
-		await get_tree().process_frame
-	_check("Real model handles all states/actions without error (procedural fallback, since it has 0 clips)", true)
+	# --- AnimationController: every registered real model, generically ---
+	for visual_id in registered_ids:
+		await _check_registered_model(visual_id)
 
 	# --- FootballPlayer integration: gameplay must not care which visual is attached ---
 	var field = FieldScene.instantiate()
 	add_child(field)
+
+	for visual_id in registered_ids:
+		await _check_football_player_with_visual(visual_id)
+
+	# --- Full match spawn: every registered model appears exactly where TestRoster put it ---
+	var main = MainScene.instantiate()
+	add_child(main)
+	for i in range(5):
+		await get_tree().physics_frame
+
+	var all_players: Array = main.home_players + main.away_players
+	var real_model_count := 0
+	var placeholder_count := 0
+	for p in all_players:
+		if p.animation_controller.supports_team_tint():
+			placeholder_count += 1
+		else:
+			real_model_count += 1
+	_check("Exactly %d spawned players use a real model" % registered_ids.size(), real_model_count == registered_ids.size())
+	_check("The remaining spawned players fall back to the placeholder", placeholder_count == all_players.size() - registered_ids.size())
+	_check("home_players[1] (Agnes) uses the real model", not main.home_players[1].animation_controller.supports_team_tint())
+	_check("home_players[2] (Teio) uses the real model", not main.home_players[2].animation_controller.supports_team_tint())
+
+	# --- Player switching + AI control + camera tracking for the newly added character ---
+	var agnes: FootballPlayer = main.home_players[1]
+	var previously_controlled = main.player_controller.controlled_player
+	_check("Agnes is not the default controlled player before switching", previously_controlled != agnes)
+
+	# Cycle switching until Agnes becomes the controlled player.
+	var reached_agnes := false
+	for i in range(main.home_players.size()):
+		main._switch_to_next_player()
+		await get_tree().physics_frame
+		if main.player_controller.controlled_player == agnes:
+			reached_agnes = true
+			break
+	_check("Switching can reach the real-model character (Agnes)", reached_agnes)
+	_check("Agnes's control indicator is visible once switched to", agnes.control_indicator.visible)
+	_check("Camera retargets to the real-model character once switched to", main.camera_controller.target == agnes)
+
+	InputState.move_vector = Vector2(1, 0)
+	var agnes_start_pos: Vector3 = agnes.global_position
+	for i in range(30):
+		await get_tree().physics_frame
+	_check("The real-model character moves normally under human control", agnes.global_position.distance_to(agnes_start_pos) > 0.5)
+	InputState.move_vector = Vector2.ZERO
+
+	# Switch away -- Agnes should fall back under AI control immediately.
+	main._switch_to_next_player()
+	await get_tree().physics_frame
+	_check("Home team no longer treats Agnes as the human player after switching away", main.home_team.human_player != agnes)
+
+	var agnes_pos_after_switch_away: Vector3 = agnes.global_position
+	for i in range(60):
+		await get_tree().physics_frame
+	_check("AI drives the real-model character once no longer human-controlled", agnes.global_position.distance_to(agnes_pos_after_switch_away) > 0.05 or agnes.move_input != Vector2.ZERO)
+
+	print("TEST_SUMMARY: %s" % ("ALL PASS" if ok else "FAILURES PRESENT"))
+	get_tree().quit(0 if ok else 1)
+
+
+func _check_registered_model(visual_id: String) -> void:
+	var scene: PackedScene = CharacterRegistry.get_scene(visual_id)
+	_check("CharacterRegistry resolves '%s' to a scene" % visual_id, scene != null)
+	if scene == null:
+		return
+
+	var ac := AnimationController.new()
+	add_child(ac)
+	ac.set_visual(visual_id)
+	await get_tree().process_frame
+
+	_check("'%s' does not support team tint (keeps authored textures)" % visual_id, not ac.supports_team_tint())
+	_check("'%s' measured a sane bind-pose height" % visual_id, ac.last_measured_height > 0.01 and ac.last_measured_height < 10.0)
+
+	var visual: Node3D = ac.get_child(0) if ac.get_child_count() > 0 else null
+	_check("'%s' produced a visual node" % visual_id, visual != null)
+	if visual:
+		var expected_scale: float = ac.target_height / ac.last_measured_height
+		_check("'%s' auto-fit scale matches target_height / measured_height" % visual_id, is_equal_approx(visual.scale.x, expected_scale))
+
+		var skeleton := _find_skeleton(visual)
+		_check("'%s' has a Skeleton3D (skinned mesh imported correctly)" % visual_id, skeleton != null)
+		_check("'%s' skeleton has bones" % visual_id, skeleton != null and skeleton.get_bone_count() > 0)
+
+	for state in ["idle", "walk", "run", "sprint", "dribble"]:
+		ac.set_state(state)
+	for action in ["pass", "shoot", "celebration", "tackle"]:
+		ac.play_action(action)
+		await get_tree().process_frame
+	_check("'%s' handles all states/actions without error" % visual_id, true)
+
+	# Real animation detection: this pipeline auto-matches clips by keyword
+	# when a model ships them, and falls back to procedural motion when it
+	# doesn't (true for every model integrated so far -- both ship 0 clips).
+	if ac._anim_player == null:
+		_check("'%s' correctly falls back to procedural animation (0 clips in source)" % visual_id, true)
+	else:
+		_check("'%s' detected real animation clips and will use them over the procedural fallback" % visual_id, ac._anim_player.get_animation_list().size() > 0)
+
+	ac.queue_free()
+
+
+func _check_football_player_with_visual(visual_id: String) -> void:
 	var ball: BallController = BallScene.instantiate()
 	ball.position = Vector3(0, 1, 0)
 	add_child(ball)
 
 	var data := PlayerData.new()
-	data.id = "test_visual_player"
+	data.id = "test_%s" % visual_id
 	data.display_name = "Test"
 	data.movement_speed = 5.0
 	data.acceleration = 14.0
@@ -99,7 +185,7 @@ func _run_tests() -> void:
 	data.dribbling = 70
 	data.stamina = 80
 	data.defensive_ability = 60
-	data.visual_id = "tokai_teio"
+	data.visual_id = visual_id
 
 	var player: FootballPlayer = PlayerScene.instantiate()
 	player.position = Vector3(0, 1, -3)
@@ -110,7 +196,7 @@ func _run_tests() -> void:
 	add_child(controller)
 	controller.set_controlled_player(player)
 
-	_check("FootballPlayer's animation_controller picked up the real model", not player.animation_controller.supports_team_tint())
+	_check("FootballPlayer's animation_controller picked up '%s'" % visual_id, not player.animation_controller.supports_team_tint())
 
 	InputState.move_vector = Vector2(0, 1)
 	var approached := false
@@ -119,38 +205,23 @@ func _run_tests() -> void:
 		if player.global_position.distance_to(ball.global_position) < 2.5:
 			approached = true
 			break
-	_check("Player with a real-model visual still moves/approaches normally", approached)
+	_check("Player with '%s' still moves/approaches normally" % visual_id, approached)
 
 	for i in range(30):
 		await get_tree().physics_frame
-	_check("Player with a real-model visual still gains possession/dribbles normally", player.has_possession)
+	_check("Player with '%s' still gains possession/dribbles normally" % visual_id, player.has_possession)
 
 	var pre_pass_speed: float = ball.linear_velocity.length()
 	InputState.pass_pressed = true
 	for i in range(3):
 		await get_tree().physics_frame
-	_check("Player with a real-model visual can still pass normally", ball.linear_velocity.length() > pre_pass_speed + 1.0)
+	_check("Player with '%s' can still pass normally" % visual_id, ball.linear_velocity.length() > pre_pass_speed + 1.0)
 	InputState.move_vector = Vector2.ZERO
 
-	# --- Full match spawn: exactly one player uses the real model, others fall back ---
-	var main = MainScene.instantiate()
-	add_child(main)
-	for i in range(5):
-		await get_tree().physics_frame
-
-	var real_model_count := 0
-	var placeholder_count := 0
-	for p in main.home_players + main.away_players:
-		if p.animation_controller.supports_team_tint():
-			placeholder_count += 1
-		else:
-			real_model_count += 1
-	_check("Exactly one spawned player in the full match uses the real model", real_model_count == 1)
-	_check("The other seven spawned players fall back to the placeholder", placeholder_count == 7)
-	_check("The real-model player is the intended default-controlled MID (home_players[2])", not main.home_players[2].animation_controller.supports_team_tint())
-
-	print("TEST_SUMMARY: %s" % ("ALL PASS" if ok else "FAILURES PRESENT"))
-	get_tree().quit(0 if ok else 1)
+	player.queue_free()
+	controller.queue_free()
+	ball.queue_free()
+	await get_tree().process_frame
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:

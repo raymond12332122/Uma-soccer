@@ -2,10 +2,10 @@
 
 A 3D soccer prototype built in Godot 4, aimed at an installable Android APK.
 This is the foundation for a much larger football game. Current milestone
-(v0.4): the first real 3D character model (Tokai Teio) integrated through a
-reusable asset pipeline, on top of the v0.3 3v3(+GK) team match (AI
-teammates/opponents, switching, data-driven formations) and the v0.2
-dribble/pass/shoot core.
+(v0.5): two real 3D character models (Tokai Teio, Agnes Digital) on the
+pitch simultaneously through the v0.4 reusable asset pipeline, on top of
+the v0.3 3v3(+GK) team match (AI teammates/opponents, switching,
+data-driven formations) and the v0.2 dribble/pass/shoot core.
 
 ## Tech Stack
 
@@ -58,7 +58,8 @@ uma-soccer/
 ├── assets/
 │   └── characters/
 │       ├── CREDITS.md             # License/attribution for every character model -- read before adding assets
-│       └── tokai_teio/            # First integrated model: tokai_teio.glb + its extracted textures
+│       ├── tokai_teio/            # tokai_teio.glb + its extracted textures
+│       └── agnes_digital/         # agnes_digital.glb + its extracted textures
 ├── scenes/
 │   ├── Main.tscn                  # Entry scene: field, ball, players container, camera, UI
 │   ├── Field.tscn                  # Ground, boundary walls, goals, goal triggers
@@ -140,12 +141,14 @@ Simple, reactive, no lookahead or tactics:
   shots simply through normal collision — no separate block-detection code
   needed.
 
-## Character Asset Pipeline (v0.4)
+## Character Asset Pipeline
 
 `PlayerData.visual_id` is the only connection between gameplay and visuals.
 Empty (the default) means "use the placeholder capsule." Set it to a key
 registered in `CharacterRegistry` and `AnimationController` handles the
-rest automatically:
+rest automatically. Two models are integrated as of v0.5 (Tokai Teio,
+Agnes Digital), both through this exact process with zero gameplay-code
+changes required for the second one:
 
 - **Scale:** downloaded models arrive with wildly inconsistent (sometimes
   simply wrong) embedded scale conventions. Rather than trusting that,
@@ -165,11 +168,11 @@ rest automatically:
 - **Animation:** if a model ships clips, their names are keyword-matched
   onto gameplay states (`idle`/`walk`/`run`/`sprint`/`dribble`) and actions
   (`pass`/`shoot`/`celebration`/`tackle`) automatically. If it has none —
-  true for the first model, which has zero animation clips — a lightweight
-  procedural fallback (speed-scaled bob/lean while moving, a dip pulse on
-  pass/shoot, a hop-spin on celebration, a lunge-tilt on a won tackle)
-  keeps the character visibly alive. `FootballPlayer` never knows which
-  path is active.
+  true for both models integrated so far — a lightweight procedural
+  fallback (speed-scaled bob/lean while moving, a dip pulse on pass/shoot,
+  a hop-spin on celebration, a lunge-tilt on a won tackle) keeps the
+  character visibly alive. `FootballPlayer` never knows which path is
+  active.
 
 **Adding another character model:** drop the file under
 `assets/characters/<name>/`, optionally run
@@ -230,35 +233,44 @@ godot --headless --path . tests/CharacterPipelineTest.tscn
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
 `team_system_test.gd` covers spawning, team assignment, formation
 positioning, switching, possession transfer, AI movement, and goalkeeper
-behavior; `character_pipeline_test.gd` covers `CharacterRegistry`,
-`AnimationController`'s real-model and placeholder-fallback paths (scale
-auto-fit, team-tint behavior, all states/actions), and that a real model
-doesn't change any gameplay behavior; the other two re-validate the full
-v0.2/v0.3 mechanics (dribble, pass, shot power/clamp, goal scoring,
-celebration, restart) now running with a real character on the pitch.
-71 assertions total across all four suites, all passing.
+behavior; `character_pipeline_test.gd` is data-driven over every
+`CharacterRegistry`-registered model (so a v0.6+ addition gets the full
+battery automatically) covering registry lookup, `AnimationController`'s
+real-model and placeholder-fallback paths (scale auto-fit, team-tint
+behavior, all states/actions, real-vs-procedural animation detection),
+gameplay parity with the placeholder, full-match spawn placement, and
+player switching / AI handoff / camera retargeting specifically for a
+real-model character; the other two re-validate the full v0.2/v0.3
+mechanics (dribble, pass, shot power/clamp, goal scoring, celebration,
+restart) now running with two real characters on the pitch.
+95 assertions total across all four suites, all passing.
 
-## Current Feature Set (v0.4)
+## Current Feature Set (v0.5)
 
 - Everything from v0.3 (3v3+GK match, AI, switching, formations, possession
   tracking, per-team score) unchanged in feel
-- First real 3D character integrated (Tokai Teio, glTF binary, CC BY 4.0 —
-  see `assets/characters/CREDITS.md`) via a reusable, data-driven pipeline
-  (`CharacterRegistry` + `AnimationController`) that required zero changes
-  to `FootballPlayer`/`AIController`/`PlayerController`/`TeamController`/
-  `PossessionManager`/`BallController`/`CameraController`/`MatchManager`
+- Two real 3D characters integrated (Tokai Teio, Agnes Digital — both glTF
+  binary, CC BY 4.0, see `assets/characters/CREDITS.md`) via the reusable,
+  data-driven pipeline (`CharacterRegistry` + `AnimationController`).
+  Adding the second required zero changes to `FootballPlayer`/
+  `AIController`/`PlayerController`/`TeamController`/`PossessionManager`/
+  `BallController`/`CameraController`/`MatchManager` — purely data
+  (one registry entry, one `visual_id` assignment, one credits block)
+- Both real characters are on the home roster, so both are actually
+  playable through switching, not just AI-visible
 - Automatic scale normalization (measured, not guessed) and orientation
   handling for downloaded models with inconsistent conventions
 - Procedural fallback animation (bob/lean/pulse) for the common case of a
   downloaded model with no animation clips, with a clean path to real
   clips later via keyword-matched state/action names
-- Every other roster slot still uses the original placeholder capsule,
-  proving the fallback and the real-model path coexist correctly
-- Goal celebrations trigger automatically on the scoring team
+- Remaining roster slots still use the original placeholder capsule,
+  proving the fallback and multiple real-model paths coexist correctly
+- Goal celebrations trigger automatically on the scoring team, including
+  for real-model characters
 
 ## Roadmap Ideas (for expanding into a full game)
 
-- Integrate the remaining downloaded character models (same pipeline)
+- Integrate further character models as they're provided (same pipeline)
 - Full 11-a-side rosters and formations
 - AI passing decisions (currently AI ball-carriers dribble + auto-shoot only)
 - Ball trapping/first-touch skill mechanics
@@ -268,6 +280,6 @@ celebration, restart) now running with a real character on the pitch.
 - Stadium environment, crowd, audio
 - Formation editor / tactic selection UI
 - Bone-count optimization pass on skinned character models for Android
-  (the first model's ~400+ joints are mostly cosmetic cloth/hair physics
-  chains that currently just sit in bind pose; fine for one character on
-  screen, worth profiling if many are visible at once)
+  (both models' ~400+ joints are mostly cosmetic cloth/hair physics chains
+  that currently just sit in bind pose; fine for a couple of characters on
+  screen, worth profiling as more are added)

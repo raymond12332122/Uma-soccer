@@ -40,6 +40,26 @@ Treat this project accordingly:
 
 ---
 
+## agnes_digital
+
+- **File:** `assets/characters/agnes_digital/agnes_digital.glb`
+- **Title:** "Agnes Digital - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/agnes-digital-uma-musume-51911125c6b441298a44027c2da3d349](https://sketchfab.com/3d-models/agnes-digital-uma-musume-51911125c6b441298a44027c2da3d349)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+- **What CC BY 4.0 requires:** attribution to the original author (provided
+  above) whenever the model or derivative work is shared. It does permit
+  commercial use and modification, *for this specific 3D model file*.
+
+Same author and license as `tokai_teio` above — the same IP-ownership
+caveat applies: this clears ansaldotoys2's own modeling work, not the
+"Agnes Digital" character design or the Uma Musume franchise, which
+remain Cygames, Inc.'s IP. Personal, non-commercial fan use only; do not
+distribute or monetize a build containing this asset without separately
+addressing that.
+
+---
+
 ## Adding another model's credits
 
 Copy the block above for each new character: file path, title, author,
