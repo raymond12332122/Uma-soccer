@@ -1,0 +1,28 @@
+config_version=5
+
+[application]
+
+config/name="Uma Soccer"
+run/main_scene="res://scenes/Main.tscn"
+config/features=PackedStringArray("4.3", "Mobile")
+config/icon="res://icon.svg"
+boot_splash/bg_color=Color(0.129412, 0.545098, 0.207843, 1)
+
+[autoload]
+
+InputState="*res://scripts/InputState.gd"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/handheld/orientation="landscape"
+window/energy_saving/keep_screen_on=true
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+
+[rendering]
+
+textures/vram_compression/import_etc2_astc=true
+renderer/rendering_method="mobile"
+renderer/rendering_method.mobile="mobile"
