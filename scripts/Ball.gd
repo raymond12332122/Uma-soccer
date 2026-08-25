@@ -1,6 +1,7 @@
 extends RigidBody3D
 
 @export var reset_height: float = -10.0
+@export var max_speed: float = 17.0
 
 var spawn_position: Vector3
 
@@ -13,6 +14,10 @@ func _ready() -> void:
 func _physics_process(_delta: float) -> void:
 	if global_position.y < reset_height:
 		reset_ball()
+		return
+
+	if linear_velocity.length() > max_speed:
+		linear_velocity = linear_velocity.normalized() * max_speed
 
 
 func reset_ball() -> void:

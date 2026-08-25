@@ -18,17 +18,47 @@ grow_vertical = 0
 mouse_filter = 1
 script = ExtResource("2")
 
-[node name="KickButton" type="Button" parent="."]
+[node name="ShootButton" type="Button" parent="."]
+custom_minimum_size = Vector2(150, 150)
+anchor_left = 1.0
+anchor_right = 1.0
+anchor_top = 1.0
+anchor_bottom = 1.0
+offset_left = -170.0
+offset_top = -190.0
+offset_right = -20.0
+offset_bottom = -40.0
+grow_horizontal = 0
+grow_vertical = 0
+theme_override_font_sizes/font_size = 26
+text = "SHOOT"
+
+[node name="PassButton" type="Button" parent="."]
 custom_minimum_size = Vector2(120, 120)
 anchor_left = 1.0
 anchor_right = 1.0
 anchor_top = 1.0
 anchor_bottom = 1.0
-offset_left = -160.0
-offset_top = -200.0
-offset_right = -40.0
-offset_bottom = -80.0
+offset_left = -330.0
+offset_top = -165.0
+offset_right = -210.0
+offset_bottom = -45.0
 grow_horizontal = 0
 grow_vertical = 0
-theme_override_font_sizes/font_size = 24
-text = "KICK"
+theme_override_font_sizes/font_size = 22
+text = "PASS"
+
+[node name="SprintButton" type="Button" parent="."]
+custom_minimum_size = Vector2(100, 100)
+anchor_left = 1.0
+anchor_right = 1.0
+anchor_top = 1.0
+anchor_bottom = 1.0
+offset_left = -260.0
+offset_top = -300.0
+offset_right = -160.0
+offset_bottom = -200.0
+grow_horizontal = 0
+grow_vertical = 0
+theme_override_font_sizes/font_size = 18
+text = "SPRINT"

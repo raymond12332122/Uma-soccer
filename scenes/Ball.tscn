@@ -13,13 +13,15 @@ height = 0.7
 albedo_color = Color(1, 1, 1, 1)
 
 [sub_resource type="PhysicsMaterial" id="PhysicsMaterial_ball"]
-friction = 0.6
-bounce = 0.4
+friction = 0.85
+bounce = 0.18
 
 [node name="Ball" type="RigidBody3D"]
 collision_layer = 4
 collision_mask = 3
 mass = 0.45
+linear_damp = 0.4
+angular_damp = 0.15
 physics_material_override = SubResource("PhysicsMaterial_ball")
 script = ExtResource("1")
 
