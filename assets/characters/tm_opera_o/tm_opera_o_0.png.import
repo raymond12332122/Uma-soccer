@@ -1,0 +1,37 @@
+[remap]
+
+importer="texture"
+type="CompressedTexture2D"
+uid="uid://crjg63phivx21"
+path="res://.godot/imported/tm_opera_o_0.png-2598b4c09d1aef6a32c2dc90583bff3c.ctex"
+metadata={
+"vram_texture": false
+}
+generator_parameters={
+"md5": "ffe0700b919658bfa90d2da373332aa6"
+}
+
+[deps]
+
+source_file="res://assets/characters/tm_opera_o/tm_opera_o_0.png"
+dest_files=["res://.godot/imported/tm_opera_o_0.png-2598b4c09d1aef6a32c2dc90583bff3c.ctex"]
+
+[params]
+
+compress/mode=0
+compress/high_quality=false
+compress/lossy_quality=0.7
+compress/hdr_compression=1
+compress/normal_map=0
+compress/channel_pack=0
+mipmaps/generate=true
+mipmaps/limit=-1
+roughness/mode=0
+roughness/src_normal=""
+process/fix_alpha_border=true
+process/premult_alpha=false
+process/normal_map_invert_y=false
+process/hdr_as_srgb=false
+process/hdr_clamp_exposure=false
+process/size_limit=0
+detect_3d/compress_to=1

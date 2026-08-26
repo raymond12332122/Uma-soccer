@@ -60,6 +60,142 @@ addressing that.
 
 ---
 
+## tamamo_cross
+
+- **File:** `assets/characters/tamamo_cross/tamamo_cross.glb`
+- **Title:** "Tamamo Cross - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/tamamo-cross-uma-musume-6911de2fdce5479c875f2d58dc571df2](https://sketchfab.com/3d-models/tamamo-cross-uma-musume-6911de2fdce5479c875f2d58dc571df2)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above: clears
+ansaldotoys2's own modeling work only, not the character or the Uma
+Musume franchise (Cygames, Inc.'s IP). Personal, non-commercial fan use.
+
+---
+
+## oguri_cap
+
+- **File:** `assets/characters/oguri_cap/oguri_cap.glb`
+- **Title:** "Oguri Cap - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/oguri-cap-uma-musume-633921f72d9c42eab0dfdb9bcb876977](https://sketchfab.com/3d-models/oguri-cap-uma-musume-633921f72d9c42eab0dfdb9bcb876977)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above.
+
+---
+
+## gold_ship
+
+- **File:** `assets/characters/gold_ship/gold_ship.glb`
+- **Title:** "Gold Ship - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/gold-ship-uma-musume-d59da1d3d7f8455bba5204bbf173e8cb](https://sketchfab.com/3d-models/gold-ship-uma-musume-d59da1d3d7f8455bba5204bbf173e8cb)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above.
+
+---
+
+## symboli_rudolf
+
+- **File:** `assets/characters/symboli_rudolf/symboli_rudolf.glb`
+- **Title:** "Symboli Rudolf - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/symboli-rudolf-uma-musume-ed52308f5b4f4d3cb4735be0be1d79f1](https://sketchfab.com/3d-models/symboli-rudolf-uma-musume-ed52308f5b4f4d3cb4735be0be1d79f1)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above.
+
+---
+
+## air_groove
+
+- **File:** `assets/characters/air_groove/air_groove.glb`
+- **Title:** "Air Groove - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/air-groove-uma-musume-abee5dac4d9546a4a85844a97ac89d65](https://sketchfab.com/3d-models/air-groove-uma-musume-abee5dac4d9546a4a85844a97ac89d65)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above.
+
+---
+
+## tm_opera_o
+
+- **File:** `assets/characters/tm_opera_o/tm_opera_o.glb`
+- **Title:** "T.M. Opera O"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/tm-opera-o-1f82ad98b84943b6b2076d742ca87dc1](https://sketchfab.com/3d-models/tm-opera-o-1f82ad98b84943b6b2076d742ca87dc1)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above.
+
+---
+
+## grass_wonder
+
+- **File:** `assets/characters/grass_wonder/grass_wonder.glb`
+- **Title:** "Grass Wonder - Uma Musume"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/grass-wonder-uma-musume-04cfb42b98b84bef9b3d4466876d60f1](https://sketchfab.com/3d-models/grass-wonder-uma-musume-04cfb42b98b84bef9b3d4466876d60f1)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above. Registered
+in `CharacterRegistry` and covered by the automated test suite, but not
+currently assigned to a `TestRoster` slot in the active 3v3(+GK) match
+(all 8 slots are filled by other models) -- available for a future roster
+expansion or manual assignment.
+
+---
+
+## mejiro_mcqueen
+
+- **File:** `assets/characters/mejiro_mcqueen/mejiro_mcqueen.glb`
+- **Title:** "Mejiro Mc Queen"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/mejiro-mc-queen-b963bea059a847b48d2e7c329fbce274](https://sketchfab.com/3d-models/mejiro-mc-queen-b963bea059a847b48d2e7c329fbce274)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above. Registered
+and tested but not currently assigned to a roster slot (see `grass_wonder`
+note above).
+
+---
+
+## silence_suzuka
+
+- **File:** `assets/characters/silence_suzuka/silence_suzuka.glb`
+- **Title:** "Silence Suzuka"
+- **Author:** ansaldotoys2 ([sketchfab.com/ansaldotoys2](https://sketchfab.com/ansaldotoys2))
+- **Source:** [sketchfab.com/3d-models/silence-suzuka-90cded9ec1e641a0a8ce6d9cc3ca7bca](https://sketchfab.com/3d-models/silence-suzuka-90cded9ec1e641a0a8ce6d9cc3ca7bca)
+- **License:** [CC BY 4.0](http://creativecommons.org/licenses/by/4.0/) (Creative Commons Attribution 4.0 International)
+
+Same author/license/IP-ownership caveat as `tokai_teio` above. Note: this
+file uses the `KHR_materials_unlit` glTF extension rather than the
+specular/glossiness workflow the other models use -- Godot 4.3 imports it
+natively with no conversion warning. Registered and tested but not
+currently assigned to a roster slot (see `grass_wonder` note above).
+
+---
+
+## Not yet integrated (download limitation, not a model problem)
+
+Five additional models were shared in the same batch but could not be
+retrieved in this environment: **super_creek**, **satano_diamond**,
+**twin_turbo**, **meisho_doto_halloween**, **calstone_light_o**. Each is
+7-10MB; the Google Drive download tool available in this session
+consistently failed (`session expired`) on every file above roughly 5MB
+while every smaller file downloaded without issue, across many retries.
+This is an environment/tooling limitation, not a defect found in these
+particular models -- none of them were actually inspected. If re-shared
+as a direct chat attachment (as the first two models were) or from a
+source this session can fetch in smaller chunks, they can go through the
+exact same pipeline as everything above.
+
+---
+
 ## Adding another model's credits
 
 Copy the block above for each new character: file path, title, author,

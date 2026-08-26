@@ -2,10 +2,10 @@
 
 A 3D soccer prototype built in Godot 4, aimed at an installable Android APK.
 This is the foundation for a much larger football game. Current milestone
-(v0.5): two real 3D character models (Tokai Teio, Agnes Digital) on the
-pitch simultaneously through the v0.4 reusable asset pipeline, on top of
-the v0.3 3v3(+GK) team match (AI teammates/opponents, switching,
-data-driven formations) and the v0.2 dribble/pass/shoot core.
+(v0.5): every one of the 8 players in the 3v3(+GK) test match is a real,
+distinct 3D character (11 total registered), through the v0.4 reusable
+asset pipeline, on top of the v0.3 team match (AI teammates/opponents,
+switching, data-driven formations) and the v0.2 dribble/pass/shoot core.
 
 ## Tech Stack
 
@@ -58,8 +58,9 @@ uma-soccer/
 ├── assets/
 │   └── characters/
 │       ├── CREDITS.md             # License/attribution for every character model -- read before adding assets
-│       ├── tokai_teio/            # tokai_teio.glb + its extracted textures
-│       └── agnes_digital/         # agnes_digital.glb + its extracted textures
+│       └── <11 model folders>     # tokai_teio, agnes_digital, tamamo_cross, oguri_cap, gold_ship,
+│                                   # symboli_rudolf, air_groove, tm_opera_o, grass_wonder,
+│                                   # mejiro_mcqueen, silence_suzuka -- each <name>.glb + extracted textures
 ├── scenes/
 │   ├── Main.tscn                  # Entry scene: field, ball, players container, camera, UI
 │   ├── Field.tscn                  # Ground, boundary walls, goals, goal triggers
@@ -234,44 +235,55 @@ Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
 `team_system_test.gd` covers spawning, team assignment, formation
 positioning, switching, possession transfer, AI movement, and goalkeeper
 behavior; `character_pipeline_test.gd` is data-driven over every
-`CharacterRegistry`-registered model (so a v0.6+ addition gets the full
-battery automatically) covering registry lookup, `AnimationController`'s
-real-model and placeholder-fallback paths (scale auto-fit, team-tint
-behavior, all states/actions, real-vs-procedural animation detection),
-gameplay parity with the placeholder, full-match spawn placement, and
-player switching / AI handoff / camera retargeting specifically for a
-real-model character; the other two re-validate the full v0.2/v0.3
-mechanics (dribble, pass, shot power/clamp, goal scoring, celebration,
-restart) now running with two real characters on the pitch.
-95 assertions total across all four suites, all passing.
+`CharacterRegistry`-registered model (11 as of this milestone; a future
+addition gets the full battery automatically, no new test code) covering
+registry lookup, `AnimationController`'s real-model and
+placeholder-fallback paths (scale auto-fit, team-tint behavior, all
+states/actions, real-vs-procedural animation detection), gameplay parity
+with the placeholder, full-match spawn placement, and player switching /
+AI handoff / camera retargeting specifically for a real-model character;
+the other two re-validate the full v0.2/v0.3 mechanics (dribble, pass,
+shot power/clamp, goal scoring, celebration, restart) now running with
+real characters filling the entire pitch.
+213 assertions total across all four suites, all passing.
 
 ## Current Feature Set (v0.5)
 
 - Everything from v0.3 (3v3+GK match, AI, switching, formations, possession
   tracking, per-team score) unchanged in feel
-- Two real 3D characters integrated (Tokai Teio, Agnes Digital — both glTF
-  binary, CC BY 4.0, see `assets/characters/CREDITS.md`) via the reusable,
-  data-driven pipeline (`CharacterRegistry` + `AnimationController`).
-  Adding the second required zero changes to `FootballPlayer`/
-  `AIController`/`PlayerController`/`TeamController`/`PossessionManager`/
-  `BallController`/`CameraController`/`MatchManager` — purely data
-  (one registry entry, one `visual_id` assignment, one credits block)
-- Both real characters are on the home roster, so both are actually
-  playable through switching, not just AI-visible
+- 11 real 3D characters integrated (all glTF binary, CC BY 4.0, see
+  `assets/characters/CREDITS.md`) via the reusable, data-driven pipeline
+  (`CharacterRegistry` + `AnimationController`). Every addition after the
+  first required zero changes to `FootballPlayer`/`AIController`/
+  `PlayerController`/`TeamController`/`PossessionManager`/
+  `BallController`/`CameraController`/`MatchManager` — purely data (one
+  registry entry, one `visual_id` assignment, one credits block each)
+- All 8 players in the active 3v3(+GK) match are real, distinct characters
+  on both teams — the placeholder capsule no longer appears in a normal
+  match, though it's still exercised directly by the test suite and used
+  automatically for any `PlayerData` without a `visual_id`
+- 3 further models (Grass Wonder, Mejiro McQueen, Silence Suzuka) are
+  registered and fully covered by the test suite but not currently
+  assigned to a match slot (all 8 are filled) — available immediately for
+  a future roster-size increase or manual swap
 - Automatic scale normalization (measured, not guessed) and orientation
-  handling for downloaded models with inconsistent conventions
+  handling for downloaded models with inconsistent conventions — verified
+  per-model via geometry (eye vs. hair mesh position), not assumed from
+  one model to the next
 - Procedural fallback animation (bob/lean/pulse) for the common case of a
   downloaded model with no animation clips, with a clean path to real
   clips later via keyword-matched state/action names
-- Remaining roster slots still use the original placeholder capsule,
-  proving the fallback and multiple real-model paths coexist correctly
-- Goal celebrations trigger automatically on the scoring team, including
-  for real-model characters
+- Goal celebrations trigger automatically on the scoring team for every
+  character, real or placeholder
 
 ## Roadmap Ideas (for expanding into a full game)
 
-- Integrate further character models as they're provided (same pipeline)
-- Full 11-a-side rosters and formations
+- Integrate the 5 models that couldn't be downloaded this round (Super
+  Creek, Satano Diamond, Twin Turbo, Meisho Doto Halloween, Calstone
+  Light O — see `assets/characters/CREDITS.md` for why) once re-shared in
+  a way this environment can fetch
+- Full 11-a-side rosters and formations (would also surface the 3
+  registered-but-unassigned models above)
 - AI passing decisions (currently AI ball-carriers dribble + auto-shoot only)
 - Ball trapping/first-touch skill mechanics
 - Match timer, possession stats
@@ -280,6 +292,6 @@ restart) now running with two real characters on the pitch.
 - Stadium environment, crowd, audio
 - Formation editor / tactic selection UI
 - Bone-count optimization pass on skinned character models for Android
-  (both models' ~400+ joints are mostly cosmetic cloth/hair physics chains
-  that currently just sit in bind pose; fine for a couple of characters on
-  screen, worth profiling as more are added)
+  (each model's ~400+ joints are mostly cosmetic cloth/hair physics chains
+  that currently just sit in bind pose; fine with 8 on screen at once so
+  far, worth profiling as more are added)

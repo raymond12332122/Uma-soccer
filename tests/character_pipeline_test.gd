@@ -76,7 +76,17 @@ func _run_tests() -> void:
 	for i in range(5):
 		await get_tree().physics_frame
 
+	# Not every registered model necessarily occupies a TestRoster slot
+	# (CharacterRegistry is the available pool; TestRoster's visual_id
+	# assignments are what actually appears in this particular match), so
+	# compare against the roster's own assignments rather than assuming
+	# every registered model is on the pitch.
 	var all_players: Array = main.home_players + main.away_players
+	var expected_real_count := 0
+	for p in all_players:
+		if p.player_data.visual_id != "":
+			expected_real_count += 1
+
 	var real_model_count := 0
 	var placeholder_count := 0
 	for p in all_players:
@@ -84,8 +94,8 @@ func _run_tests() -> void:
 			placeholder_count += 1
 		else:
 			real_model_count += 1
-	_check("Exactly %d spawned players use a real model" % registered_ids.size(), real_model_count == registered_ids.size())
-	_check("The remaining spawned players fall back to the placeholder", placeholder_count == all_players.size() - registered_ids.size())
+	_check("Real-model count matches the roster's visual_id assignments (%d)" % expected_real_count, real_model_count == expected_real_count)
+	_check("The remaining spawned players fall back to the placeholder", placeholder_count == all_players.size() - expected_real_count)
 	_check("home_players[1] (Agnes) uses the real model", not main.home_players[1].animation_controller.supports_team_tint())
 	_check("home_players[2] (Teio) uses the real model", not main.home_players[2].animation_controller.supports_team_tint())
 
