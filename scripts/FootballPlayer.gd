@@ -13,6 +13,14 @@ extends CharacterBody3D
 @export var team_id: int = 0
 @export var is_goalkeeper: bool = false
 
+## Behavioral tendencies, separate from player_data's football-ability
+## stats. Looked up from PersonalityProfiles by visual_id in
+## apply_player_data(); read by AIController (continuous decisions) and
+## PersonalityEventSystem (spontaneous events). Never null after
+## apply_player_data runs -- an unmatched key resolves to a neutral
+## (all-50) default profile.
+var personality: PersonalityData = PersonalityData.new()
+
 ## Normalized formation slot (see FormationManager), assigned by
 ## MatchManager at spawn time and used by TeamController/AIController and
 ## match-reset logic to know where this player belongs.
@@ -74,6 +82,36 @@ var _possession_cooldown_timer: float = 0.0
 var _shoot_charging: bool = false
 var _shoot_charge_elapsed: float = 0.0
 
+# ---- Personality bookkeeping (state only -- decisions live in
+# PersonalityEventSystem / AIController, never here) ----
+
+## Currently active personality event id, or "" if none. Set/cleared by
+## PersonalityEventSystem; TeamController checks this (indirectly, via
+## PersonalityEventSystem.tick()'s return value) to know whether to skip
+## normal AI for this player this frame.
+var active_personality_event: String = ""
+var personality_event_time_left: float = 0.0
+## event id -> seconds remaining before it can be considered again.
+var personality_event_cooldowns: Dictionary = {}
+## Scratch space an event's on_start/on_tick can stash data in (e.g. a
+## wander target); cleared automatically whenever a new event starts.
+var personality_scratch: Dictionary = {}
+## Non-empty while an active event wants a specific AnimationController
+## *state* (as opposed to a one-shot action) -- e.g. "sitting". Checked by
+## _update_animation_state() before the normal speed-based computation.
+var personality_visual_state_override: String = ""
+
+var time_since_last_touch: float = 0.0
+## Countdown windows (seconds) that stay >0 briefly after a momentary
+## event, so PersonalityEventSystem's per-second probability roll gets a
+## real chance to catch it instead of needing to hit an exact single
+## physics frame.
+var just_lost_possession_window: float = 0.0
+var just_missed_shot_window: float = 0.0
+var _pending_shot_check_timer: float = -1.0
+const _SHOT_MISS_CHECK_DELAY := 1.5
+const _MOMENTARY_TRIGGER_WINDOW := 0.6
+
 
 func _ready() -> void:
 	action_area.body_entered.connect(_on_action_area_entered)
@@ -109,6 +147,8 @@ func apply_player_data(data: PlayerData) -> void:
 	if animation_controller:
 		animation_controller.set_visual(data.visual_id)
 
+	personality = PersonalityProfiles.get_profile(data.visual_id)
+
 	if control_area:
 		var shape_node: CollisionShape3D = control_area.get_node("CollisionShape3D")
 		if shape_node and shape_node.shape:
@@ -131,19 +171,74 @@ func set_controlled_visual(is_controlled: bool) -> void:
 ## opponent (as opposed to picking up a loose ball) -- a reasonable, cheap
 ## proxy for "successfully tackled" without a dedicated tackle mechanic.
 func notify_possession_won_from_opponent() -> void:
-	if animation_controller:
+	if animation_controller == null:
+		return
+	# A notably competitive/aggressive character reacts more visibly to
+	# winning the ball than a plain "tackle" animation implies.
+	if personality.competitiveness > 75.0 or personality.aggression > 75.0:
+		animation_controller.play_action("excited_reaction")
+	else:
 		animation_controller.play_action("tackle")
 
 
 ## Called by MatchManager on every player of the scoring team after a goal.
+## Plain default celebration -- react_to_goal() below decides whether a
+## personality trait upgrades this to something more specific instead.
 func play_celebration() -> void:
 	if animation_controller:
 		animation_controller.play_action("celebration")
 
 
+## Called by MatchManager for every player after a goal (both teams), each
+## frame after play_celebration() has already been called for the scoring
+## side. This is the single authority on which pulse actually ends up
+## playing (AnimationController's pulse system holds only one action at a
+## time, so layering two calls would just mean the second silently wins)
+## -- every branch below is a *replacement* choice, not an addition.
+## Never touches gameplay state, purely a visual/animation decision.
+func react_to_goal(scored_by_own_team: bool) -> void:
+	if animation_controller == null:
+		return
+
+	if scored_by_own_team:
+		if personality.showmanship > 70.0:
+			animation_controller.play_action("victory_pose")
+		elif personality.playfulness > 70.0:
+			animation_controller.play_action("excited_reaction")
+		# else: leave play_celebration()'s "celebration" pulse in place.
+	else:
+		if personality.composure < 45.0:
+			animation_controller.play_action("frustrated_reaction")
+
+
+func has_active_personality_event() -> bool:
+	return active_personality_event != ""
+
+
+## Snapshot of this player's current AI-relevant state, for the debug
+## overlay and for tests -- never used by gameplay logic itself.
+func get_debug_info() -> Dictionary:
+	return {
+		"name": player_data.display_name if player_data else "?",
+		"visual_id": player_data.visual_id if player_data else "",
+		"team_id": team_id,
+		"is_goalkeeper": is_goalkeeper,
+		"has_possession": has_possession,
+		"active_personality_event": active_personality_event,
+		"personality_event_time_left": personality_event_time_left,
+		"stamina_ratio": (current_stamina / max_stamina) if max_stamina > 0.0 else 0.0,
+		"move_input": move_input,
+		"sprint_requested": sprint_requested,
+	}
+
+
 ## Clears all input intent and cancels any in-progress shot charge. Called
 ## when a player stops being human-controlled so it doesn't keep coasting
-## on stale input or fire a phantom shot mid-charge.
+## on stale input or fire a phantom shot mid-charge. Also clears any
+## active personality event (but NOT its cooldown) so switching to a
+## player mid-event, or a match restart, never leaves a human-controlled
+## character stuck sitting/wandering or an AI character frozen in a
+## stale event from before the reset.
 func reset_intent() -> void:
 	move_input = Vector2.ZERO
 	sprint_requested = false
@@ -151,6 +246,14 @@ func reset_intent() -> void:
 	pass_requested = false
 	_shoot_charging = false
 	_shoot_charge_elapsed = 0.0
+
+	active_personality_event = ""
+	personality_event_time_left = 0.0
+	personality_visual_state_override = ""
+	personality_scratch.clear()
+	just_lost_possession_window = 0.0
+	just_missed_shot_window = 0.0
+	_pending_shot_check_timer = -1.0
 
 
 func _physics_process(delta: float) -> void:
@@ -193,6 +296,7 @@ func _physics_process(delta: float) -> void:
 	_process_pass_input()
 	_process_shoot_input(delta)
 	_update_animation_state()
+	_update_personality_bookkeeping(delta)
 
 	if _control_lost_timer > 0.0:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
@@ -200,8 +304,38 @@ func _physics_process(delta: float) -> void:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
 
 
+## Pure bookkeeping for personality triggers -- no gameplay decisions are
+## made here, only timers/counters that PersonalityEvents' trigger_check
+## Callables read. Safe to run every frame regardless of who/what is
+## controlling this player.
+func _update_personality_bookkeeping(delta: float) -> void:
+	time_since_last_touch += delta
+
+	if just_lost_possession_window > 0.0:
+		just_lost_possession_window = maxf(0.0, just_lost_possession_window - delta)
+	if just_missed_shot_window > 0.0:
+		just_missed_shot_window = maxf(0.0, just_missed_shot_window - delta)
+
+	# Heuristic, not true shot-outcome tracking: if a shot was taken and
+	# this player still doesn't have the ball back by the time the check
+	# fires, treat it as "didn't immediately work out" for reaction
+	# purposes. Deliberately approximate and cosmetic-only -- it only ever
+	# feeds a brief animation reaction, never blocks or delays anything
+	# gameplay-relevant (goal detection, possession, restart all run
+	# independently of this).
+	if _pending_shot_check_timer > 0.0:
+		_pending_shot_check_timer -= delta
+		if _pending_shot_check_timer <= 0.0:
+			_pending_shot_check_timer = -1.0
+			if not has_possession:
+				just_missed_shot_window = _MOMENTARY_TRIGGER_WINDOW
+
+
 func _update_animation_state() -> void:
 	if animation_controller == null:
+		return
+	if personality_visual_state_override != "":
+		animation_controller.set_state(personality_visual_state_override)
 		return
 	var speed: float = Vector2(velocity.x, velocity.z).length()
 	var state: String
@@ -305,6 +439,10 @@ func _apply_kick_impulse(ball: RigidBody3D, power: float, is_shot: bool) -> void
 	has_possession = false
 	_control_lost_timer = 0.0
 	_possession_cooldown_timer = possession_release_cooldown
+	time_since_last_touch = 0.0
+
+	if is_shot:
+		_pending_shot_check_timer = _SHOT_MISS_CHECK_DELAY
 
 	if animation_controller:
 		animation_controller.play_action("shoot" if is_shot else "pass")
@@ -328,4 +466,9 @@ func _on_control_area_entered(body: Node3D) -> void:
 func _on_control_area_exited(body: Node3D) -> void:
 	if body == ball_in_control_range:
 		ball_in_control_range = null
+		# Distinguish a deliberate kick (possession_release_cooldown is
+		# already counting down from _apply_kick_impulse) from genuinely
+		# being dispossessed, for the "lost possession" personality trigger.
+		if has_possession and _possession_cooldown_timer <= 0.0:
+			just_lost_possession_window = _MOMENTARY_TRIGGER_WINDOW
 		has_possession = false

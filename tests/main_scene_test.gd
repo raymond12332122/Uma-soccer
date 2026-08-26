@@ -39,15 +39,21 @@ func _run_tests() -> void:
 	_check("Score label updates after goal", score_label.text == "Home 1 - 0 Away")
 	_check("Ball auto-resets to spawn after goal", ball.global_position.distance_to(ball.spawn_position) < 0.5)
 
+	# v0.6: the scoring team's reaction is personality-dependent -- high
+	# showmanship gets "victory_pose", high playfulness gets
+	# "excited_reaction", everyone else keeps the plain "celebration" from
+	# play_celebration(). All three are positive scoring reactions, so
+	# check for any of them rather than assuming uniform "celebration".
+	const POSITIVE_REACTIONS := ["celebration", "victory_pose", "excited_reaction"]
 	var scoring_team_celebrating := true
 	for p in main.home_players:
-		if p.animation_controller._pulse_kind != "celebration":
+		if not POSITIVE_REACTIONS.has(p.animation_controller._pulse_kind):
 			scoring_team_celebrating = false
-	_check("Scoring team's players trigger a celebration on goal", scoring_team_celebrating)
+	_check("Scoring team's players trigger a positive reaction on goal", scoring_team_celebrating)
 
 	var conceding_team_not_celebrating := true
 	for p in main.away_players:
-		if p.animation_controller._pulse_kind == "celebration":
+		if POSITIVE_REACTIONS.has(p.animation_controller._pulse_kind):
 			conceding_team_not_celebrating = false
 	_check("Conceding team's players do not celebrate", conceding_team_not_celebrating)
 

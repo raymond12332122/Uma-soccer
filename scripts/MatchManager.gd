@@ -2,9 +2,10 @@ extends Node3D
 
 ## Top-level orchestrator. Spawns both squads, wires up the (small,
 ## single-purpose) subsystems -- PossessionManager, TeamController x2,
-## PlayerController -- and owns match-level concerns: goal scoring,
-## player switching, and match restart. Everything else lives in its own
-## script; this file intentionally stays thin.
+## PlayerController, MatchMood, PersonalityEventSystem -- and owns
+## match-level concerns: goal scoring, player switching, and match
+## restart. Everything else lives in its own script; this file
+## intentionally stays thin.
 
 const HOME_COLOR := Color(0.964706, 0.960784, 0.309804, 1)
 const AWAY_COLOR := Color(0.85, 0.16, 0.16, 1)
@@ -29,9 +30,13 @@ var possession_manager: PossessionManager
 var home_team: TeamController
 var away_team: TeamController
 var player_controller: PlayerController
+var match_mood: MatchMood
+var personality_event_system: PersonalityEventSystem
+var debug_overlay: PersonalityDebugOverlay
 
 var _switch_key_was_pressed: bool = false
 var _restart_key_was_pressed: bool = false
+var _debug_key_was_pressed: bool = false
 
 
 func _ready() -> void:
@@ -40,6 +45,7 @@ func _ready() -> void:
 
 	_spawn_teams()
 	_setup_controllers()
+	_setup_debug_overlay()
 	_update_score_label()
 
 
@@ -76,6 +82,9 @@ func _setup_controllers() -> void:
 	add_child(possession_manager)
 	possession_manager.setup(home_players + away_players, ball)
 
+	match_mood = MatchMood.new()
+	personality_event_system = PersonalityEventSystem.new()
+
 	var home_goal: Vector3 = FormationManager.get_world_position(Vector2(-1, 0), 0)
 	var away_goal: Vector3 = FormationManager.get_world_position(Vector2(-1, 0), 1)
 
@@ -83,11 +92,13 @@ func _setup_controllers() -> void:
 	home_team.team_id = 0
 	add_child(home_team)
 	home_team.setup(home_players, ball, possession_manager, home_goal, away_goal)
+	home_team.set_personality_systems(match_mood, personality_event_system)
 
 	away_team = TeamController.new()
 	away_team.team_id = 1
 	add_child(away_team)
 	away_team.setup(away_players, ball, possession_manager, away_goal, home_goal)
+	away_team.set_personality_systems(match_mood, personality_event_system)
 
 	home_team.set_opponent_team(away_team)
 	away_team.set_opponent_team(home_team)
@@ -98,7 +109,16 @@ func _setup_controllers() -> void:
 	_set_human_player(home_players[DEFAULT_HUMAN_INDEX])
 
 
-func _physics_process(_delta: float) -> void:
+func _setup_debug_overlay() -> void:
+	debug_overlay = PersonalityDebugOverlay.new()
+	debug_overlay.match_manager = self
+	$UI.add_child(debug_overlay)
+
+
+func _physics_process(delta: float) -> void:
+	if match_mood:
+		match_mood.tick(delta)
+
 	var tab_now := Input.is_key_pressed(KEY_TAB)
 	var switch_requested: bool = InputState.switch_pressed or (tab_now and not _switch_key_was_pressed)
 	_switch_key_was_pressed = tab_now
@@ -111,6 +131,11 @@ func _physics_process(_delta: float) -> void:
 	if r_now and not _restart_key_was_pressed:
 		restart_match()
 	_restart_key_was_pressed = r_now
+
+	var f3_now := Input.is_key_pressed(KEY_F3)
+	if f3_now and not _debug_key_was_pressed and debug_overlay:
+		debug_overlay.toggle_visible()
+	_debug_key_was_pressed = f3_now
 
 
 func _switch_to_next_player() -> void:
@@ -137,19 +162,26 @@ func _set_human_player(player: FootballPlayer) -> void:
 func _on_goal_scored_right(body: Node3D) -> void:
 	if body.is_in_group("ball"):
 		home_score += 1
-		_after_goal(home_players)
+		_after_goal(home_players, away_players)
 
 
 func _on_goal_scored_left(body: Node3D) -> void:
 	if body.is_in_group("ball"):
 		away_score += 1
-		_after_goal(away_players)
+		_after_goal(away_players, home_players)
 
 
-func _after_goal(scoring_team: Array) -> void:
+func _after_goal(scoring_team: Array, conceding_team: Array) -> void:
 	_update_score_label()
+	if match_mood:
+		match_mood.notify_exciting_event()
+
 	for player in scoring_team:
 		player.play_celebration()
+		player.react_to_goal(true)
+	for player in conceding_team:
+		player.react_to_goal(false)
+
 	ball.reset_ball()
 	_reset_all_players()
 
@@ -161,6 +193,8 @@ func restart_match() -> void:
 	ball.reset_ball()
 	_reset_all_players()
 	_set_human_player(home_players[DEFAULT_HUMAN_INDEX])
+	if match_mood:
+		match_mood.notify_exciting_event()
 
 
 func _reset_all_players() -> void:
@@ -178,3 +212,15 @@ func _reset_player(player: FootballPlayer) -> void:
 
 func _update_score_label() -> void:
 	score_label.text = "Home %d - %d Away" % [home_score, away_score]
+
+
+## Debug/test hook: force a specific personality event onto a player right
+## now, bypassing its probability roll and trigger check. Used by the F3
+## debug overlay's forced-event shortcut and by automated tests that need
+## a deterministic event without waiting on RNG.
+func force_personality_event(player: FootballPlayer, event_id: String) -> bool:
+	if personality_event_system == null:
+		return false
+	var team: TeamController = home_team if player.team_id == 0 else away_team
+	var ctx: PersonalityContext = team._build_context(player)
+	return personality_event_system.force_trigger(player, event_id, ctx)

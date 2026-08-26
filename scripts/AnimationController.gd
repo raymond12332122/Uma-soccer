@@ -32,18 +32,27 @@ const STATE_KEYWORDS := {
 	"run": ["run", "jog"],
 	"sprint": ["sprint", "dash"],
 	"dribble": ["dribble"],
+	"sitting": ["sit"],
 }
 const ACTION_KEYWORDS := {
 	"pass": ["pass"],
 	"shoot": ["shoot", "kick"],
 	"celebration": ["celebrat", "cheer", "goal"],
 	"tackle": ["tackle", "slide"],
+	"look_around": ["look"],
+	"excited_reaction": ["excite", "hype"],
+	"frustrated_reaction": ["frustrat", "annoy"],
+	"victory_pose": ["victory", "pose", "triumph"],
 }
 const PULSE_DURATIONS := {
 	"pass": 0.3,
 	"shoot": 0.4,
 	"celebration": 0.9,
 	"tackle": 0.4,
+	"look_around": 0.8,
+	"excited_reaction": 0.7,
+	"frustrated_reaction": 0.6,
+	"victory_pose": 1.3,
 }
 
 var _visual_root: Node3D = null
@@ -163,6 +172,11 @@ func _apply_state_procedural(state: String) -> void:
 			bob_speed = 8.0
 			bob_height = 0.06
 			lean = 0.05
+		"sitting":
+			var sway: float = sin(_procedural_time * 1.2) * 0.015
+			_visual_root.position = Vector3(0, -0.55 + sway, 0)
+			_visual_root.rotation = Vector3(0.15, 0, 0)
+			return
 
 	var bob: float = sin(_procedural_time * bob_speed) * bob_height
 	_visual_root.position = Vector3(0, bob, 0)
@@ -184,6 +198,18 @@ func _apply_action_pulse(kind: String, t: float) -> void:
 		"tackle":
 			_visual_root.position = Vector3.ZERO
 			_visual_root.rotation = Vector3(0.3 * ease_out, 0, 0)
+		"look_around":
+			_visual_root.position = Vector3.ZERO
+			_visual_root.rotation = Vector3(0, sin(t * TAU * 0.5) * 0.6 * ease_out, 0)
+		"excited_reaction":
+			_visual_root.position = Vector3(0, absf(sin(t * PI * 3.0)) * 0.12 * ease_out, 0)
+			_visual_root.rotation = Vector3.ZERO
+		"frustrated_reaction":
+			_visual_root.position = Vector3.ZERO
+			_visual_root.rotation = Vector3(0, sin(t * PI * 4.0) * 0.15 * ease_out, 0)
+		"victory_pose":
+			_visual_root.position = Vector3(0, 0.2 * sin(t * PI) * ease_out + 0.1 * sin(t * PI), 0)
+			_visual_root.rotation = Vector3(-0.2 * ease_out, t * TAU * 1.5, 0)
 		_:
 			_visual_root.position = Vector3.ZERO
 			_visual_root.rotation = Vector3.ZERO

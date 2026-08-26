@@ -3,8 +3,18 @@ extends RefCounted
 
 ## Simple, stateless per-frame decision logic for AI-controlled players.
 ## TeamController calls these each physics frame for every player on its
-## roster that isn't the current human target. No memory/planning between
-## frames on purpose -- this is foundation-level AI, not tactics.
+## roster that isn't the current human target (and, since v0.6, that
+## doesn't have an active personality event driving it -- see
+## PersonalityEventSystem). No memory/planning between frames on purpose --
+## this is foundation-level AI, not tactics.
+##
+## Personality (player.personality) continuously modifies these decisions
+## via generic formulas reading trait values -- no per-character branches
+## here. A disciplined/tactically-aware character holds tighter formation
+## and marks tighter; a high-aggression/risk-taking character makes bigger
+## forward runs, sprints more readily, and shoots from further out; better
+## teamwork keeps tighter spacing. Every character's data alone accounts
+## for the behavioral differences.
 
 const SHOOT_RANGE := 9.0
 const SPACING_RADIUS := 6.0
@@ -32,18 +42,26 @@ static func update_player(
 
 	if attacking and player.has_possession:
 		# I have the ball -- carry it toward goal, shoot once in range.
+		# Confidence/risk-taking widen the range a character is willing
+		# to shoot from.
 		target = opponent_goal_pos
+		var shoot_range: float = _shoot_range(player)
 		var dist_to_goal: float = player.global_position.distance_to(opponent_goal_pos)
-		if dist_to_goal < SHOOT_RANGE:
-			player.execute_shot(clampf(1.0 - dist_to_goal / SHOOT_RANGE, 0.35, 1.0))
+		if dist_to_goal < shoot_range:
+			player.execute_shot(clampf(1.0 - dist_to_goal / shoot_range, 0.35, 1.0))
 	elif attacking:
 		# Support: push the formation slot toward goal, keep spacing.
-		var advance: Vector3 = _safe_normalize(opponent_goal_pos - formation_target) * 6.0
+		# Aggression/risk-taking widen the forward run; teamwork tightens
+		# spacing discipline.
+		var advance_distance: float = _advance_distance(player)
+		var advance: Vector3 = _safe_normalize(opponent_goal_pos - formation_target) * advance_distance
 		target = formation_target + advance + _spacing_offset(player, teammates)
 	else:
 		# Opponent has it, or the ball is loose: nearest teammate presses
 		# the most dangerous opponent (or the loose ball); everyone else
-		# holds a defensive-leaning shape.
+		# holds a defensive-leaning shape. Discipline/tactical_awareness
+		# pull that fallback shape further back toward goal (more
+		# conservative); low-discipline characters drift instead.
 		var dangerous_opponent: Node3D = _find_dangerous_opponent(opponents, own_goal_pos)
 		var press_point: Vector3 = dangerous_opponent.global_position if dangerous_opponent else ball.global_position
 		var marker: FootballPlayer = _closest_to(teammates, press_point)
@@ -51,10 +69,11 @@ static func update_player(
 		if marker == player:
 			target = press_point
 		else:
-			target = formation_target.lerp(own_goal_pos, 0.25)
+			var fallback_pull: float = lerp(0.1, 0.4, player.personality.discipline / 100.0)
+			target = formation_target.lerp(own_goal_pos, fallback_pull)
 
 	_move_toward(player, target, ARRIVE_RADIUS)
-	player.sprint_requested = player.global_position.distance_to(target) > SPRINT_DISTANCE
+	player.sprint_requested = player.global_position.distance_to(target) > _sprint_threshold(player)
 
 
 static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goal_pos: Vector3) -> void:
@@ -89,15 +108,46 @@ static func _move_toward(player: FootballPlayer, target: Vector3, arrive_radius:
 
 
 static func _spacing_offset(player: FootballPlayer, teammates: Array) -> Vector3:
+	var spacing_radius: float = lerp(4.0, 8.0, player.personality.teamwork / 100.0)
 	var offset := Vector3.ZERO
 	for mate in teammates:
 		if mate == player or mate.is_goalkeeper:
 			continue
 		var diff: Vector3 = player.global_position - mate.global_position
 		var dist := diff.length()
-		if dist < SPACING_RADIUS and dist > 0.01:
-			offset += diff.normalized() * (SPACING_RADIUS - dist) * 0.5
+		if dist < spacing_radius and dist > 0.01:
+			offset += diff.normalized() * (spacing_radius - dist) * 0.5
 	return offset
+
+
+## Higher aggression/risk-taking/impulsiveness -> bigger forward runs when
+## supporting an attack; higher discipline pulls that back in slightly so
+## a disciplined-but-aggressive character doesn't fully abandon shape.
+static func _advance_distance(player: FootballPlayer) -> float:
+	var p: PersonalityData = player.personality
+	var eagerness: float = (p.aggression + p.risk_taking) / 2.0
+	var distance: float = lerp(3.0, 9.0, eagerness / 100.0)
+	distance -= (p.discipline - 50.0) * 0.02
+	return clampf(distance, 2.0, 10.0)
+
+
+## Higher aggression/risk-taking/impulsiveness -> sprints from further
+## away (more eager); higher stamina_management/composure -> waits until
+## closer (doesn't waste energy / stays composed).
+static func _sprint_threshold(player: FootballPlayer) -> float:
+	var p: PersonalityData = player.personality
+	var eagerness: float = (p.aggression + p.risk_taking + p.impulsiveness) / 3.0
+	var restraint: float = (p.stamina_management + p.composure) / 2.0
+	var threshold: float = SPRINT_DISTANCE - (eagerness - 50.0) * 0.06 + (restraint - 50.0) * 0.04
+	return clampf(threshold, 4.0, 14.0)
+
+
+## Higher confidence/risk-taking -> willing to shoot from further out.
+static func _shoot_range(player: FootballPlayer) -> float:
+	var p: PersonalityData = player.personality
+	var boldness: float = (p.confidence + p.risk_taking) / 2.0
+	var range_val: float = SHOOT_RANGE + (boldness - 50.0) * 0.1
+	return clampf(range_val, 6.0, 14.0)
 
 
 static func _find_dangerous_opponent(opponents: Array, own_goal_pos: Vector3) -> Node3D:
