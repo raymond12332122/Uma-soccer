@@ -3,11 +3,14 @@ extends Node3D
 
 @export var target_path: NodePath
 @export var ball_path: NodePath
-@export var follow_speed: float = 5.0
+@export var follow_speed: float = 5.5
 @export var ball_bias: float = 0.28
-@export var base_camera_offset: Vector3 = Vector3(0, 9, 7)
-@export var max_extra_back: float = 4.0
-@export var zoom_distance_threshold: float = 9.0
+## Closer/lower than the old distant-simulation framing (was Vector3(0, 9, 7))
+## -- players read clearly on a phone screen while still keeping enough
+## pitch in view for tactical awareness.
+@export var base_camera_offset: Vector3 = Vector3(0, 6, 4.6)
+@export var max_extra_back: float = 3.0
+@export var zoom_distance_threshold: float = 7.0
 
 @onready var camera: Camera3D = $Camera3D
 

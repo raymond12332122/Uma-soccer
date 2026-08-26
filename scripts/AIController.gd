@@ -49,6 +49,14 @@ const GK_FORWARD_RANGE := 2.5
 const GK_DANGER_DISTANCE := 7.0
 const GK_ARRIVE_RADIUS := 0.25
 
+## Minimum distance a supporting (non-carrier) attacking teammate's target
+## is allowed to end up from the ball/carrier -- keeps support runs
+## spreading into passing lanes around the carrier instead of converging
+## on top of them, which read as "AI just follows me" at close range.
+## Applies equally to a human or AI carrier; nothing here is aware of
+## which one it is.
+const MIN_SUPPORT_DISTANCE_FROM_BALL := 3.2
+
 ## Formation-role-category multipliers -- generic positional tendencies,
 ## not character-specific. Forwards make the biggest attacking runs and
 ## give the least defensive recovery ("limited defensive support");
@@ -99,10 +107,18 @@ static func update_player(
 		# Wingers additionally stay wide to stretch the field rather than
 		# drifting in toward the ball/center.
 		var advance_distance: float = _advance_distance(player) * ROLE_ATTACK_MULT.get(category, 1.0)
-		var advance: Vector3 = _safe_normalize(opponent_goal_pos - formation_target) * advance_distance
+		# Pure attack-axis direction rather than "straight at the goal
+		# mouth" -- the latter makes every role's advance vector
+		# converge toward the same central point as it lengthens, which
+		# is what made support runs look like they were all collapsing
+		# in on the ball/carrier. Each role keeps its own lane; lateral
+		# variety comes from formation_target itself (already
+		# ball-reactive -- see FormationManager.get_dynamic_position).
+		var advance: Vector3 = Vector3(signf(opponent_goal_pos.x - own_goal_pos.x), 0.0, 0.0) * advance_distance
 		target = formation_target + advance + _spacing_offset(player, teammates)
 		if player.formation_role == "LW" or player.formation_role == "RW":
 			target.z = formation_target.z * WINGER_WIDTH_STRETCH
+		target = _keep_support_distance(target, ball.global_position)
 	else:
 		# Opponent has it, or the ball is loose: the team's nominated
 		# ball_challenger presses the ball directly; everyone else holds a
@@ -170,6 +186,19 @@ static func find_dangerous_opponent(opponents: Array, own_goal_pos: Vector3) -> 
 			best_dist = d
 			best = opp
 	return best
+
+
+## Pushes a support target outward if it ends up closer than
+## MIN_SUPPORT_DISTANCE_FROM_BALL to the ball -- keeps supporting
+## teammates spread into open passing lanes around the carrier instead of
+## converging on top of them (see the const doc comment above).
+static func _keep_support_distance(target: Vector3, ball_pos: Vector3) -> Vector3:
+	var diff := Vector2(target.x, target.z) - Vector2(ball_pos.x, ball_pos.z)
+	var dist := diff.length()
+	if dist >= MIN_SUPPORT_DISTANCE_FROM_BALL or dist < 0.001:
+		return target
+	var pushed: Vector2 = diff.normalized() * MIN_SUPPORT_DISTANCE_FROM_BALL
+	return Vector3(ball_pos.x + pushed.x, target.y, ball_pos.z + pushed.y)
 
 
 static func _move_toward(player: FootballPlayer, target: Vector3, arrive_radius: float) -> void:

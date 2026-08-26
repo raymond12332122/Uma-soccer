@@ -133,19 +133,41 @@ uma-soccer/
 | Sprint   | Hold Shift          | Hold SPRINT button       |
 | Pass     | Tap F               | Tap PASS button           |
 | Shoot    | Hold Space, release | Hold SHOOT, release       |
-| Switch   | Tap Tab             | Tap SWITCH button          |
+| Switch   | Tap Tab             | Tap SWAP button          |
 | Restart  | Tap R               | (desktop-only for now)      |
 
 Shooting is charge-based: the longer Space/SHOOT is held before release, the
-harder the shot (up to a capped max speed). Passing is a fixed, lower-power
-tap. Both fire in the direction you're currently moving, or the direction
-you're facing if you're standing still. Switch cycles through your team's 4
-players (GK included); the controlled player has a glowing ring underfoot
-and a name label overhead so it's always obvious who you're playing as.
+harder the shot (up to a capped max speed) -- the SHOOT button itself fills
+in with a charge ring while held, on top of the same mechanic. Passing is a
+fixed, lower-power tap. Both fire in the direction you're currently moving,
+or the direction you're facing if you're standing still. Switch cycles
+through your team's 11 players; the controlled player has a glowing ring
+underfoot and a name label overhead (the only player on the pitch that gets
+one -- see the HUD section below) so it's always obvious who you're playing
+as.
 
-Touch controls also work with a mouse in the Godot editor, since Godot
-translates mouse input into GUI touch-equivalent events automatically — no
-Android device needed to test the full control scheme.
+### Mobile HUD & true multitouch (v0.8)
+
+`scripts/HUD.gd` (`scenes/UI/HUD.tscn`) owns every on-screen control plus a
+single central per-finger input dispatcher, replacing the old
+Button/gui_input-based touch controls. Godot's default
+"emulate_mouse_from_touch" setting (now disabled in `project.godot`)
+resolves every touch through *one* synthesized mouse pointer, which is why
+the joystick and action buttons used to fight each other -- holding SHOOT
+while dragging the joystick was effectively "one finger, two jobs". Now
+each `InputEventScreenTouch.index` (a real, independent finger) is bound
+exclusively to whichever control it first touches down on
+(`scripts/ui/VirtualJoystick.gd` / `scripts/ui/TouchButton.gd`, both
+self-drawing `Control`s that never touch Godot's `Button`/mouse-emulation
+path), so the joystick and any combination of SHOOT/PASS/SPRINT can be held
+at once by separate fingers. Desktop/editor testing still works via the
+mouse, handled through the same dispatcher under a reserved finger index.
+
+The HUD layout is a top bar (score + match timer), a top-left panel
+(controlled character's name + a stamina bar that tints gold while
+sprinting), a large joystick in the bottom-left corner, and a SHOOT/PASS/
+SPRINT thumb cluster in the bottom-right corner, all anchored close to the
+screen edges for one-handed reach.
 
 ## Ball Control / Dribbling
 
@@ -157,11 +179,37 @@ sharply at speed, sprinting, or passing/shooting all break this steering
 (with a brief cooldown after a kick before control can be regained), so
 losing the ball on a bad touch is a real possibility, not just cosmetic.
 
-## Team AI (v0.3, extended v0.7)
+**Contested-ball fix (v0.8).** `has_possession` is a purely local flag (in
+sensor range + no cooldown), so two opposing players standing in the ball's
+control range used to both apply this steering force every frame --
+opposing pulls and dampers that cancel out at equilibrium, freezing the
+ball in place until one side physically shoved it clear. `PossessionManager`
+already elects one carrier generically (closest, with hysteresis so it
+doesn't flicker); now only that elected carrier actively steers the ball --
+see `FootballPlayer._update_possession()`. The loser still physically
+collides with the ball via normal capsule/rigidbody contact, so a contest
+still feels physical instead of the ball going inert.
+
+## Team AI (v0.3, extended v0.7, v0.8)
 
 Simple, reactive, no lookahead or tactics -- the base decision loop from
-v0.3 is unchanged; v0.7 (below) adds formation-role awareness on top:
+v0.3 is unchanged; v0.7 added formation-role awareness; v0.8 makes the
+formation targets themselves alive:
 
+- **Ball-reactive team shape (v0.8).** `FormationManager.get_dynamic_position()`
+  continuously shifts each player's formation target with the ball's
+  current location (weighted by role -- defenders barely shift
+  longitudinally but stay compact laterally; forwards/midfielders shift
+  more both ways), instead of a permanently fixed coordinate. A static
+  target was the actual cause of players "not moving" -- a defender whose
+  slot happened to be far from wherever play currently was just sat at
+  that exact spot indefinitely.
+- **Support spacing (v0.8).** Supporting attackers advance along the pure
+  attack axis (not "straight at the goal mouth", which made every role's
+  run converge toward the same central point) and are pushed outward if
+  they'd end up within `AIController.MIN_SUPPORT_DISTANCE_FROM_BALL` of the
+  carrier -- teammates spread into open passing lanes instead of stacking
+  on whoever (human or AI) currently has the ball.
 - **Offense** (own team has the ball): the carrier dribbles toward goal and
   auto-shoots once in range; teammates push into space ahead of their
   formation slot and keep spacing from each other (repel when too close, so
@@ -447,6 +495,7 @@ godot --headless --path . tests/TeamSystemTest.tscn
 godot --headless --path . tests/CharacterPipelineTest.tscn
 godot --headless --path . tests/PersonalityTest.tscn
 godot --headless --path . tests/V0_7MatchTest.tscn
+godot --headless --path . tests/V0_8PlaytestFixesTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
@@ -486,10 +535,21 @@ handing off on a genuine change, and the full 22-player goal/restart reset
 (formation return, both goalkeepers back on their line, cleared personality
 events, retained camera target); the other two re-validate the full v0.2/
 v0.3 mechanics (dribble, pass, shot power/clamp, goal scoring, celebration,
-restart) now running with real characters filling the entire pitch.
-345 assertions total across all six suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
+restart) now running with real characters filling the entire pitch;
+`v0_8_playtest_fixes_test.gd` is the newest suite, covering the manual-
+playtest fix pass: a two-player contested-ball scenario that used to freeze
+(now proven to keep moving and resolve to a single carrier),
+`is_currently_sprinting`/stamina drain+regen smoothness, a ball fired
+directly at a goal post being physically blocked by the new goal geometry,
+`HUD.gd`'s multitouch dispatcher holding the joystick and SHOOT
+independently on two separate synthetic finger IDs at once (drag one,
+release either, both stay correctly isolated), a far-side defender still
+moving under the new ball-reactive formation targets instead of sitting
+frozen at a static spawn point, and supporting teammates keeping a passing
+distance from the ball carrier instead of stacking on top of them.
+362 assertions total across all seven suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
 
-## Current Feature Set (v0.7)
+## Current Feature Set (v0.7, extended v0.8)
 
 - Full 11v11 match on a data-driven 4-3-3 formation — 22 players, 11 per
   team, exactly 2 goalkeepers, every non-GK slot assigned a specific role
@@ -551,6 +611,15 @@ restart) now running with real characters filling the entire pitch.
 - Gold Ship was moved from goalkeeper to outfield defender (Symboli
   Rudolf now keeps goal) so her chaotic events can never affect the one
   position that must stay disciplined near the goal line
+- **(v0.8)** A real mobile football HUD (`scripts/HUD.gd` /
+  `scenes/UI/HUD.tscn`) with true independent-finger multitouch, a
+  ball-reactive AI positioning system that keeps every player alive and
+  properly spaced instead of idling at a static formation slot, a
+  contested-ball fix so two players fighting for the ball can never freeze
+  it, a closer mobile-scale camera, a fully enclosed stadium (tiered
+  stands, end stands, team benches, corner flags), and a real goal frame
+  (posts, crossbar, back stanchions, and a semi-transparent net) instead of
+  three bare tubes — see the sections above for each in detail
 
 ## Roadmap Ideas (for expanding into a full game)
 

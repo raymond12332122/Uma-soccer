@@ -130,14 +130,14 @@ The project's own automated regression suite (assertion-based, separate
 from the driver above):
 
 ```bash
-for scene in GameplayTest MainSceneTest TeamSystemTest CharacterPipelineTest PersonalityTest V0_7MatchTest; do
+for scene in GameplayTest MainSceneTest TeamSystemTest CharacterPipelineTest PersonalityTest V0_7MatchTest V0_8PlaytestFixesTest; do
   $GODOT --headless --path . tests/$scene.tscn
 done
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check, a `TEST_SUMMARY: ALL PASS` (or
-`FAILURES PRESENT`) line, and exits non-zero on any failure. 323
-assertions total across the six suites as of v0.7.
+`FAILURES PRESENT`) line, and exits non-zero on any failure. 362
+assertions total across the seven suites as of v0.8.
 
 ---
 

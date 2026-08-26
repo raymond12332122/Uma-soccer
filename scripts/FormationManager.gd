@@ -66,3 +66,42 @@ static func get_world_position(normalized: Vector2, team_id: int, field_half_len
 	var x := normalized.x * field_half_length * side
 	var z := normalized.y * field_half_width
 	return Vector3(x, 1.0, z)
+
+
+## Role-category shift weights for get_dynamic_position -- how much a
+## player's formation target reacts to the ball's current location.
+## Generic (role-based only, never character-specific): defenders barely
+## shift longitudinally (hold depth) but do compress laterally to stay
+## compact; forwards/midfielders push further with the ball both ways.
+const _DYNAMIC_LONGITUDINAL_MULT := {"GK": 0.0, "DEF": 0.12, "MID": 0.22, "FWD": 0.30}
+const _DYNAMIC_LATERAL_MULT := {"GK": 0.0, "DEF": 0.35, "MID": 0.55, "FWD": 0.45}
+
+## Same as get_world_position, but the resulting spot continuously shifts
+## with the ball's current position instead of sitting at a permanently
+## fixed coordinate. This is what makes team shape look alive: a static
+## formation_target only ever changes across a goal/restart, so a player
+## whose slot happens to be far from wherever play currently is just sits
+## motionless at that exact spot indefinitely -- the actual root cause of
+## "some players barely move or do not move at all". Shifting the base
+## target itself (rather than only the attacking-support "advance" vector)
+## means the fallback-defensive branch benefits too, since it derives its
+## target from this same value.
+static func get_dynamic_position(normalized: Vector2, team_id: int, ball_pos: Vector3, category: String, field_half_length: float = FIELD_HALF_LENGTH, field_half_width: float = FIELD_HALF_WIDTH) -> Vector3:
+	var base: Vector3 = get_world_position(normalized, team_id, field_half_length, field_half_width)
+	var side := 1.0 if team_id == 0 else -1.0
+
+	# -1 (ball deep in our own half) .. +1 (ball deep in the opponent half).
+	var ball_progress: float = clampf((ball_pos.x * side) / field_half_length, -1.0, 1.0)
+	# -1 (ball on the near touchline) .. +1 (ball on the far touchline).
+	var ball_lateral: float = clampf(ball_pos.z / field_half_width, -1.0, 1.0)
+
+	var longitudinal_mult: float = _DYNAMIC_LONGITUDINAL_MULT.get(category, 0.2)
+	var lateral_mult: float = _DYNAMIC_LATERAL_MULT.get(category, 0.4)
+
+	var shift_x: float = ball_progress * field_half_length * longitudinal_mult * side
+	var shift_z: float = ball_lateral * field_half_width * lateral_mult
+
+	var result: Vector3 = base + Vector3(shift_x, 0.0, shift_z)
+	result.x = clampf(result.x, -field_half_length - 4.0, field_half_length + 4.0)
+	result.z = clampf(result.z, -field_half_width - 2.0, field_half_width + 2.0)
+	return result

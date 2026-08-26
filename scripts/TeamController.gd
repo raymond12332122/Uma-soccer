@@ -75,7 +75,8 @@ func _physics_process(delta: float) -> void:
 		if player.is_goalkeeper:
 			AIController.update_goalkeeper(player, ball, own_goal_pos)
 		else:
-			var target: Vector3 = FormationManager.get_world_position(player.formation_slot, team_id)
+			var category: String = FormationManager.role_category(player.formation_role)
+			var target: Vector3 = FormationManager.get_dynamic_position(player.formation_slot, team_id, ball.global_position, category)
 			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target, ball_challenger, dangerous_opponent)
 
 		if personality_events and mood:

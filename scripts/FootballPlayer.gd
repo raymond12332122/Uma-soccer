@@ -41,6 +41,11 @@ var formation_role: String = ""
 var teammates: Array = []
 var opponents: Array = []
 
+## Wired once by MatchManager alongside set_match_context. Used only to
+## resolve contested-ball duels generically (see _update_possession) --
+## never read for anything else here.
+var possession_manager: PossessionManager = null
+
 # ---- Intent, written externally each physics frame ----
 var move_input: Vector2 = Vector2.ZERO
 var sprint_requested: bool = false
@@ -96,6 +101,11 @@ var ball_in_control_range: RigidBody3D = null
 
 var has_possession: bool = false
 var _facing_angle: float = 0.0
+
+## Set each physics frame in _physics_process -- whether this player was
+## actually sprinting (requesting it, moving, and had stamina left) this
+## tick, for the HUD's sprint indicator to read on the controlled player.
+var is_currently_sprinting: bool = false
 
 var _control_lost_timer: float = 0.0
 var _possession_cooldown_timer: float = 0.0
@@ -186,14 +196,24 @@ func set_match_context(p_teammates: Array, p_opponents: Array) -> void:
 	opponents = p_opponents
 
 
+## Wired once by MatchManager right after PossessionManager is created.
+func set_possession_manager(pm: PossessionManager) -> void:
+	possession_manager = pm
+
+
 func set_team_color(color: Color) -> void:
 	if animation_controller:
 		animation_controller.set_team_color(color)
 
 
+## Name labels stay hidden for every AI player by default (22 of them
+## floating permanently is pure clutter) -- only the controlled player
+## gets a name marker, alongside the ring indicator underfoot.
 func set_controlled_visual(is_controlled: bool) -> void:
 	if control_indicator:
 		control_indicator.visible = is_controlled
+	if name_label:
+		name_label.visible = is_controlled
 
 
 ## Called by PossessionManager when this player wins the ball away from an
@@ -238,6 +258,14 @@ func react_to_goal(scored_by_own_team: bool) -> void:
 	else:
 		if personality.composure < 45.0:
 			animation_controller.play_action("frustrated_reaction")
+
+
+## 0.0 when not charging a shot, otherwise how far through the charge
+## window (0..1) -- read by the HUD to fill the SHOOT button's charge ring.
+func get_shoot_charge_ratio() -> float:
+	if not _shoot_charging or shoot_charge_time <= 0.0:
+		return 0.0
+	return clampf(_shoot_charge_elapsed / shoot_charge_time, 0.0, 1.0)
 
 
 func has_active_personality_event() -> bool:
@@ -290,6 +318,7 @@ func reset_intent() -> void:
 func _physics_process(delta: float) -> void:
 	var wants_sprint: bool = sprint_requested and move_input.length() > 0.1
 	var sprinting: bool = wants_sprint and current_stamina > 0.0
+	is_currently_sprinting = sprinting
 
 	if sprinting:
 		current_stamina = maxf(0.0, current_stamina - stamina_drain_rate * delta)
@@ -410,6 +439,25 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	has_possession = true
 
 	if _control_lost_timer > 0.0:
+		return
+
+	# Contested-ball fix: has_possession above is purely local (sensor
+	# range + cooldown), so two opposing players standing in the same
+	# ball's control range both used to reach this point and apply
+	# opposing spring/damper forces every frame -- their pulls and
+	# dampers cancel out at equilibrium, freezing the ball in place
+	# until one side physically shoved it clear. PossessionManager
+	# already elects a single carrier generically (closest, with
+	# hysteresis so it doesn't flicker) -- once it has done so, only
+	# that elected carrier actively steers the ball. The loser applies
+	# no steering force at all, so there is never a second opposing
+	# force to cancel against; the ball still responds normally to
+	# both players' physical capsule collisions, so a contest still
+	# looks/feels physical rather than the ball going inert. On the
+	# rare first frame of a brand new contest (before PossessionManager
+	# has run this tick and elected anyone), current_carrier can briefly
+	# be null/stale for one frame -- harmless, self-corrects next tick.
+	if possession_manager and possession_manager.current_carrier != null and possession_manager.current_carrier != self:
 		return
 
 	# Close control also degrades gradually with fatigue (weaker steering

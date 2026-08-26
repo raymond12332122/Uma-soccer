@@ -31,6 +31,12 @@ var _football_player_scene: PackedScene = preload("res://scenes/FootballPlayer.t
 var home_score: int = 0
 var away_score: int = 0
 
+## Simple count-up match clock in seconds, read by the HUD's timer label.
+## Purely cosmetic -- nothing gameplay-relevant depends on it (no halves/
+## injury time yet), so it just keeps counting and resets alongside score
+## on restart_match().
+var match_time_elapsed: float = 0.0
+
 var home_players: Array = []
 var away_players: Array = []
 
@@ -55,6 +61,10 @@ func _ready() -> void:
 	_setup_controllers()
 	_setup_debug_overlay()
 	_update_score_label()
+
+	var hud: Node = $UI.get_node_or_null("HUD")
+	if hud:
+		hud.match_manager = self
 
 
 func _spawn_teams() -> void:
@@ -97,6 +107,8 @@ func _setup_controllers() -> void:
 	possession_manager = PossessionManager.new()
 	add_child(possession_manager)
 	possession_manager.setup(home_players + away_players, ball)
+	for p in home_players + away_players:
+		p.set_possession_manager(possession_manager)
 
 	match_mood = MatchMood.new()
 	personality_event_system = PersonalityEventSystem.new()
@@ -132,6 +144,8 @@ func _setup_debug_overlay() -> void:
 
 
 func _physics_process(delta: float) -> void:
+	match_time_elapsed += delta
+
 	if match_mood:
 		match_mood.tick(delta)
 
@@ -252,6 +266,7 @@ func _after_goal(scoring_team: Array, conceding_team: Array) -> void:
 func restart_match() -> void:
 	home_score = 0
 	away_score = 0
+	match_time_elapsed = 0.0
 	_update_score_label()
 	ball.reset_ball()
 	_reset_all_players()
@@ -275,6 +290,12 @@ func _reset_player(player: FootballPlayer) -> void:
 
 func _update_score_label() -> void:
 	score_label.text = "Home %d - %d Away" % [home_score, away_score]
+
+
+## "MM:SS" for the HUD's match timer label.
+func get_match_time_string() -> String:
+	var total_seconds: int = int(match_time_elapsed)
+	return "%02d:%02d" % [total_seconds / 60, total_seconds % 60]
 
 
 ## Debug/test hook: force a specific personality event onto a player right
