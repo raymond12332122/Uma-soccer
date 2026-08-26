@@ -29,6 +29,20 @@ var personality_events: PersonalityEventSystem
 var own_goal_pos: Vector3
 var opponent_goal_pos: Vector3
 
+## v0.8.2: which player is currently pressing the ball, kept sticky across
+## frames (see _pick_ball_challenger) so it doesn't flicker between two
+## similarly-placed defenders as the ball moves -- a fresh nearest-player
+## recompute every single frame with no memory at all was the actual cause
+## of "defenders swarm/chase the ball": whichever of two close defenders
+## was a hair's-breadth closer would flip frame to frame, so both would
+## visibly dash in and out toward the ball instead of exactly one of them
+## committing to press while the other held shape.
+var _current_challenger: FootballPlayer = null
+## A challenger candidate must be closer than the current one by more than
+## this margin to take over -- same spirit as PossessionManager's own
+## HYSTERESIS_MARGIN, applied to the same kind of "who's closest" jitter.
+const CHALLENGER_HYSTERESIS_MARGIN := 1.2
+
 
 func setup(p_players: Array, p_ball: RigidBody3D, p_possession: PossessionManager, p_own_goal: Vector3, p_opponent_goal: Vector3) -> void:
 	players = p_players
@@ -59,7 +73,7 @@ func _physics_process(delta: float) -> void:
 	# non-challenging player used to redo an equivalent O(opponents) scan
 	# independently at 11-a-side, which is real duplicated work.
 	# AIController.update_player just reads the shared result below.
-	var ball_challenger: FootballPlayer = AIController.find_ball_challenger(players, ball)
+	var ball_challenger: FootballPlayer = _pick_ball_challenger()
 	var dangerous_opponent: Node3D = AIController.find_dangerous_opponent(opponent_team.players, own_goal_pos)
 
 	for player in players:
@@ -81,6 +95,29 @@ func _physics_process(delta: float) -> void:
 
 		if personality_events and mood:
 			personality_events.maybe_trigger(player, delta, ctx)
+
+
+## Sticky version of AIController.find_ball_challenger -- see
+## _current_challenger's doc comment for why plain nearest-player-every-
+## frame flickered between defenders.
+func _pick_ball_challenger() -> FootballPlayer:
+	var nearest: FootballPlayer = AIController.find_ball_challenger(players, ball)
+	if nearest == null:
+		_current_challenger = null
+		return null
+
+	if _current_challenger == null or not is_instance_valid(_current_challenger) or _current_challenger.is_goalkeeper:
+		_current_challenger = nearest
+		return _current_challenger
+
+	if _current_challenger == nearest:
+		return _current_challenger
+
+	var current_dist: float = _current_challenger.global_position.distance_to(ball.global_position)
+	var nearest_dist: float = nearest.global_position.distance_to(ball.global_position)
+	if nearest_dist + CHALLENGER_HYSTERESIS_MARGIN < current_dist:
+		_current_challenger = nearest
+	return _current_challenger
 
 
 func _build_context(player: FootballPlayer) -> PersonalityContext:

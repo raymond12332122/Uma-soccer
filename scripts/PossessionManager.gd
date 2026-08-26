@@ -21,6 +21,24 @@ var current_carrier: FootballPlayer = null
 var possessing_team: int = -1
 var is_loose: bool = true
 
+## v0.8.2: unlike possessing_team (which drops to -1 the instant the ball
+## is loose, even for a single physics tick), this only ever updates when
+## a player genuinely takes clear possession -- it stays put through a
+## brief bounce/50-50/contest. AIController's team-shape decisions read
+## this instead of possessing_team: without it, "opponent has it" and "the
+## ball momentarily bounced loose off my own teammate's foot" were
+## indistinguishable, so the whole team's attacking shape (forwards'
+## advanced runs especially) instantly, jarringly collapsed back to
+## defensive recovery on every single loose touch, then re-advanced a
+## moment later -- read as "gave up the run" even mid-attack. Reactive
+## things (who presses, individual has_possession) still use the true
+## instantaneous state; only shape/positioning smooths over this.
+var last_team_with_possession: int = -1
+## Seconds since last_team_with_possession actually changed -- a short
+## window after it does is a genuine transition (see AIController.AIState
+## TRANSITION_ATTACK/TRANSITION_DEFENSE), not just an ordinary loose ball.
+var time_since_last_team_change: float = 0.0
+
 var _tracked_players: Array = []
 var _ball: RigidBody3D = null
 
@@ -30,7 +48,7 @@ func setup(players: Array, ball: RigidBody3D) -> void:
 	_ball = ball
 
 
-func _physics_process(_delta: float) -> void:
+func _physics_process(delta: float) -> void:
 	if _ball == null:
 		return
 
@@ -56,3 +74,8 @@ func _physics_process(_delta: float) -> void:
 	current_carrier = best
 	possessing_team = best.team_id if best else -1
 	is_loose = best == null
+
+	time_since_last_team_change += delta
+	if best != null and best.team_id != last_team_with_possession:
+		last_team_with_possession = best.team_id
+		time_since_last_team_change = 0.0

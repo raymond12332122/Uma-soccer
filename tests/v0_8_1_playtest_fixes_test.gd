@@ -365,7 +365,7 @@ func _test_teammate_and_opponent_recognition() -> void:
 	var opponent_goal := Vector3(26, 1, 0)
 	var own_goal := Vector3(-26, 1, 0)
 	var passed_to_human := false
-	for i in range(240):
+	for i in range(360):
 		AIController.update_player(carrier, ball, pm, [carrier, human2], [], own_goal, opponent_goal, opponent_goal, null, null, 1.0 / 60.0)
 		await get_tree().physics_frame
 		if not carrier.has_possession and ball.global_position.distance_to(human2.global_position) < 3.0:

@@ -497,6 +497,7 @@ godot --headless --path . tests/PersonalityTest.tscn
 godot --headless --path . tests/V0_7MatchTest.tscn
 godot --headless --path . tests/V0_8PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_1PlaytestFixesTest.tscn
+godot --headless --path . tests/V0_8_2PlaytestFixesTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
@@ -564,10 +565,23 @@ toward the human player like any other teammate, a fast tap on SHOOT still
 firing a shot even when the press and release both land inside the same
 physics-tick gap, and switching the controlled player mid-charge never
 crediting a phantom shot to whoever is controlled by the time a
-still-held finger is released.
-396 assertions total across all eight suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
+still-held finger is released; `v0_8_2_playtest_fixes_test.gd` is the
+latest suite, covering the football-intelligence pass: the ball settling
+close to the feet at a standstill and loosening (but never fully letting
+go) while sprinting, the retuned dribble spring still never freezing a
+contested ball, a forward's shape surviving a brief loose-ball moment
+mid-attack instead of snapping back to defensive recovery, a real
+turnover correctly producing `TRANSITION_DEFENSE`, ball-challenger
+hysteresis holding through a sub-margin jitter (no defender-swarm
+flicker), the AI's omnidirectional pass search finding a teammate
+directly behind the carrier that the human PASS button's narrower cone
+correctly does not, switch-target scoring preferring a relevant nearby
+player over a genuinely distant one, and the kickoff state machine itself
+(starts in KICKOFF, movement frozen, transitions to PLAYING on its own,
+timer only then starts, normal goal scoring still works afterward).
+422 assertions total across all nine suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
 
-## Current Feature Set (v0.7, extended v0.8, v0.8.1)
+## Current Feature Set (v0.7, extended v0.8, v0.8.1, v0.8.2)
 
 - Full 11v11 match on a data-driven 4-3-3 formation — 22 players, 11 per
   team, exactly 2 goalkeepers, every non-GK slot assigned a specific role
@@ -647,6 +661,22 @@ still-held finger is released.
   `FootballPlayer.notify_shoot_release()`); a low perimeter curb replaced
   the old tall boundary wall; the goal net now physically blocks players
   while still letting the ball score before reaching it
+- **(v0.8.2)** A named AI state model (`AIController.AIState` --
+  HOLDING_POSSESSION/ATTACKING_RUN/SUPPORTING_ATTACK/TRANSITION_ATTACK/
+  PRESSING/SEEKING_BALL/MARKING/TRANSITION_DEFENSE/RECOVERING_SHAPE)
+  driven by `PossessionManager`'s new *sticky* `last_team_with_possession`
+  rather than the instantaneous per-tick value, so a brief loose-ball
+  bounce mid-attack no longer collapses the whole team's shape into
+  defensive recovery and back; the AI's pass search is now
+  omnidirectional (a teammate square or behind the carrier is a real
+  option, not just whoever's directly ahead); `TeamController` now keeps
+  a sticky ball-challenger so defenders don't flicker-swarm the ball;
+  switch-target scoring weighs distance and lateral position much more
+  heavily; a genuinely gentler dribble spring (close at a standstill,
+  loosens while sprinting, still never freezes a contest); and a brief
+  KICKOFF hold before PLAYING starts (formations set, ball centered,
+  movement frozen, timer withheld) instead of the match beginning
+  mid-play on frame one
 
 ## Roadmap Ideas (for expanding into a full game)
 

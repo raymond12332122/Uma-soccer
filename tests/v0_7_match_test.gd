@@ -384,13 +384,35 @@ func _test_ai_shot_scores(main: Node3D) -> void:
 
 	for p in main.away_players:
 		p.global_position = Vector3(200, 1, 200)
+	# v0.8.2: teammates too, not just opponents -- with 21 other players
+	# still roaming the pitch, one could occasionally end up standing
+	# close enough to the teleport target below to interpenetrate the
+	# ball's collider, and a plain position teleport (rather than
+	# PhysicsServer3D) straight into an overlap could make the physics
+	# engine's separation response genuinely explosive (a many-thousand-
+	# m/s velocity spike observed directly via debug trace) rather than a
+	# normal bump -- this test is specifically about shooting mechanics in
+	# isolation, not about surviving a crowded box.
+	for p in main.home_players:
+		if p != striker:
+			p.global_position = Vector3(-200, 1, -200)
+	await get_tree().physics_frame
 
-	main.ball.linear_velocity = Vector3.ZERO
-	main.ball.global_position = striker.global_position + Vector3(0.5, 0, 0)
+	var xform: Transform3D = main.ball.global_transform
+	xform.origin = striker.global_position + Vector3(0.5, 0, 0)
+	PhysicsServer3D.body_set_state(main.ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, xform)
+	PhysicsServer3D.body_set_state(main.ball.get_rid(), PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
 	var pre_score: int = main.home_score
 
+	# v0.8.2: shooting is now a per-second probabilistic decision (see
+	# AIController._decide_possession_action) gated on actually being in
+	# range, rather than an instant "shoot the moment range is reached" --
+	# a below-average-confidence real character's shoot_range can also be
+	# on the low end (6-14 depending on personality), so this needs enough
+	# real margin to close the gap to goal *and* let the roll land with
+	# very high confidence, not just enough time for the roll alone.
 	var scored := false
-	for i in range(240):
+	for i in range(480):
 		await get_tree().physics_frame
 		if main.home_score > pre_score:
 			scored = true

@@ -15,9 +15,42 @@ const DEFAULT_HUMAN_INDEX := 9  # index into home_players -- the ST slot (see Te
 ## "always pick the closest player" -- distance still matters most, but
 ## attacking/defensive positional relevance can outweigh a small distance
 ## difference, and the goalkeeper is deprioritized outside real danger.
-const SWITCH_DIST_WEIGHT := 1.0
-const SWITCH_RELEVANCE_BONUS := 6.0
-const SWITCH_GK_PENALTY := 12.0
+## v0.8.2: raised across the board -- manual playtesting found repeated
+## SWITCH presses sometimes landing on a distant, seemingly-unrelated
+## player. SWITCH_DIST_WEIGHT and SWITCH_FAR_PENALTY_DISTANCE/_WEIGHT make
+## genuinely distant candidates score much worse (not just slightly worse)
+## even when they technically satisfy the ahead-of/behind-the-ball
+## relevance check, and SWITCH_LATERAL_WEIGHT means "ahead of the ball" on
+## the opposite touchline no longer counts as being "in the play".
+const SWITCH_DIST_WEIGHT := 1.4
+const SWITCH_LATERAL_WEIGHT := 0.5
+const SWITCH_RELEVANCE_BONUS := 8.0
+const SWITCH_GK_PENALTY := 20.0
+## Beyond this distance from the ball, an extra steep penalty kicks in on
+## top of the normal linear distance weight -- keeps a technically-"ahead"
+## but genuinely far-off player from ever outscoring someone actually near
+## the play.
+const SWITCH_FAR_PENALTY_DISTANCE := 20.0
+const SWITCH_FAR_PENALTY_WEIGHT := 2.5
+
+## v0.8.2: a bare "match already mid-play from frame 0" didn't read as a
+## real kickoff. PRE_MATCH/KICKOFF hold movement frozen for a beat (players
+## already sit in formation, ball already sits at center -- both are just
+## where _spawn_teams()/_reset_all_players() already put them, nothing new
+## to build there) before PLAYING unlocks control and starts the clock.
+## Deliberately NOT a cinematic -- no camera moves, no extra nodes, just a
+## short hold. Scoped to genuine match start/restart only, not every goal
+## restart (which stays instant, matching existing tested behavior).
+enum MatchPhase { PRE_MATCH, KICKOFF, PLAYING }
+## Kept genuinely brief (not a cinematic pause) so it reads as "the whistle
+## just blew" rather than a loading screen -- long enough to be a real,
+## visible hold; short enough to stay well inside the generous
+## movement-outcome windows the rest of the game (and its tests) already
+## use everywhere else.
+const KICKOFF_DURATION := 0.35
+
+var match_phase: int = MatchPhase.PRE_MATCH
+var _kickoff_timer: float = 0.0
 
 var _football_player_scene: PackedScene = preload("res://scenes/FootballPlayer.tscn")
 
@@ -65,6 +98,13 @@ func _ready() -> void:
 	var hud: Node = $UI.get_node_or_null("HUD")
 	if hud:
 		hud.match_manager = self
+
+	_start_kickoff()
+
+
+func _start_kickoff() -> void:
+	match_phase = MatchPhase.KICKOFF
+	_kickoff_timer = KICKOFF_DURATION
 
 
 func _spawn_teams() -> void:
@@ -144,6 +184,16 @@ func _setup_debug_overlay() -> void:
 
 
 func _physics_process(delta: float) -> void:
+	if match_phase != MatchPhase.PLAYING:
+		_kickoff_timer -= delta
+		for player in home_players + away_players:
+			player.movement_locked = true
+		if _kickoff_timer <= 0.0:
+			match_phase = MatchPhase.PLAYING
+			for player in home_players + away_players:
+				player.movement_locked = false
+		return
+
 	match_time_elapsed += delta
 
 	if match_mood:
@@ -199,6 +249,9 @@ func _select_switch_target(candidates: Array) -> FootballPlayer:
 	for p in candidates:
 		var dist: float = p.global_position.distance_to(ball_pos)
 		var score: float = -dist * SWITCH_DIST_WEIGHT
+		score -= absf(p.global_position.z - ball_pos.z) * SWITCH_LATERAL_WEIGHT
+		if dist > SWITCH_FAR_PENALTY_DISTANCE:
+			score -= (dist - SWITCH_FAR_PENALTY_DISTANCE) * SWITCH_FAR_PENALTY_WEIGHT
 
 		if p.is_goalkeeper:
 			score -= SWITCH_GK_PENALTY
@@ -273,6 +326,7 @@ func restart_match() -> void:
 	_set_human_player(home_players[DEFAULT_HUMAN_INDEX])
 	if match_mood:
 		match_mood.notify_exciting_event()
+	_start_kickoff()
 
 
 func _reset_all_players() -> void:
@@ -294,6 +348,8 @@ func _update_score_label() -> void:
 
 ## "MM:SS" for the HUD's match timer label.
 func get_match_time_string() -> String:
+	if match_phase != MatchPhase.PLAYING:
+		return "KICKOFF"
 	var total_seconds: int = int(match_time_elapsed)
 	return "%02d:%02d" % [total_seconds / 60, total_seconds % 60]
 

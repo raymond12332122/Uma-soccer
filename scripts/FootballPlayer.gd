@@ -66,28 +66,46 @@ var max_stamina: float = 100.0
 var current_stamina: float = 100.0
 
 # ---- Ball control / dribbling ----
-@export var dribble_distance: float = 0.9
-var dribble_accel: float = 24.0
-@export var dribble_damping_accel: float = 9.0
-@export var dribble_force_accel_clamp: float = 30.0
+# v0.8.2: the ball now hugs close at walking pace (dribble_distance) and
+# is knocked a bit further ahead while sprinting (dribble_distance_sprint,
+# see _update_possession) -- a fixed close-control leash regardless of
+# speed was the whole ball -- and the spring itself is gentler (lower
+# accel/damping/clamp than v0.8.1's 24/9/30) so the ball trails and
+# settles naturally on a turn instead of snapping rigidly onto the target
+# point every frame, which is what read as "welded to the player".
+@export var dribble_distance: float = 0.62
+@export var dribble_distance_sprint: float = 1.05
+var dribble_accel: float = 13.0
+@export var dribble_damping_accel: float = 6.0
+@export var dribble_force_accel_clamp: float = 18.0
 var control_loss_angle_threshold: float = 1.2
 @export var control_loss_speed_threshold: float = 2.5
 @export var control_loss_duration: float = 0.35
 @export var possession_release_cooldown: float = 0.35
 
 # ---- Pass / Shoot ----
-var pass_power: float = 2.4
-var shoot_min_power: float = 3.4
-var shoot_max_power: float = 7.0
+# v0.8.2: raised versus v0.8.1 (was 1.4-2.6 pass / 3.0-4.6 shoot) -- passes
+# were dying out well short of teammates at realistic pitch distances
+# against the ball's linear_damp. The two ranges still never overlap.
+var pass_power: float = 2.8
+var shoot_min_power: float = 4.2
+var shoot_max_power: float = 7.6
 @export var shoot_charge_time: float = 1.1
 @export var kick_lift: float = 0.35
 @export var momentum_transfer: float = 0.25
 
 # ---- Pass assist tunables (see _get_pass_direction / _find_pass_target) ----
-const PASS_ASSIST_MAX_DISTANCE := 24.0
-const PASS_ASSIST_MIN_ALIGNMENT := 0.35  ## cos(~70deg) -- candidate must be roughly ahead of the aim direction
-const PASS_ASSIST_BLEND := 0.55          ## 0 = pure raw aim, 1 = dead-on at the chosen teammate
+const PASS_ASSIST_MAX_DISTANCE := 26.0
+const PASS_ASSIST_MIN_ALIGNMENT := 0.25  ## cos(~75deg) -- candidate must be roughly ahead of the aim direction
+const PASS_ASSIST_BLEND := 0.7           ## 0 = pure raw aim, 1 = dead-on at the chosen teammate
 const PASS_OBSTRUCTION_RADIUS := 1.3     ## opponent within this perpendicular distance of the lane counts as blocking it
+## AIController's pass search uses this instead of PASS_ASSIST_MIN_ALIGNMENT
+## -- an AI carrier's "aim" is usually just "toward goal" (see
+## _get_aim_direction), which would otherwise exclude the very common case
+## of an open teammate square or slightly behind them. The human PASS
+## button intentionally keeps the tighter, direction-of-joystick cone
+## instead -- that one really is meant to be "aim your pass".
+const PASS_SEARCH_MIN_ALIGNMENT_OMNI := -1.0
 
 @onready var action_area: Area3D = $ActionArea
 @onready var control_area: Area3D = $ControlArea
@@ -101,6 +119,19 @@ var ball_in_control_range: RigidBody3D = null
 
 var has_possession: bool = false
 var _facing_angle: float = 0.0
+
+## v0.8.2: set/cleared exclusively by MatchManager during its brief
+## PRE_MATCH/KICKOFF hold. Deliberately a flag FootballPlayer itself
+## checks (rather than MatchManager just zeroing move_input each frame)
+## -- PlayerController and TeamController both also write move_input every
+## single tick, and MatchManager's own _physics_process runs before its
+## children's in Godot's traversal order, so a plain "zero it out" write
+## from MatchManager was immediately overwritten later the very same tick
+## by whichever controller runs next, never actually reaching
+## move_and_slide() at all. This flag has exactly one writer and it's
+## read directly at the top of the movement calculation below, so there's
+## no ordering race to lose.
+var movement_locked: bool = false
 
 ## Set each physics frame in _physics_process -- whether this player was
 ## actually sprinting (requesting it, moving, and had stamina left) this
@@ -320,7 +351,7 @@ func reset_intent() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	var wants_sprint: bool = sprint_requested and move_input.length() > 0.1
+	var wants_sprint: bool = (not movement_locked) and sprint_requested and move_input.length() > 0.1
 	var sprinting: bool = wants_sprint and current_stamina > 0.0
 	is_currently_sprinting = sprinting
 
@@ -339,7 +370,7 @@ func _physics_process(delta: float) -> void:
 	var sprint_bonus: float = (sprint_speed - base_speed) * lerp(0.4, 1.0, stamina_ratio)
 	var target_speed: float = (base_speed + sprint_bonus) if sprinting else base_speed
 	var effective_acceleration: float = acceleration * lerp(0.7, 1.0, stamina_ratio)
-	var direction := Vector3(move_input.x, 0.0, move_input.y)
+	var direction := Vector3.ZERO if movement_locked else Vector3(move_input.x, 0.0, move_input.y)
 
 	if direction.length() > 0.01:
 		var target_angle := atan2(direction.x, direction.z)
@@ -473,8 +504,15 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 		accel_coeff *= 0.6
 		damping_coeff *= 0.7
 
+	# Close at a standstill/walk, knocked further ahead while sprinting --
+	# "sprinting should loosen control" per the brief -- driven off actual
+	# current speed (not just the sprinting flag) so the transition itself
+	# feels smooth rather than an instant step.
+	var speed_ratio: float = clampf(velocity.length() / maxf(sprint_speed, 0.01), 0.0, 1.0)
+	var current_dribble_distance: float = lerp(dribble_distance, dribble_distance_sprint, speed_ratio)
+
 	var facing_dir := Vector3(sin(_facing_angle), 0.0, cos(_facing_angle))
-	var target_pos: Vector3 = global_position + facing_dir * dribble_distance
+	var target_pos: Vector3 = global_position + facing_dir * current_dribble_distance
 
 	var to_target: Vector3 = target_pos - ball_in_control_range.global_position
 	to_target.y = 0.0
@@ -535,11 +573,18 @@ func notify_shoot_release(elapsed_seconds: float) -> void:
 ## dribbling reach) -- action_area is a strict superset of control_area,
 ## so this only ever makes a real, close-by ball MORE kickable, never
 ## invents one that isn't actually there.
-func execute_pass() -> void:
+## min_alignment/forward_axis are forwarded straight to _find_pass_target
+## (via _get_pass_direction) -- AIController's decision search and the
+## actual kick direction here must agree, or the AI could decide to pass
+## based on an omnidirectional search finding a square/backward teammate,
+## then kick using the default narrow forward-only cone that excludes
+## that exact same teammate and silently fall back to aiming at nothing
+## in particular.
+func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO) -> void:
 	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
 	if ball == null:
 		return
-	_apply_kick_impulse(ball, pass_power, false, _get_pass_direction())
+	_apply_kick_impulse(ball, pass_power, false, _get_pass_direction(min_alignment, forward_axis))
 
 
 func execute_shot(charge_ratio: float) -> void:
@@ -556,9 +601,9 @@ func execute_shot(charge_ratio: float) -> void:
 ## with no suitable candidate, or none set up via set_match_context() at
 ## all (teammates defaults to []), this returns the exact same direction
 ## passing always used before this system existed.
-func _get_pass_direction() -> Vector3:
+func _get_pass_direction(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO) -> Vector3:
 	var base_dir: Vector3 = _get_aim_direction()
-	var best: FootballPlayer = _find_pass_target(base_dir)
+	var best: FootballPlayer = _find_pass_target(base_dir, min_alignment, forward_axis)
 	if best == null:
 		return base_dir
 	var to_best: Vector3 = best.global_position - global_position
@@ -579,17 +624,33 @@ const _PASS_ROLE_BONUS := {"FWD": 0.15, "MID": 0.05, "DEF": 0.0, "GK": -0.3}
 
 ## Among teammates roughly ahead of base_dir and within range, prefer one
 ## with a clear lane (no opponent close to the straight line between here
-## and them), who is open (no opponent marking them closely), and who is
-## in a more advanced role -- "avoid passing directly through opponents
-## when a reasonable alternative exists" without full auto-targeting (a
-## candidate outside the alignment cone is never considered at all,
-## regardless of how open they are). teammates naturally includes
-## whichever player is currently human-controlled, same as every other
-## teammate -- there is nothing here that special-cases the human.
-func _find_pass_target(base_dir: Vector3) -> FootballPlayer:
+## and them), who is open (no opponent marking them closely), who is in a
+## more advanced role, and who represents real forward progress -- "avoid
+## passing directly through opponents when a reasonable alternative
+## exists" without full auto-targeting (a candidate outside the alignment
+## cone is never considered at all, regardless of how open they are).
+## teammates naturally includes whichever player is currently
+## human-controlled, same as every other teammate -- there is nothing
+## here that special-cases the human.
+##
+## min_alignment overrides PASS_ASSIST_MIN_ALIGNMENT -- the human PASS
+## button keeps the tight "aim your pass" cone (the default), but
+## AIController's own search passes PASS_SEARCH_MIN_ALIGNMENT_OMNI: an AI
+## carrier's "aim" is just whichever way they're currently running (see
+## _get_aim_direction), almost always straight at goal, so a tight cone
+## around that would exclude the extremely common case of an open
+## teammate square or slightly behind them -- alignment still *scores*
+## positively below, it just stops being a hard filter.
+##
+## forward_axis (when non-zero) adds a small bonus for genuine progression
+## up the pitch, independent of base_dir -- "a pass should have a purpose"
+## (progression being one of them) rather than only ever describing where
+## the passer happened to be aiming.
+func _find_pass_target(base_dir: Vector3, min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO) -> FootballPlayer:
 	var best: FootballPlayer = null
 	var best_score := -INF
 	var base_dir_n: Vector3 = base_dir.normalized()
+	var forward_axis_n: Vector3 = forward_axis.normalized() if forward_axis != Vector3.ZERO else Vector3.ZERO
 
 	for mate in teammates:
 		if mate == self or mate == null or not is_instance_valid(mate):
@@ -599,14 +660,17 @@ func _find_pass_target(base_dir: Vector3) -> FootballPlayer:
 		var dist: float = to_mate.length()
 		if dist < 0.5 or dist > PASS_ASSIST_MAX_DISTANCE:
 			continue
-		var alignment: float = base_dir_n.dot(to_mate / dist)
-		if alignment < PASS_ASSIST_MIN_ALIGNMENT:
+		var to_mate_dir: Vector3 = to_mate / dist
+		var alignment: float = base_dir_n.dot(to_mate_dir)
+		if alignment < min_alignment:
 			continue
 		var score: float = alignment - dist * 0.01
 		if _lane_is_obstructed(to_mate, dist):
 			score -= 0.5
 		score -= (1.0 - _openness(mate)) * 0.4
 		score += _PASS_ROLE_BONUS.get(FormationManager.role_category(mate.formation_role), 0.0)
+		if forward_axis_n != Vector3.ZERO:
+			score += forward_axis_n.dot(to_mate_dir) * 0.3
 		if score > best_score:
 			best_score = score
 			best = mate
