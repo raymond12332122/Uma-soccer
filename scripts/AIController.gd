@@ -57,6 +57,11 @@ const GK_ARRIVE_RADIUS := 0.25
 ## which one it is.
 const MIN_SUPPORT_DISTANCE_FROM_BALL := 3.2
 
+## An opponent closer than this to the ball carrier counts as real
+## pressure -- pushes the release-the-ball decision below instead of
+## holding it indefinitely. Roughly a lunging-tackle distance.
+const PRESSURE_DISTANCE := 3.0
+
 ## Formation-role-category multipliers -- generic positional tendencies,
 ## not character-specific. Forwards make the biggest attacking runs and
 ## give the least defensive recovery ("limited defensive support");
@@ -85,21 +90,24 @@ static func update_player(
 	opponent_goal_pos: Vector3,
 	formation_target: Vector3,
 	ball_challenger: FootballPlayer = null,
-	dangerous_opponent: Node3D = null
+	dangerous_opponent: Node3D = null,
+	delta: float = 1.0 / 60.0
 ) -> void:
 	var attacking: bool = possession.possessing_team == player.team_id
 	var category: String = FormationManager.role_category(player.formation_role)
 	var target: Vector3
 
 	if attacking and player.has_possession:
-		# I have the ball -- carry it toward goal, shoot once in range.
-		# Confidence/risk-taking widen the range a character is willing
-		# to shoot from.
+		# I have the ball -- carry it toward goal by default, but run a
+		# real decision hierarchy first: shoot / forward pass / release
+		# under pressure / safe pass, falling back to carrying only when
+		# none of those actually apply this frame (see
+		# _decide_possession_action). Carrying toward goal is still the
+		# steering target regardless -- a pass/shot call below releases
+		# the ball immediately (has_possession goes false), so there's no
+		# risk of also acting on a now-stale target this same frame.
 		target = opponent_goal_pos
-		var shoot_range: float = _shoot_range(player)
-		var dist_to_goal: float = player.global_position.distance_to(opponent_goal_pos)
-		if dist_to_goal < shoot_range:
-			player.execute_shot(clampf(1.0 - dist_to_goal / shoot_range, 0.35, 1.0))
+		_decide_possession_action(player, opponent_goal_pos, own_goal_pos, opponents, delta)
 	elif attacking:
 		# Support: push into useful space ahead of the formation slot,
 		# scaled by role (forwards make the biggest runs, defenders mostly
@@ -136,6 +144,76 @@ static func update_player(
 
 	_move_toward(player, target, ARRIVE_RADIUS)
 	player.sprint_requested = player.global_position.distance_to(target) > _sprint_threshold(player)
+
+
+## v0.8.1: the actual decision hierarchy for an AI player currently in
+## possession -- before this existed, update_player()'s attacking branch
+## only ever checked "am I in shooting range," so an AI player who never
+## got that close simply carried the ball forever; nothing here ever
+## called execute_pass() for an AI player at all. Evaluated in priority
+## order, self-limiting by construction: execute_shot()/execute_pass()
+## both clear has_possession immediately, so once either fires this
+## player exits the "attacking and has_possession" branch entirely on the
+## very next frame -- there is no separate re-entrancy guard needed.
+##
+## Both shoot and pass are gated by a per-second *rate* (scaled by delta,
+## not a flat per-frame probability) so the eventual decision is
+## frame-rate independent and, for a genuinely good chance, fires within
+## roughly a second or two rather than instantly on the very first
+## qualifying frame or never at all -- it reads as "decided", not as
+## "rolled a die every tick". Stats (shooting/passing) and personality
+## (confidence/risk_taking/competitiveness for shooting; tactical_awareness/
+## teamwork for passing) bias the rate per player, so different characters
+## genuinely behave differently -- never a hard-coded per-character branch.
+static func _decide_possession_action(player: FootballPlayer, opponent_goal_pos: Vector3, own_goal_pos: Vector3, opponents: Array, delta: float) -> void:
+	var p: PersonalityData = player.personality
+	var stats: PlayerData = player.player_data
+
+	# 1. Immediate shooting opportunity.
+	var shoot_range: float = _shoot_range(player)
+	var dist_to_goal: float = player.global_position.distance_to(opponent_goal_pos)
+	if dist_to_goal < shoot_range:
+		var shoot_skill: float = stats.shooting if stats else 50.0
+		var shoot_eagerness: float = (p.confidence + p.risk_taking + p.competitiveness) / 3.0
+		var shoot_rate: float = lerp(1.5, 5.0, clampf((shoot_eagerness + shoot_skill) / 200.0, 0.0, 1.0))
+		if randf() < shoot_rate * delta:
+			player.execute_shot(clampf(1.0 - dist_to_goal / shoot_range, 0.35, 1.0))
+			return
+
+	# 2/3/4. Forward/valuable pass, or -- under real pressure -- any safe
+	# release rather than continuing to hold the ball. _find_pass_target
+	# already scores candidates by alignment/distance/lane/openness/role
+	# (see FootballPlayer.gd) and already considers every teammate,
+	# including whichever one is currently human-controlled -- there is
+	# nothing here that treats the human differently from any other
+	# teammate.
+	var pass_target: FootballPlayer = player._find_pass_target(player._get_aim_direction())
+	if pass_target != null:
+		var nearest_opp: float = _nearest_opponent_distance(player, opponents)
+		var under_pressure: bool = nearest_opp < PRESSURE_DISTANCE
+
+		var pass_skill: float = stats.passing if stats else 50.0
+		var pass_will: float = (p.tactical_awareness + p.teamwork) / 2.0
+		var pass_rate: float = lerp(0.6, 3.0, clampf((pass_will + pass_skill) / 200.0, 0.0, 1.0))
+		if under_pressure:
+			pass_rate *= 3.5  # a closing defender should force a much quicker decision
+		if randf() < pass_rate * delta:
+			player.execute_pass()
+			return
+
+	# 5. Fallback: keep dribbling/carrying -- update_player()'s caller
+	# already left `target` pointed at goal, nothing further to do here.
+
+
+static func _nearest_opponent_distance(player: FootballPlayer, opponents: Array) -> float:
+	var best := INF
+	for opp in opponents:
+		if opp == null or not is_instance_valid(opp):
+			continue
+		var d: float = player.global_position.distance_to(opp.global_position)
+		if d < best:
+			best = d
+	return best
 
 
 static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goal_pos: Vector3) -> void:

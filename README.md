@@ -496,6 +496,7 @@ godot --headless --path . tests/CharacterPipelineTest.tscn
 godot --headless --path . tests/PersonalityTest.tscn
 godot --headless --path . tests/V0_7MatchTest.tscn
 godot --headless --path . tests/V0_8PlaytestFixesTest.tscn
+godot --headless --path . tests/V0_8_1PlaytestFixesTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
@@ -546,10 +547,27 @@ independently on two separate synthetic finger IDs at once (drag one,
 release either, both stay correctly isolated), a far-side defender still
 moving under the new ball-reactive formation targets instead of sitting
 frozen at a static spawn point, and supporting teammates keeping a passing
-distance from the ball carrier instead of stacking on top of them.
-362 assertions total across all seven suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
+distance from the ball carrier instead of stacking on top of them;
+`v0_8_1_playtest_fixes_test.gd` is the latest suite, covering the manual-
+playtest gameplay-correction pass: the low perimeter curb still reliably
+containing the ball and a sprinting player from every side, a player being
+physically blocked by the new goal net collision while the ball can still
+enter and score before ever reaching it, pass power never overlapping shot
+power regardless of stats, an AI player actually shooting when in range
+(preferred over passing), actually passing when out of range with an open
+teammate instead of holding the ball forever, falling back to a genuine
+no-kick dribble when neither a shot nor a pass makes sense, pass targeting
+only ever considering same-team players (an equally-well-positioned
+opponent is never picked) while a same-team player stays a valid target
+even while human-controlled, an AI teammate actually releasing the ball
+toward the human player like any other teammate, a fast tap on SHOOT still
+firing a shot even when the press and release both land inside the same
+physics-tick gap, and switching the controlled player mid-charge never
+crediting a phantom shot to whoever is controlled by the time a
+still-held finger is released.
+396 assertions total across all eight suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
 
-## Current Feature Set (v0.7, extended v0.8)
+## Current Feature Set (v0.7, extended v0.8, v0.8.1)
 
 - Full 11v11 match on a data-driven 4-3-3 formation — 22 players, 11 per
   team, exactly 2 goalkeepers, every non-GK slot assigned a specific role
@@ -620,6 +638,15 @@ distance from the ball carrier instead of stacking on top of them.
   stands, end stands, team benches, corner flags), and a real goal frame
   (posts, crossbar, back stanchions, and a semi-transparent net) instead of
   three bare tubes — see the sections above for each in detail
+- **(v0.8.1)** A real AI pass/shoot decision hierarchy (see `AIController._decide_possession_action`)
+  -- before this, an AI player in possession only ever checked "am I in
+  shooting range," so nobody ever passed and the human's own teammates
+  never released the ball toward them either; pass power and shot power
+  now never overlap so the two actions read as clearly different;
+  SHOOT fires reliably even on a very fast tap (see
+  `FootballPlayer.notify_shoot_release()`); a low perimeter curb replaced
+  the old tall boundary wall; the goal net now physically blocks players
+  while still letting the ball score before reaching it
 
 ## Roadmap Ideas (for expanding into a full game)
 

@@ -166,8 +166,12 @@ func apply_player_data(data: PlayerData) -> void:
 	max_stamina = data.stamina
 	current_stamina = max_stamina
 
-	pass_power = lerp(1.6, 3.2, data.passing / 100.0)
-	shoot_min_power = lerp(2.4, 4.2, data.shooting / 100.0)
+	# v0.8.1: pass and shoot power ranges no longer overlap at all (old
+	# 1.6-3.2 pass vs. 2.4-4.2 shoot could put a high-passing player's tap
+	# ahead of a low-shooting player's release) -- a pass should always
+	# read as clearly weaker than any shot, never coincidentally similar.
+	pass_power = lerp(1.4, 2.6, data.passing / 100.0)
+	shoot_min_power = lerp(3.0, 4.6, data.shooting / 100.0)
 	shoot_max_power = lerp(5.0, 8.5, data.shooting / 100.0)
 	dribble_accel = lerp(16.0, 30.0, data.dribbling / 100.0)
 	control_loss_angle_threshold = lerp(0.9, 1.5, data.dribbling / 100.0)
@@ -491,6 +495,11 @@ func _process_pass_input() -> void:
 	execute_pass()
 
 
+## Only accumulates charge time while held -- firing on release is handled
+## exclusively by notify_shoot_release() (see InputState.gd's doc comment
+## and PlayerController), not here. A charge that never actually fires
+## (e.g. reset_intent() on a player-switch mid-charge) just harmlessly
+## stops accumulating.
 func _process_shoot_input(delta: float) -> void:
 	if shoot_held:
 		if not _shoot_charging:
@@ -498,26 +507,47 @@ func _process_shoot_input(delta: float) -> void:
 			_shoot_charge_elapsed = 0.0
 		else:
 			_shoot_charge_elapsed = minf(_shoot_charge_elapsed + delta, shoot_charge_time)
-	elif _shoot_charging:
-		_shoot_charging = false
-		var charge_ratio: float = _shoot_charge_elapsed / shoot_charge_time if shoot_charge_time > 0.0 else 1.0
-		_shoot_charge_elapsed = 0.0
-		execute_shot(charge_ratio)
+
+
+## Single, exclusive firing point for a human-controlled release (touch or
+## keyboard -- see PlayerController), called with the real wall-clock
+## elapsed hold time. Prefers the frame-accumulated _shoot_charge_elapsed
+## when this player was actually seen charging (the normal multi-frame
+## hold case); falls back to the raw elapsed time when it wasn't -- a very
+## fast tap can have its press *and* release both land inside the same
+## physics-tick gap, so _process_shoot_input() above never got a chance to
+## even set _shoot_charging, and a plain "was _shoot_charging true"
+## release check would silently swallow the whole tap.
+func notify_shoot_release(elapsed_seconds: float) -> void:
+	var was_charging: bool = _shoot_charging
+	_shoot_charging = false
+	var charge_seconds: float = _shoot_charge_elapsed if was_charging else elapsed_seconds
+	_shoot_charge_elapsed = 0.0
+	var ratio: float = clampf(charge_seconds / shoot_charge_time, 0.0, 1.0) if shoot_charge_time > 0.0 else 1.0
+	execute_shot(ratio)
 
 
 ## Public kick API -- used by the human charge-release flow above and
-## called directly by AIController for AI-driven passes/shots.
+## called directly by AIController for AI-driven passes/shots. Falls back
+## to the tighter control-range ball reference when the wider action-range
+## one is momentarily null (e.g. a contest/possession handoff nudged the
+## ball just outside the action sensor for a frame while still well within
+## dribbling reach) -- action_area is a strict superset of control_area,
+## so this only ever makes a real, close-by ball MORE kickable, never
+## invents one that isn't actually there.
 func execute_pass() -> void:
-	if ball_in_action_range == null:
+	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
+	if ball == null:
 		return
-	_apply_kick_impulse(ball_in_action_range, pass_power, false, _get_pass_direction())
+	_apply_kick_impulse(ball, pass_power, false, _get_pass_direction())
 
 
 func execute_shot(charge_ratio: float) -> void:
-	if ball_in_action_range == null:
+	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
+	if ball == null:
 		return
 	var power: float = lerp(shoot_min_power, shoot_max_power, clampf(charge_ratio, 0.0, 1.0))
-	_apply_kick_impulse(ball_in_action_range, power, true)
+	_apply_kick_impulse(ball, power, true)
 
 
 ## Default aim direction, nudged toward a nearby, roughly-ahead, unblocked
@@ -538,12 +568,24 @@ func _get_pass_direction() -> Vector3:
 	return base_dir.slerp(to_best.normalized(), PASS_ASSIST_BLEND).normalized()
 
 
+## v0.8.1: role-based small tie-breaker for _find_pass_target -- a more
+## advanced teammate is a marginally more useful outlet than a deeper one
+## when the rest of the score is close, without ever overriding alignment/
+## openness/lane (still just a few hundredths, same spirit as the
+## distance term below). GK is deprioritized slightly since passing back
+## to your own keeper is rarely the attacking-useful option. Generic by
+## role category only -- never a specific character or team.
+const _PASS_ROLE_BONUS := {"FWD": 0.15, "MID": 0.05, "DEF": 0.0, "GK": -0.3}
+
 ## Among teammates roughly ahead of base_dir and within range, prefer one
 ## with a clear lane (no opponent close to the straight line between here
-## and them) over a more directly-aligned but blocked one -- "avoid passing
-## directly through opponents when a reasonable alternative exists" without
-## full auto-targeting (a candidate outside the alignment cone is never
-## considered at all, regardless of how open they are).
+## and them), who is open (no opponent marking them closely), and who is
+## in a more advanced role -- "avoid passing directly through opponents
+## when a reasonable alternative exists" without full auto-targeting (a
+## candidate outside the alignment cone is never considered at all,
+## regardless of how open they are). teammates naturally includes
+## whichever player is currently human-controlled, same as every other
+## teammate -- there is nothing here that special-cases the human.
 func _find_pass_target(base_dir: Vector3) -> FootballPlayer:
 	var best: FootballPlayer = null
 	var best_score := -INF
@@ -563,10 +605,31 @@ func _find_pass_target(base_dir: Vector3) -> FootballPlayer:
 		var score: float = alignment - dist * 0.01
 		if _lane_is_obstructed(to_mate, dist):
 			score -= 0.5
+		score -= (1.0 - _openness(mate)) * 0.4
+		score += _PASS_ROLE_BONUS.get(FormationManager.role_category(mate.formation_role), 0.0)
 		if score > best_score:
 			best_score = score
 			best = mate
 	return best
+
+
+## 1.0 = no opponent within OPENNESS_FULL_RADIUS of this teammate (fully
+## open), scaling down to 0.0 as the nearest marker closes in -- a cheap,
+## generic proxy for "is this teammate actually a good pass target right
+## now" that doesn't need real vision/line-of-sight simulation.
+const OPENNESS_FULL_RADIUS := 6.0
+
+func _openness(mate: FootballPlayer) -> float:
+	var nearest := INF
+	for opp in opponents:
+		if opp == null or not is_instance_valid(opp):
+			continue
+		var d: float = mate.global_position.distance_to(opp.global_position)
+		if d < nearest:
+			nearest = d
+	if nearest == INF:
+		return 1.0
+	return clampf(nearest / OPENNESS_FULL_RADIUS, 0.0, 1.0)
 
 
 func _lane_is_obstructed(to_mate: Vector3, dist: float) -> bool:

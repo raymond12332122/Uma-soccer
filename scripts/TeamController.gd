@@ -77,7 +77,7 @@ func _physics_process(delta: float) -> void:
 		else:
 			var category: String = FormationManager.role_category(player.formation_role)
 			var target: Vector3 = FormationManager.get_dynamic_position(player.formation_slot, team_id, ball.global_position, category)
-			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target, ball_challenger, dangerous_opponent)
+			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target, ball_challenger, dangerous_opponent, delta)
 
 		if personality_events and mood:
 			personality_events.maybe_trigger(player, delta, ctx)

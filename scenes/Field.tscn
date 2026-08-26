@@ -1,4 +1,4 @@
-[gd_scene load_steps=34 format=3]
+[gd_scene load_steps=39 format=3]
 
 [sub_resource type="PlaneMesh" id="PlaneMesh_ground"]
 size = Vector2(70, 46)
@@ -23,6 +23,12 @@ size = Vector3(1, 4, 46)
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_wall"]
 albedo_color = Color(0.85, 0.85, 0.85, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_curb_long"]
+size = Vector3(70, 0.4, 0.6)
+
+[sub_resource type="BoxMesh" id="BoxMesh_curb_end"]
+size = Vector3(0.6, 0.4, 46)
 
 [sub_resource type="BoxMesh" id="BoxMesh_post"]
 size = Vector3(0.3, 3, 0.3)
@@ -59,6 +65,12 @@ size = Vector3(3.2, 3, 0.06)
 
 [sub_resource type="BoxMesh" id="BoxMesh_net_top"]
 size = Vector3(3.2, 0.06, 8)
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_net_back"]
+size = Vector3(0.4, 3, 8)
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_net_side"]
+size = Vector3(3.2, 3, 0.4)
 
 [sub_resource type="BoxMesh" id="BoxMesh_stand_tier1"]
 size = Vector3(72, 3, 3)
@@ -127,7 +139,8 @@ collision_layer = 1
 collision_mask = 0
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="WallNorth"]
-mesh = SubResource("BoxMesh_wall_long")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.8, 0)
+mesh = SubResource("BoxMesh_curb_long")
 surface_material_override/0 = SubResource("StandardMaterial3D_wall")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="WallNorth"]
@@ -139,7 +152,8 @@ collision_layer = 1
 collision_mask = 0
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="WallSouth"]
-mesh = SubResource("BoxMesh_wall_long")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.8, 0)
+mesh = SubResource("BoxMesh_curb_long")
 surface_material_override/0 = SubResource("StandardMaterial3D_wall")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="WallSouth"]
@@ -151,7 +165,8 @@ collision_layer = 1
 collision_mask = 0
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="WallWest"]
-mesh = SubResource("BoxMesh_wall_end")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.8, 0)
+mesh = SubResource("BoxMesh_curb_end")
 surface_material_override/0 = SubResource("StandardMaterial3D_wall")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="WallWest"]
@@ -163,7 +178,8 @@ collision_layer = 1
 collision_mask = 0
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="WallEast"]
-mesh = SubResource("BoxMesh_wall_end")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.8, 0)
+mesh = SubResource("BoxMesh_curb_end")
 surface_material_override/0 = SubResource("StandardMaterial3D_wall")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="WallEast"]
@@ -244,20 +260,41 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -30.6, 3, 4)
 mesh = SubResource("BoxMesh_side_bar")
 surface_material_override/0 = SubResource("StandardMaterial3D_post")
 
-[node name="GoalLeftNetBack" type="MeshInstance3D" parent="."]
+[node name="GoalLeftNetBack" type="StaticBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -32.2, 1.5, 0)
+collision_layer = 1
+collision_mask = 0
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="GoalLeftNetBack"]
 mesh = SubResource("BoxMesh_net_back")
 surface_material_override/0 = SubResource("StandardMaterial3D_net")
 
-[node name="GoalLeftNetSideA" type="MeshInstance3D" parent="."]
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GoalLeftNetBack"]
+shape = SubResource("BoxShape3D_net_back")
+
+[node name="GoalLeftNetSideA" type="StaticBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -30.6, 1.5, -4)
+collision_layer = 1
+collision_mask = 0
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="GoalLeftNetSideA"]
 mesh = SubResource("BoxMesh_net_side")
 surface_material_override/0 = SubResource("StandardMaterial3D_net")
 
-[node name="GoalLeftNetSideB" type="MeshInstance3D" parent="."]
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GoalLeftNetSideA"]
+shape = SubResource("BoxShape3D_net_side")
+
+[node name="GoalLeftNetSideB" type="StaticBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -30.6, 1.5, 4)
+collision_layer = 1
+collision_mask = 0
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="GoalLeftNetSideB"]
 mesh = SubResource("BoxMesh_net_side")
 surface_material_override/0 = SubResource("StandardMaterial3D_net")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GoalLeftNetSideB"]
+shape = SubResource("BoxShape3D_net_side")
 
 [node name="GoalLeftNetTop" type="MeshInstance3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -30.6, 3, 0)
@@ -339,20 +376,41 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 30.6, 3, 4)
 mesh = SubResource("BoxMesh_side_bar")
 surface_material_override/0 = SubResource("StandardMaterial3D_post")
 
-[node name="GoalRightNetBack" type="MeshInstance3D" parent="."]
+[node name="GoalRightNetBack" type="StaticBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 32.2, 1.5, 0)
+collision_layer = 1
+collision_mask = 0
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="GoalRightNetBack"]
 mesh = SubResource("BoxMesh_net_back")
 surface_material_override/0 = SubResource("StandardMaterial3D_net")
 
-[node name="GoalRightNetSideA" type="MeshInstance3D" parent="."]
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GoalRightNetBack"]
+shape = SubResource("BoxShape3D_net_back")
+
+[node name="GoalRightNetSideA" type="StaticBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 30.6, 1.5, -4)
+collision_layer = 1
+collision_mask = 0
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="GoalRightNetSideA"]
 mesh = SubResource("BoxMesh_net_side")
 surface_material_override/0 = SubResource("StandardMaterial3D_net")
 
-[node name="GoalRightNetSideB" type="MeshInstance3D" parent="."]
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GoalRightNetSideA"]
+shape = SubResource("BoxShape3D_net_side")
+
+[node name="GoalRightNetSideB" type="StaticBody3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 30.6, 1.5, 4)
+collision_layer = 1
+collision_mask = 0
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="GoalRightNetSideB"]
 mesh = SubResource("BoxMesh_net_side")
 surface_material_override/0 = SubResource("StandardMaterial3D_net")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GoalRightNetSideB"]
+shape = SubResource("BoxShape3D_net_side")
 
 [node name="GoalRightNetTop" type="MeshInstance3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 30.6, 3, 0)

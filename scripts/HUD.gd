@@ -36,8 +36,8 @@ var _stamina_fill_style: StyleBoxFlat = null
 
 func _ready() -> void:
 	joystick.vector_changed.connect(_on_joystick_vector_changed)
-	shoot_button.pressed_down.connect(func(): InputState.shoot_held = true)
-	shoot_button.pressed_up.connect(func(): InputState.shoot_held = false)
+	shoot_button.pressed_down.connect(_on_shoot_pressed_down)
+	shoot_button.pressed_up.connect(_on_shoot_pressed_up)
 	sprint_button.pressed_down.connect(func(): InputState.sprint_held = true)
 	sprint_button.pressed_up.connect(func(): InputState.sprint_held = false)
 	pass_button.pressed_down.connect(func(): InputState.pass_pressed = true)
@@ -51,6 +51,22 @@ func _ready() -> void:
 
 func _on_joystick_vector_changed(vector: Vector2) -> void:
 	InputState.move_vector = vector
+
+
+## Real-timestamped press/release (see InputState.gd's doc comment) rather
+## than a plain level-triggered bool -- guarantees a fast tap still fires,
+## even if both edges land inside the same physics-tick gap.
+func _on_shoot_pressed_down() -> void:
+	InputState.shoot_held = true
+	InputState.shoot_pressed_at_ms = Time.get_ticks_msec()
+
+
+func _on_shoot_pressed_up() -> void:
+	InputState.shoot_held = false
+	if InputState.shoot_pressed_at_ms >= 0:
+		InputState.shoot_release_elapsed_seconds = (Time.get_ticks_msec() - InputState.shoot_pressed_at_ms) / 1000.0
+		InputState.shoot_release_pending = true
+	InputState.shoot_pressed_at_ms = -1
 
 
 func _process(_delta: float) -> void:
