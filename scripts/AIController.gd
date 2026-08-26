@@ -8,13 +8,36 @@ extends RefCounted
 ## PersonalityEventSystem). No memory/planning between frames on purpose --
 ## this is foundation-level AI, not tactics.
 ##
+## Decision hierarchy per non-carrier player, in priority order:
+##   1. immediate danger / 2. possession opportunity -- the team's single
+##      nominated ball_challenger (nearest suitable teammate, computed once
+##      per team per frame by TeamController -- see find_ball_challenger)
+##      goes straight at the ball, whether it's loose or an opponent has it
+##      (the ball's own position already tracks the carrier via the
+##      dribble-steering force, so "press the carrier" and "chase the loose
+##      ball" collapse into the same target).
+##   3. defensive responsibility -- everyone else recovers toward
+##      defensive shape, pulled harder for defenders, moderately for
+##      midfielders, lightly for forwards (limited defensive support),
+##      with a slight bias toward covering the most advanced opponent
+##      (dangerous_opponent, also computed once per team per frame).
+##   4. attacking opportunity / 5. formation positioning -- when the ball
+##      carrier is a teammate, everyone else pushes into useful space
+##      ahead of their formation slot (see _advance_distance) while
+##      holding spacing from each other.
+##
+## Formation role (player.formation_role, via FormationManager.role_category)
+## is a generic GK/DEF/MID/FWD bucket -- never a specific character -- so
+## "defenders hold depth, wingers stretch wide, strikers push higher" comes
+## from the role a character is currently playing, not who they are.
+##
 ## Personality (player.personality) continuously modifies these decisions
-## via generic formulas reading trait values -- no per-character branches
-## here. A disciplined/tactically-aware character holds tighter formation
-## and marks tighter; a high-aggression/risk-taking character makes bigger
-## forward runs, sprints more readily, and shoots from further out; better
-## teamwork keeps tighter spacing. Every character's data alone accounts
-## for the behavioral differences.
+## on top of role/stats via generic formulas reading trait values -- no
+## per-character branches here. A disciplined/tactically-aware character
+## holds tighter formation and marks tighter; a high-aggression/risk-taking
+## character makes bigger forward runs, sprints more readily, and shoots
+## from further out; better teamwork keeps tighter spacing. Every
+## character's data alone accounts for the behavioral differences.
 
 const SHOOT_RANGE := 9.0
 const SPACING_RADIUS := 6.0
@@ -26,6 +49,23 @@ const GK_FORWARD_RANGE := 2.5
 const GK_DANGER_DISTANCE := 7.0
 const GK_ARRIVE_RADIUS := 0.25
 
+## Formation-role-category multipliers -- generic positional tendencies,
+## not character-specific. Forwards make the biggest attacking runs and
+## give the least defensive recovery ("limited defensive support");
+## defenders are the mirror image (hold depth attacking, recover hardest
+## defending); midfielders sit in between ("track dangerous areas" /
+## "provide passing options").
+const ROLE_ATTACK_MULT := {"GK": 0.0, "DEF": 0.45, "MID": 0.85, "FWD": 1.25}
+const ROLE_DEFENSE_MULT := {"GK": 0.0, "DEF": 1.25, "MID": 0.9, "FWD": 0.55}
+const WINGER_WIDTH_STRETCH := 1.15
+
+## Below this stamina ratio, positioning gets a small amount of random
+## noise -- fatigue affecting "decision quality slightly" per the brief,
+## without ever disabling the player (still moves, still presses, still
+## defends; just a little less precise).
+const FATIGUE_DECISION_THRESHOLD := 0.3
+const FATIGUE_NOISE_SCALE := 1.5
+
 
 static func update_player(
 	player: FootballPlayer,
@@ -35,9 +75,12 @@ static func update_player(
 	opponents: Array,
 	own_goal_pos: Vector3,
 	opponent_goal_pos: Vector3,
-	formation_target: Vector3
+	formation_target: Vector3,
+	ball_challenger: FootballPlayer = null,
+	dangerous_opponent: Node3D = null
 ) -> void:
 	var attacking: bool = possession.possessing_team == player.team_id
+	var category: String = FormationManager.role_category(player.formation_role)
 	var target: Vector3
 
 	if attacking and player.has_possession:
@@ -50,27 +93,30 @@ static func update_player(
 		if dist_to_goal < shoot_range:
 			player.execute_shot(clampf(1.0 - dist_to_goal / shoot_range, 0.35, 1.0))
 	elif attacking:
-		# Support: push the formation slot toward goal, keep spacing.
-		# Aggression/risk-taking widen the forward run; teamwork tightens
-		# spacing discipline.
-		var advance_distance: float = _advance_distance(player)
+		# Support: push into useful space ahead of the formation slot,
+		# scaled by role (forwards make the biggest runs, defenders mostly
+		# hold depth) and by aggression/risk-taking/teamwork as before.
+		# Wingers additionally stay wide to stretch the field rather than
+		# drifting in toward the ball/center.
+		var advance_distance: float = _advance_distance(player) * ROLE_ATTACK_MULT.get(category, 1.0)
 		var advance: Vector3 = _safe_normalize(opponent_goal_pos - formation_target) * advance_distance
 		target = formation_target + advance + _spacing_offset(player, teammates)
+		if player.formation_role == "LW" or player.formation_role == "RW":
+			target.z = formation_target.z * WINGER_WIDTH_STRETCH
 	else:
-		# Opponent has it, or the ball is loose: nearest teammate presses
-		# the most dangerous opponent (or the loose ball); everyone else
-		# holds a defensive-leaning shape. Discipline/tactical_awareness
-		# pull that fallback shape further back toward goal (more
-		# conservative); low-discipline characters drift instead.
-		var dangerous_opponent: Node3D = _find_dangerous_opponent(opponents, own_goal_pos)
-		var press_point: Vector3 = dangerous_opponent.global_position if dangerous_opponent else ball.global_position
-		var marker: FootballPlayer = _closest_to(teammates, press_point)
-
-		if marker == player:
-			target = press_point
+		# Opponent has it, or the ball is loose: the team's nominated
+		# ball_challenger presses the ball directly; everyone else holds a
+		# defensive-leaning shape, pulled back by role + discipline, with a
+		# slight bias toward covering the most advanced opponent.
+		if player == ball_challenger:
+			target = ball.global_position
 		else:
-			var fallback_pull: float = lerp(0.1, 0.4, player.personality.discipline / 100.0)
+			var fallback_pull: float = clampf(lerp(0.1, 0.4, player.personality.discipline / 100.0) * ROLE_DEFENSE_MULT.get(category, 1.0), 0.0, 0.85)
 			target = formation_target.lerp(own_goal_pos, fallback_pull)
+			if dangerous_opponent:
+				target = target.lerp(dangerous_opponent.global_position, 0.12 * ROLE_DEFENSE_MULT.get(category, 1.0))
+
+	target += _fatigue_noise(player)
 
 	_move_toward(player, target, ARRIVE_RADIUS)
 	player.sprint_requested = player.global_position.distance_to(target) > _sprint_threshold(player)
@@ -96,6 +142,34 @@ static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goa
 
 	_move_toward(player, target, GK_ARRIVE_RADIUS)
 	player.sprint_requested = dist_to_ball_x < GK_DANGER_DISTANCE
+
+
+## Nearest suitable teammate to the ball -- the single player who presses/
+## challenges for it this frame (see the decision-hierarchy note above).
+## Computed once per team per frame by TeamController rather than
+## redundantly inside every single player's update, which used to be an
+## O(team_size * opponents) waste repeated once per non-marking player;
+## now it's O(team_size) once.
+static func find_ball_challenger(teammates: Array, ball: RigidBody3D) -> FootballPlayer:
+	return _closest_to(teammates, ball.global_position)
+
+
+## The most advanced opponent (closest to our own goal) -- a cheap proxy
+## for "who's making the dangerous run," used to bias non-challenging
+## defenders' fallback shape toward covering them. Also computed once per
+## team per frame by TeamController, for the same reason as
+## find_ball_challenger above.
+static func find_dangerous_opponent(opponents: Array, own_goal_pos: Vector3) -> Node3D:
+	var best: Node3D = null
+	var best_dist := INF
+	for opp in opponents:
+		if opp.is_goalkeeper:
+			continue
+		var d: float = opp.global_position.distance_to(own_goal_pos)
+		if d < best_dist:
+			best_dist = d
+			best = opp
+	return best
 
 
 static func _move_toward(player: FootballPlayer, target: Vector3, arrive_radius: float) -> void:
@@ -150,17 +224,15 @@ static func _shoot_range(player: FootballPlayer) -> float:
 	return clampf(range_val, 6.0, 14.0)
 
 
-static func _find_dangerous_opponent(opponents: Array, own_goal_pos: Vector3) -> Node3D:
-	var best: Node3D = null
-	var best_dist := INF
-	for opp in opponents:
-		if opp.is_goalkeeper:
-			continue
-		var d: float = opp.global_position.distance_to(own_goal_pos)
-		if d < best_dist:
-			best_dist = d
-			best = opp
-	return best
+## Small positional imprecision once a player is significantly fatigued --
+## "decision quality slightly" affected by stamina, never enough to stop
+## them moving/pressing/defending normally.
+static func _fatigue_noise(player: FootballPlayer) -> Vector3:
+	var stamina_ratio: float = (player.current_stamina / player.max_stamina) if player.max_stamina > 0.0 else 1.0
+	if stamina_ratio >= FATIGUE_DECISION_THRESHOLD:
+		return Vector3.ZERO
+	var magnitude: float = (FATIGUE_DECISION_THRESHOLD - stamina_ratio) * FATIGUE_NOISE_SCALE
+	return Vector3(randf_range(-magnitude, magnitude), 0.0, randf_range(-magnitude, magnitude))
 
 
 static func _closest_to(players: Array, pos: Vector3) -> FootballPlayer:

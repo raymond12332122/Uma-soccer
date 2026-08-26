@@ -96,23 +96,34 @@ func _run_tests() -> void:
 			real_model_count += 1
 	_check("Real-model count matches the roster's visual_id assignments (%d)" % expected_real_count, real_model_count == expected_real_count)
 	_check("The remaining spawned players fall back to the placeholder", placeholder_count == all_players.size() - expected_real_count)
-	_check("home_players[1] (Agnes) uses the real model", not main.home_players[1].animation_controller.supports_team_tint())
-	_check("home_players[2] (Teio) uses the real model", not main.home_players[2].animation_controller.supports_team_tint())
+
+	# v0.7: TestRoster's 4-3-3 slot order means specific characters no
+	# longer live at fixed indices -- find them by visual_id instead.
+	var agnes: FootballPlayer = null
+	var teio: FootballPlayer = null
+	for p in main.home_players:
+		if p.player_data.visual_id == "agnes_digital":
+			agnes = p
+		elif p.player_data.visual_id == "tokai_teio":
+			teio = p
+	_check("Agnes Digital (found by visual_id) uses the real model", agnes != null and not agnes.animation_controller.supports_team_tint())
+	_check("Tokai Teio (found by visual_id) uses the real model", teio != null and not teio.animation_controller.supports_team_tint())
 
 	# --- Player switching + AI control + camera tracking for the newly added character ---
-	var agnes: FootballPlayer = main.home_players[1]
 	var previously_controlled = main.player_controller.controlled_player
 	_check("Agnes is not the default controlled player before switching", previously_controlled != agnes)
 
-	# Cycle switching until Agnes becomes the controlled player.
-	var reached_agnes := false
-	for i in range(main.home_players.size()):
-		main._switch_to_next_player()
-		await get_tree().physics_frame
-		if main.player_controller.controlled_player == agnes:
-			reached_agnes = true
-			break
-	_check("Switching can reach the real-model character (Agnes)", reached_agnes)
+	# v0.7: switching to a *specific* player uses _set_human_player directly
+	# (the same method _switch_to_next_player() itself calls) rather than
+	# cycling _switch_to_next_player() a fixed number of times -- switching
+	# is now relevance-scored (see MatchManager._select_switch_target), not
+	# round-robin, so there's no longer a guaranteed number of cycles that
+	# reaches one specific player. The switching *algorithm* itself is
+	# covered by TeamSystemTest and V0_7MatchTest; this test is about the
+	# real-model character's AI-handoff/camera plumbing.
+	main._set_human_player(agnes)
+	await get_tree().physics_frame
+	_check("Switching can reach the real-model character (Agnes)", main.player_controller.controlled_player == agnes)
 	_check("Agnes's control indicator is visible once switched to", agnes.control_indicator.visible)
 	_check("Camera retargets to the real-model character once switched to", main.camera_controller.target == agnes)
 

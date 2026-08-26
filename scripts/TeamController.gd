@@ -55,6 +55,13 @@ func _physics_process(delta: float) -> void:
 	if opponent_team == null:
 		return
 
+	# Computed once per team per frame rather than once per player -- every
+	# non-challenging player used to redo an equivalent O(opponents) scan
+	# independently at 11-a-side, which is real duplicated work.
+	# AIController.update_player just reads the shared result below.
+	var ball_challenger: FootballPlayer = AIController.find_ball_challenger(players, ball)
+	var dangerous_opponent: Node3D = AIController.find_dangerous_opponent(opponent_team.players, own_goal_pos)
+
 	for player in players:
 		if player == human_player:
 			continue
@@ -69,7 +76,7 @@ func _physics_process(delta: float) -> void:
 			AIController.update_goalkeeper(player, ball, own_goal_pos)
 		else:
 			var target: Vector3 = FormationManager.get_world_position(player.formation_slot, team_id)
-			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target)
+			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target, ball_challenger, dangerous_opponent)
 
 		if personality_events and mood:
 			personality_events.maybe_trigger(player, delta, ctx)

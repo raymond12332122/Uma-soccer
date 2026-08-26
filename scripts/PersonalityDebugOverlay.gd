@@ -3,10 +3,12 @@ extends CanvasLayer
 
 ## Developer/debug display: current controlled character, its personality
 ## state, AI decision (move/sprint intent), active personality event +
-## time left, possession state, and a compact per-player event summary so
-## AI-controlled characters' events are visible too. Toggled with F3 (see
-## MatchManager); fully inert (no processing, no visible node) until
-## toggled on, so it never affects normal play.
+## time left, possession state, and (as of v0.7) a compact per-player line
+## for the full 22-player roster -- id, name, formation role, stamina,
+## possession, and active event -- so 11v11 AI behavior is easy to
+## diagnose without needing to switch to every player individually.
+## Toggled with F3 (see MatchManager); fully inert (no processing, no
+## visible node) until toggled on, so it never affects normal play.
 
 var match_manager: Node = null
 
@@ -45,7 +47,7 @@ func _build_text() -> String:
 	var controlled: FootballPlayer = match_manager.player_controller.controlled_player if match_manager.player_controller else null
 	if controlled:
 		var info: Dictionary = controlled.get_debug_info()
-		lines.append("Controlled: %s (%s)" % [info["name"], info["visual_id"]])
+		lines.append("Controlled: %s [%s] role=%s team=%d" % [info["name"], info["id"], info["formation_role"], info["team_id"]])
 		lines.append("  possession: %s   move_input: %s   sprint: %s" % [info["has_possession"], info["move_input"], info["sprint_requested"]])
 		lines.append("  stamina: %.0f%%   active event: %s (%.1fs left)" % [
 			info["stamina_ratio"] * 100.0,
@@ -62,13 +64,23 @@ func _build_text() -> String:
 		var pm = match_manager.possession_manager
 		lines.append("Ball: %s" % ("loose" if pm.is_loose else "team %d" % pm.possessing_team))
 
-	lines.append("-- All players --")
-	for player in match_manager.home_players + match_manager.away_players:
-		if player == controlled:
-			continue
-		var ev: String = player.active_personality_event
-		if ev != "":
-			lines.append("  %s: %s (%.1fs)" % [player.player_data.display_name, ev, player.personality_event_time_left])
+	lines.append("-- Home (%d) --" % match_manager.home_players.size())
+	for player in match_manager.home_players:
+		lines.append(_player_line(player, player == controlled))
+	lines.append("-- Away (%d) --" % match_manager.away_players.size())
+	for player in match_manager.away_players:
+		lines.append(_player_line(player, player == controlled))
 
 	lines.append("Force: call MatchManager.force_personality_event(player, event_id)")
 	return "\n".join(lines)
+
+
+func _player_line(player: FootballPlayer, is_controlled: bool) -> String:
+	var info: Dictionary = player.get_debug_info()
+	var marker: String = "*" if is_controlled else " "
+	var ev: String = info["active_personality_event"] if info["active_personality_event"] != "" else "-"
+	return "%s%s [%s] %s stam:%.0f%% poss:%s ev:%s" % [
+		marker, info["name"], info["id"], info["formation_role"],
+		info["stamina_ratio"] * 100.0,
+		("Y" if info["has_possession"] else "-"), ev,
+	]

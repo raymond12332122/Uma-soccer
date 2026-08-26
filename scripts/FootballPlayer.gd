@@ -26,6 +26,21 @@ var personality: PersonalityData = PersonalityData.new()
 ## match-reset logic to know where this player belongs.
 var formation_slot: Vector2 = Vector2.ZERO
 
+## Specific formation role code (e.g. "CB", "LW", "ST"; "GK" for the
+## goalkeeper), assigned by MatchManager alongside formation_slot. Read by
+## AIController via FormationManager.role_category() for generic (never
+## character-specific) team-shape behavior. Empty string for any player
+## not spawned through a formation (e.g. a test-constructed FootballPlayer)
+## -- FormationManager.role_category("") safely falls back to "MID".
+var formation_role: String = ""
+
+## Other players on this match, wired once by MatchManager right after
+## both squads are spawned (set_match_context). Used only for the pass-
+## direction assist in execute_pass()/_get_pass_direction() below -- never
+## mutated per-frame, so this is cheap to keep as a plain reference.
+var teammates: Array = []
+var opponents: Array = []
+
 # ---- Intent, written externally each physics frame ----
 var move_input: Vector2 = Vector2.ZERO
 var sprint_requested: bool = false
@@ -62,6 +77,12 @@ var shoot_max_power: float = 7.0
 @export var shoot_charge_time: float = 1.1
 @export var kick_lift: float = 0.35
 @export var momentum_transfer: float = 0.25
+
+# ---- Pass assist tunables (see _get_pass_direction / _find_pass_target) ----
+const PASS_ASSIST_MAX_DISTANCE := 24.0
+const PASS_ASSIST_MIN_ALIGNMENT := 0.35  ## cos(~70deg) -- candidate must be roughly ahead of the aim direction
+const PASS_ASSIST_BLEND := 0.55          ## 0 = pure raw aim, 1 = dead-on at the chosen teammate
+const PASS_OBSTRUCTION_RADIUS := 1.3     ## opponent within this perpendicular distance of the lane counts as blocking it
 
 @onready var action_area: Area3D = $ActionArea
 @onready var control_area: Area3D = $ControlArea
@@ -157,6 +178,14 @@ func apply_player_data(data: PlayerData) -> void:
 			shape_node.shape = shape
 
 
+## Wired once by MatchManager right after both squads are spawned. Safe to
+## call again later (e.g. if a roster were ever rebuilt) -- just replaces
+## the references.
+func set_match_context(p_teammates: Array, p_opponents: Array) -> void:
+	teammates = p_teammates
+	opponents = p_opponents
+
+
 func set_team_color(color: Color) -> void:
 	if animation_controller:
 		animation_controller.set_team_color(color)
@@ -219,9 +248,11 @@ func has_active_personality_event() -> bool:
 ## overlay and for tests -- never used by gameplay logic itself.
 func get_debug_info() -> Dictionary:
 	return {
+		"id": player_data.id if player_data else "",
 		"name": player_data.display_name if player_data else "?",
 		"visual_id": player_data.visual_id if player_data else "",
 		"team_id": team_id,
+		"formation_role": formation_role,
 		"is_goalkeeper": is_goalkeeper,
 		"has_possession": has_possession,
 		"active_personality_event": active_personality_event,
@@ -265,7 +296,16 @@ func _physics_process(delta: float) -> void:
 	else:
 		current_stamina = minf(max_stamina, current_stamina + stamina_regen_rate * delta)
 
-	var target_speed: float = sprint_speed if sprinting else base_speed
+	# Fatigue scales sprint speed, acceleration, and (in _update_possession)
+	# close control gradually as stamina drains, instead of a hard on/off
+	# cliff at exactly 0 stamina -- a tired player is progressively less
+	# sharp, not "full speed until empty, then frozen." At full stamina
+	# (stamina_ratio == 1.0) every lerp below resolves to its old fixed
+	# value, so a fresh player behaves exactly as before this system existed.
+	var stamina_ratio: float = (current_stamina / max_stamina) if max_stamina > 0.0 else 1.0
+	var sprint_bonus: float = (sprint_speed - base_speed) * lerp(0.4, 1.0, stamina_ratio)
+	var target_speed: float = (base_speed + sprint_bonus) if sprinting else base_speed
+	var effective_acceleration: float = acceleration * lerp(0.7, 1.0, stamina_ratio)
 	var direction := Vector3(move_input.x, 0.0, move_input.y)
 
 	if direction.length() > 0.01:
@@ -279,8 +319,8 @@ func _physics_process(delta: float) -> void:
 		_facing_angle = target_angle
 		model.rotation.y = lerp_angle(model.rotation.y, _facing_angle, turn_lerp_speed * delta)
 
-		velocity.x = move_toward(velocity.x, direction.x * target_speed, acceleration * delta)
-		velocity.z = move_toward(velocity.z, direction.z * target_speed, acceleration * delta)
+		velocity.x = move_toward(velocity.x, direction.x * target_speed, effective_acceleration * delta)
+		velocity.z = move_toward(velocity.z, direction.z * target_speed, effective_acceleration * delta)
 	else:
 		velocity.x = move_toward(velocity.x, 0.0, deceleration * delta)
 		velocity.z = move_toward(velocity.z, 0.0, deceleration * delta)
@@ -292,7 +332,7 @@ func _physics_process(delta: float) -> void:
 
 	move_and_slide()
 
-	_update_possession(sprinting)
+	_update_possession(sprinting, stamina_ratio)
 	_process_pass_input()
 	_process_shoot_input(delta)
 	_update_animation_state()
@@ -362,7 +402,7 @@ func _get_aim_direction() -> Vector3:
 # player with a spring/damper force. The ball stays a fully simulated
 # RigidBody3D at all times -- this only adds a force on top of normal
 # physics, so collisions, bounces, and knock-aways still behave naturally.
-func _update_possession(sprinting: bool) -> void:
+func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	if ball_in_control_range == null or _possession_cooldown_timer > 0.0:
 		has_possession = false
 		return
@@ -372,7 +412,10 @@ func _update_possession(sprinting: bool) -> void:
 	if _control_lost_timer > 0.0:
 		return
 
-	var accel_coeff := dribble_accel
+	# Close control also degrades gradually with fatigue (weaker steering
+	# force back to the target dribble point) -- at full stamina this is
+	# identical to the pre-fatigue behavior.
+	var accel_coeff: float = dribble_accel * lerp(0.75, 1.0, stamina_ratio)
 	var damping_coeff := dribble_damping_accel
 	if sprinting:
 		accel_coeff *= 0.6
@@ -419,7 +462,7 @@ func _process_shoot_input(delta: float) -> void:
 func execute_pass() -> void:
 	if ball_in_action_range == null:
 		return
-	_apply_kick_impulse(ball_in_action_range, pass_power, false)
+	_apply_kick_impulse(ball_in_action_range, pass_power, false, _get_pass_direction())
 
 
 func execute_shot(charge_ratio: float) -> void:
@@ -429,8 +472,73 @@ func execute_shot(charge_ratio: float) -> void:
 	_apply_kick_impulse(ball_in_action_range, power, true)
 
 
-func _apply_kick_impulse(ball: RigidBody3D, power: float, is_shot: bool) -> void:
-	var aim_dir := _get_aim_direction()
+## Default aim direction, nudged toward a nearby, roughly-ahead, unblocked
+## teammate if one exists (see _find_pass_target) -- a blend, not a snap,
+## so "the default direction remains based on player aim/movement" holds:
+## with no suitable candidate, or none set up via set_match_context() at
+## all (teammates defaults to []), this returns the exact same direction
+## passing always used before this system existed.
+func _get_pass_direction() -> Vector3:
+	var base_dir: Vector3 = _get_aim_direction()
+	var best: FootballPlayer = _find_pass_target(base_dir)
+	if best == null:
+		return base_dir
+	var to_best: Vector3 = best.global_position - global_position
+	to_best.y = 0.0
+	if to_best.length() < 0.01:
+		return base_dir
+	return base_dir.slerp(to_best.normalized(), PASS_ASSIST_BLEND).normalized()
+
+
+## Among teammates roughly ahead of base_dir and within range, prefer one
+## with a clear lane (no opponent close to the straight line between here
+## and them) over a more directly-aligned but blocked one -- "avoid passing
+## directly through opponents when a reasonable alternative exists" without
+## full auto-targeting (a candidate outside the alignment cone is never
+## considered at all, regardless of how open they are).
+func _find_pass_target(base_dir: Vector3) -> FootballPlayer:
+	var best: FootballPlayer = null
+	var best_score := -INF
+	var base_dir_n: Vector3 = base_dir.normalized()
+
+	for mate in teammates:
+		if mate == self or mate == null or not is_instance_valid(mate):
+			continue
+		var to_mate: Vector3 = mate.global_position - global_position
+		to_mate.y = 0.0
+		var dist: float = to_mate.length()
+		if dist < 0.5 or dist > PASS_ASSIST_MAX_DISTANCE:
+			continue
+		var alignment: float = base_dir_n.dot(to_mate / dist)
+		if alignment < PASS_ASSIST_MIN_ALIGNMENT:
+			continue
+		var score: float = alignment - dist * 0.01
+		if _lane_is_obstructed(to_mate, dist):
+			score -= 0.5
+		if score > best_score:
+			best_score = score
+			best = mate
+	return best
+
+
+func _lane_is_obstructed(to_mate: Vector3, dist: float) -> bool:
+	var dir: Vector3 = to_mate / dist
+	for opp in opponents:
+		if opp == null or not is_instance_valid(opp):
+			continue
+		var to_opp: Vector3 = opp.global_position - global_position
+		to_opp.y = 0.0
+		var along: float = to_opp.dot(dir)
+		if along <= 0.3 or along >= dist - 0.3:
+			continue
+		var perp: Vector3 = to_opp - dir * along
+		if perp.length() < PASS_OBSTRUCTION_RADIUS:
+			return true
+	return false
+
+
+func _apply_kick_impulse(ball: RigidBody3D, power: float, is_shot: bool, aim_dir_override: Vector3 = Vector3.ZERO) -> void:
+	var aim_dir: Vector3 = aim_dir_override if aim_dir_override != Vector3.ZERO else _get_aim_direction()
 	var impulse: Vector3 = aim_dir * power + velocity * momentum_transfer
 	impulse.y = kick_lift * (1.0 if is_shot else 0.6)
 

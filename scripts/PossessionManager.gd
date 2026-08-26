@@ -9,6 +9,14 @@ extends Node
 ## ball is treated as the carrier for AI/UI purposes; the underlying
 ## dribble-steering forces still resolve the physical duel naturally.
 
+## At 22 players, a crowded box can put several teammates within a hair's
+## breadth of "closest to the ball" simultaneously; without this, tiny
+## per-frame distance jitter between them would flip current_carrier back
+## and forth every frame even though nobody actually changed possession.
+## The current carrier keeps the job as long as it's still within this
+## margin of the best candidate, not just strictly closest.
+const HYSTERESIS_MARGIN := 0.15
+
 var current_carrier: FootballPlayer = null
 var possessing_team: int = -1
 var is_loose: bool = true
@@ -35,6 +43,12 @@ func _physics_process(_delta: float) -> void:
 			if d < best_dist:
 				best_dist = d
 				best = p
+
+	if current_carrier != null and current_carrier.has_possession:
+		var current_dist: float = current_carrier.global_position.distance_to(_ball.global_position)
+		if current_dist <= best_dist + HYSTERESIS_MARGIN:
+			best = current_carrier
+			best_dist = current_dist
 
 	if best != null and current_carrier != null and best != current_carrier and best.team_id != current_carrier.team_id:
 		best.notify_possession_won_from_opponent()

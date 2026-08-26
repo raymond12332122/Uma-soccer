@@ -22,8 +22,8 @@ func _run_tests() -> void:
 		await get_tree().physics_frame
 
 	# --- player spawning ---
-	_check("4 home players spawned", main.home_players.size() == 4)
-	_check("4 away players spawned", main.away_players.size() == 4)
+	_check("11 home players spawned", main.home_players.size() == 11)
+	_check("11 away players spawned", main.away_players.size() == 11)
 
 	var home_gk_count := 0
 	for p in main.home_players:
@@ -79,11 +79,25 @@ func _run_tests() -> void:
 	_check("New player's indicator turns on", second_controlled.control_indicator.visible)
 	_check("Home team no longer treats old player as human", main.home_team.human_player == second_controlled)
 
-	# Cycle all the way around back to the start.
-	for i in range(main.home_players.size() - 1):
+	# v0.7: switching is relevance-scored (distance to ball + attacking/
+	# defensive positioning -- see MatchManager._select_switch_target), not
+	# simple round-robin, so repeatedly switching is no longer guaranteed to
+	# tour every player and return to the start (a football game's smart
+	# switch is explicitly allowed to revisit the most relevant couple of
+	# players rather than blindly cycling). What must still hold at every
+	# step: the result is always a real member of the home roster, and a
+	# switch always actually changes who's controlled (the previous player
+	# is excluded from candidates by construction).
+	var repeated_switch_ok := true
+	var previous = second_controlled
+	for i in range(main.home_players.size() + 3):
 		main._switch_to_next_player()
 		await get_tree().physics_frame
-	_check("Cycling through all players returns to the start", main.player_controller.controlled_player == initial_controlled)
+		var now = main.player_controller.controlled_player
+		if not main.home_players.has(now) or now == previous:
+			repeated_switch_ok = false
+		previous = now
+	_check("Repeated switching always lands on a distinct, valid home-roster player", repeated_switch_ok)
 
 	# --- possession transfer ---
 	var controlled = main.player_controller.controlled_player

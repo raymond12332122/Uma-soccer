@@ -9,7 +9,15 @@ extends Node3D
 
 const HOME_COLOR := Color(0.964706, 0.960784, 0.309804, 1)
 const AWAY_COLOR := Color(0.85, 0.16, 0.16, 1)
-const DEFAULT_HUMAN_INDEX := 2  # index into home_players -- the MID
+const DEFAULT_HUMAN_INDEX := 9  # index into home_players -- the ST slot (see TestRoster's 4-3-3 slot order)
+
+## Player-switching relevance weights (see _select_switch_target). Not
+## "always pick the closest player" -- distance still matters most, but
+## attacking/defensive positional relevance can outweigh a small distance
+## difference, and the goalkeeper is deprioritized outside real danger.
+const SWITCH_DIST_WEIGHT := 1.0
+const SWITCH_RELEVANCE_BONUS := 6.0
+const SWITCH_GK_PENALTY := 12.0
 
 var _football_player_scene: PackedScene = preload("res://scenes/FootballPlayer.tscn")
 
@@ -53,23 +61,31 @@ func _spawn_teams() -> void:
 	home_players = _spawn_team(TestRoster.home_team(), 0, HOME_COLOR)
 	away_players = _spawn_team(TestRoster.away_team(), 1, AWAY_COLOR)
 
+	# Wired once, up front -- used only for the pass-direction assist (see
+	# FootballPlayer._find_pass_target), never mutated per-frame.
+	for p in home_players:
+		p.set_match_context(home_players, away_players)
+	for p in away_players:
+		p.set_match_context(away_players, home_players)
+
 
 func _spawn_team(roster: Array[PlayerData], team_id: int, color: Color) -> Array:
-	var formation: Dictionary = FormationManager.get_slots("3_flat")
+	var slots: Array = FormationManager.get_slots(FormationManager.DEFAULT_FORMATION)
 	var result: Array = []
 
 	for i in range(roster.size()):
 		var data: PlayerData = roster[i]
+		var slot: Dictionary = slots[i]
 		var player: FootballPlayer = _football_player_scene.instantiate()
 		players_root.add_child(player)
 
 		player.team_id = team_id
-		player.is_goalkeeper = (i == 0)
+		player.is_goalkeeper = (slot["role"] == "GK")
+		player.formation_role = slot["role"]
 		player.apply_player_data(data)
 
-		var slot: Vector2 = formation["GK"][0] if i == 0 else formation["OUT"][i - 1]
-		player.formation_slot = slot
-		player.global_position = FormationManager.get_world_position(slot, team_id)
+		player.formation_slot = slot["pos"]
+		player.global_position = FormationManager.get_world_position(slot["pos"], team_id)
 		player.set_team_color(color)
 
 		result.append(player)
@@ -138,12 +154,59 @@ func _physics_process(delta: float) -> void:
 	_debug_key_was_pressed = f3_now
 
 
+## Switching considers distance to the ball, current possession, and
+## attacking/defensive relevance -- not just "closest player" -- so it
+## feels like picking the right teammate rather than blindly cycling.
+## Falls back to plain next-index cycling if scoring can't pick anyone
+## (e.g. only one player left).
 func _switch_to_next_player() -> void:
 	if home_players.is_empty():
 		return
-	var current_index: int = home_players.find(player_controller.controlled_player)
-	var next_index: int = (current_index + 1) % home_players.size()
-	_set_human_player(home_players[next_index])
+	var current: FootballPlayer = player_controller.controlled_player
+	var candidates: Array = home_players.duplicate()
+	candidates.erase(current)
+	if candidates.is_empty():
+		return
+
+	var target: FootballPlayer = _select_switch_target(candidates)
+	if target == null:
+		var current_index: int = home_players.find(current)
+		target = home_players[(current_index + 1) % home_players.size()]
+	_set_human_player(target)
+
+
+func _select_switch_target(candidates: Array) -> FootballPlayer:
+	var ball_pos: Vector3 = ball.global_position
+	var team_has_possession: bool = possession_manager and possession_manager.possessing_team == 0
+	var ball_loose: bool = possession_manager == null or possession_manager.is_loose
+
+	var best: FootballPlayer = null
+	var best_score := -INF
+	for p in candidates:
+		var dist: float = p.global_position.distance_to(ball_pos)
+		var score: float = -dist * SWITCH_DIST_WEIGHT
+
+		if p.is_goalkeeper:
+			score -= SWITCH_GK_PENALTY
+
+		if team_has_possession:
+			# Attacking relevance: prefer a teammate positioned ahead of
+			# the ball (further toward the opponent goal), a better
+			# candidate to receive/support the attack than one who's
+			# simply nearby but square or behind the ball.
+			if p.global_position.x > ball_pos.x:
+				score += SWITCH_RELEVANCE_BONUS
+		elif not ball_loose:
+			# Defensive danger: prefer a teammate positioned between the
+			# ball and our own goal -- actually in a position to matter
+			# defensively, not just whoever happens to be nearby upfield.
+			if p.global_position.x < ball_pos.x:
+				score += SWITCH_RELEVANCE_BONUS
+
+		if score > best_score:
+			best_score = score
+			best = p
+	return best
 
 
 func _set_human_player(player: FootballPlayer) -> void:

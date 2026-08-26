@@ -2,14 +2,20 @@
 
 A 3D soccer prototype built in Godot 4, aimed at an installable Android APK.
 This is the foundation for a much larger football game. Current milestone
-(v0.6): every character has a personality -- data-driven traits that
-continuously bias AI decisions (sprint eagerness, shoot range, forward
-runs, marking discipline, spacing) plus a reusable spontaneous-event
-system for character-specific moments (Gold Ship getting bored and
-sitting down mid-match, Opera O showboating, Agnes reacting to Teio
-nearby), on top of the v0.5 roster of 11 real 3D characters (v0.4's
-reusable asset pipeline), the v0.3 team match (AI, switching, formations),
-and the v0.2 dribble/pass/shoot core.
+(v0.7): a complete 11v11 match on a data-driven 4-3-3 formation -- 22
+players (11 per team, 2 goalkeepers) with formation-role-aware team shape
+(defenders hold depth, wingers stretch the field, forwards push forward and
+give only limited defensive support), a relevance-scored player switch
+(distance to ball *and* attacking/defensive positioning, not just
+"closest"), gradual stamina fatigue (sprint speed/acceleration/close
+control all degrade smoothly rather than cutting off), a light pass-
+direction assist, and a hysteresis-stabilized `PossessionManager` for
+22-player crowds -- all on top of the v0.6 personality system (every
+character's traits still continuously bias AI decisions and drive
+spontaneous events like Gold Ship getting bored and sitting down
+mid-match), the v0.5 roster of 11 real 3D characters (v0.4's reusable
+asset pipeline, each character now used once per team), the v0.3 team
+match foundations, and the v0.2 dribble/pass/shoot core.
 
 ## Tech Stack
 
@@ -28,13 +34,13 @@ Each system is a small, single-purpose script (no giant manager):
 | `PlayerData` | `scripts/PlayerData.gd` | Resource: one character's stats (speed, passing, shooting, dribbling, stamina, defense, foot, etc.) |
 | `FootballPlayer` | `scripts/FootballPlayer.gd` | Shared entity for every player (human, AI, GK). Simulates movement/dribbling/kicking from *intent* fields it never sets itself |
 | `PlayerController` | `scripts/PlayerController.gd` | Drives the one human-controlled `FootballPlayer` from touch/keyboard input |
-| `AIController` | `scripts/AIController.gd` | Stateless per-frame offense/defense/goalkeeper decision logic |
-| `TeamController` | `scripts/TeamController.gd` | Owns one team's roster; runs `AIController` on every member except the human target |
-| `PossessionManager` | `scripts/PossessionManager.gd` | Single source of truth for who/which team currently has the ball, or if it's loose |
-| `FormationManager` | `scripts/FormationManager.gd` | Data-driven starting positions, normalized and mirrored per team |
+| `AIController` | `scripts/AIController.gd` | Stateless per-frame offense/defense/goalkeeper decision logic; role-category-aware team shape (v0.7) |
+| `TeamController` | `scripts/TeamController.gd` | Owns one team's roster; runs `AIController` on every member except the human target; computes each team's shared ball-challenger/dangerous-opponent once per frame (v0.7) |
+| `PossessionManager` | `scripts/PossessionManager.gd` | Single source of truth for who/which team currently has the ball, or if it's loose; hysteresis-stabilized for 22-player crowds (v0.7) |
+| `FormationManager` | `scripts/FormationManager.gd` | Data-driven formations (4-3-3), role-labeled slots, normalized/mirrored per team; `role_category()` maps a specific slot to a generic GK/DEF/MID/FWD bucket (v0.7) |
 | `BallController` | `scripts/BallController.gd` | Ball physics tuning, max-speed clamp, reset |
 | `CameraController` | `scripts/CameraController.gd` | Follow camera, retargetable at runtime (player switching) |
-| `MatchManager` | `scripts/MatchManager.gd` | Top-level orchestrator: spawns both squads, wires the above together, owns scoring/switching/restart |
+| `MatchManager` | `scripts/MatchManager.gd` | Top-level orchestrator: spawns both squads, wires the above together, owns scoring/switching/restart; relevance-scored switch target selection (v0.7) |
 | `AnimationController` | `scripts/AnimationController.gd` | Owns whichever visual (real model or placeholder) is displayed for one `FootballPlayer`; translates gameplay state into animation/procedural motion |
 | `CharacterRegistry` | `scripts/data/CharacterRegistry.gd` | Data-driven map from a `PlayerData.visual_id` string to a character model scene |
 | `PersonalityData` | `scripts/PersonalityData.gd` | Resource: one character's behavioral traits (confidence, discipline, aggression, etc.) -- separate from `PlayerData`'s football-ability stats |
@@ -50,7 +56,9 @@ Each system is a small, single-purpose script (no giant manager):
 *except* whichever one `PlayerController` currently targets. Switching is
 just reassigning that target — the old player is automatically back under
 AI control on the very next physics frame, no separate enable/disable logic
-needed.
+needed. As of v0.7, *which* teammate switching lands on is relevance-scored
+(`MatchManager._select_switch_target`) rather than a plain next-index
+cycle — see [11v11 Match & Team Shape](#11v11-match--team-shape-v07) below.
 
 **How possession works:** Every `FootballPlayer` tracks its own
 `has_possession` locally (ball within its control sensor, not on a
@@ -58,7 +66,10 @@ post-kick cooldown). `PossessionManager` polls all players each frame and
 reports whichever one is closest to the ball as the current carrier (and
 that player's team as the possessing team) — giving AI a single, cheap
 question to ask ("does my team have the ball?") without changing how the
-underlying dribble physics resolves a contested ball.
+underlying dribble physics resolves a contested ball. As of v0.7 it also
+applies a small hysteresis margin so a crowded 22-player box doesn't flip
+the carrier every frame over sub-centimeter distance jitter between two
+teammates who both happen to be in range.
 
 ## Project Structure
 
@@ -79,7 +90,7 @@ uma-soccer/
 │   ├── Ball.tscn                    # RigidBody3D soccer ball
 │   └── UI/TouchControls.tscn       # Joystick + PASS/SHOOT/SPRINT/SWITCH buttons
 ├── scripts/
-│   ├── data/TestRoster.gd         # Small hand-built 3v3(+GK) test squads (PlayerData instances)
+│   ├── data/TestRoster.gd         # 11v11 4-3-3 test squads (PlayerData instances; 11 characters, 1x/team)
 │   ├── data/CharacterRegistry.gd  # visual_id -> character model scene
 │   ├── InputState.gd               # Autoload singleton bridging touch + gameplay
 │   ├── PlayerData.gd                # Per-character stat Resource (incl. visual_id)
@@ -110,7 +121,8 @@ uma-soccer/
     ├── main_scene_test.gd / MainSceneTest.tscn        # Goals, per-team score, restart, celebration
     ├── team_system_test.gd / TeamSystemTest.tscn      # Spawning, switching, possession, AI, GK
     ├── character_pipeline_test.gd / CharacterPipelineTest.tscn  # Registry, AnimationController, real-model gameplay parity
-    └── personality_test.gd / PersonalityTest.tscn      # Personality profiles, AI modifiers, event triggers/cooldowns/interruption
+    ├── personality_test.gd / PersonalityTest.tscn      # Personality profiles, AI modifiers, event triggers/cooldowns/interruption
+    └── v0_7_match_test.gd / V0_7MatchTest.tscn          # 22-player formation/roles, smart switching, role-based shape, fatigue, pass assist, possession hysteresis, 22-player goal/restart reset
 ```
 
 ## Controls
@@ -145,22 +157,105 @@ sharply at speed, sprinting, or passing/shooting all break this steering
 (with a brief cooldown after a kick before control can be regained), so
 losing the ball on a bad touch is a real possibility, not just cosmetic.
 
-## Team AI (v0.3)
+## Team AI (v0.3, extended v0.7)
 
-Simple, reactive, no lookahead or tactics:
+Simple, reactive, no lookahead or tactics -- the base decision loop from
+v0.3 is unchanged; v0.7 (below) adds formation-role awareness on top:
 
 - **Offense** (own team has the ball): the carrier dribbles toward goal and
-  auto-shoots once in range; teammates push their formation slot forward and
-  keep spacing from each other (repel when too close, so they don't bunch).
-- **Defense** (opponent has it, or ball is loose): the nearest teammate to
-  the most advanced opponent presses them (or the ball, if loose); everyone
-  else holds a defensive-leaning position pulled back toward their own goal.
+  auto-shoots once in range; teammates push into space ahead of their
+  formation slot and keep spacing from each other (repel when too close, so
+  they don't bunch).
+- **Defense** (opponent has it, or ball is loose): the team's nominated
+  ball-challenger (nearest suitable teammate) presses the ball directly;
+  everyone else holds a defensive-leaning position pulled back toward their
+  own goal.
 - **Goalkeeper**: stays on the goal line, tracks the ball laterally, steps
   out when the ball gets dangerously close, and instantly clears (shoots)
   the ball upfield if it ends up in the keeper's control rather than
   dribbling around the box. A keeper standing in the goal mouth also blocks
   shots simply through normal collision — no separate block-detection code
   needed.
+
+## 11v11 Match & Team Shape (v0.7)
+
+The match is now a full 11v11 on a data-driven 4-3-3: `FormationManager`
+defines 11 role-labeled slots (GK, LB, CB, CB, RB, CM, CM, CM, LW, ST, RW)
+as normalized coordinates, mirrored per team exactly like the old 3-slot
+layout was. Adding "4-4-2", "3-5-2", "4-2-3-1", etc. later is purely a new
+entry in `FormationManager.FORMATIONS` — nothing in `TeamController` or
+`AIController` references a formation by name or assumes a slot count.
+
+**Formation-role team shape.** Each `FootballPlayer` carries a
+`formation_role` (e.g. `"CB"`, `"LW"`, `"ST"`) assigned at spawn.
+`FormationManager.role_category()` maps that to a generic `GK`/`DEF`/`MID`/
+`FWD` bucket that `AIController` reads for positional tendencies — never a
+specific character:
+
+| Situation | DEF | MID | FWD |
+|---|---|---|---|
+| Attacking-support advance distance | smallest (hold depth) | moderate (passing options) | biggest (attacking space) |
+| Defensive fallback pull toward goal | strongest (recover hardest) | moderate (track dangerous areas) | weakest ("limited defensive support") |
+
+Wingers (`LW`/`RW`) additionally stay pulled wide during an attacking move
+instead of drifting toward the ball, so the team actually stretches the
+field rather than everyone converging on one spot.
+
+**Decision hierarchy**, per non-carrier player, in priority order:
+1. **immediate danger / 2. possession opportunity** — the team's single
+   `ball_challenger` (nearest suitable teammate to the ball, computed
+   *once per team per frame* by `TeamController` rather than redundantly
+   inside every player's own update — a real O(n·m) → O(n) win at 11-a-side)
+   goes straight at the ball, whether it's loose or an opponent has it.
+3. **defensive responsibility** — everyone else recovers toward defensive
+   shape (role + discipline + a slight bias toward covering the most
+   advanced opponent, `dangerous_opponent`, also computed once per team).
+4. **attacking opportunity / 5. formation positioning** — when a teammate
+   has the ball, everyone else pushes into useful space per the table above.
+
+**Smart switching.** `MatchManager._select_switch_target()` scores every
+other home player by distance to the ball *and* attacking/defensive
+relevance (ahead of the ball when we have possession; goal-side of the ball
+when defending), with a penalty for the goalkeeper outside real danger —
+not simply "closest player." Cycling still lands on a real, distinct
+teammate every time; it's no longer a fixed round-robin, so it can (and
+should) revisit the couple of most relevant players in a phase of play
+rather than touring the whole roster.
+
+**Stamina fatigue** is now gradual, not a hard on/off cliff at 0 stamina:
+sprint speed, acceleration, and close (dribble) control all scale smoothly
+down as `current_stamina` drops (a fresh, full-stamina player behaves
+exactly as before this system existed — every formula resolves to its old
+fixed value at `stamina_ratio == 1.0`). AI positioning also gets a small
+amount of random noise once a player is significantly fatigued ("decision
+quality slightly" affected, per design) — never enough to stop them moving,
+pressing, or defending.
+
+**Pass assist.** `FootballPlayer.execute_pass()` still aims from the
+player's own movement/facing direction by default, but if a teammate sits
+roughly ahead of that aim (within a ~70° cone) and has a clear lane (no
+opponent close to the straight line between them), the pass direction
+blends toward them — a nudge, not FIFA-style auto-targeting. With no
+suitable teammate (or none known at all — `FootballPlayer.teammates`/
+`opponents` are only wired for informational pass-assist purposes, set once
+by `MatchManager` after both squads spawn), the pass goes out exactly where
+aimed, identical to pre-v0.7 behavior. AI ball-carriers still only
+dribble + auto-shoot (deciding *when* to pass is not yet AI-driven — see
+Roadmap).
+
+**Debug overlay** (F3) now lists every one of the 22 players — id, name,
+formation role, stamina, possession, active personality event — alongside
+the detailed view of whichever one is currently controlled.
+
+**Performance.** With 21 AI updates/frame (22 players minus the human) all
+doing simple vector math, this is nowhere near CPU-bound at 60Hz — a 10
+second idle 22-player match and repeated headless test runs show no
+slowdown. The one concrete algorithmic waste found and fixed was the
+per-player-redundant ball-challenger/dangerous-opponent scan noted above.
+Draw calls / skinned-mesh bone counts (noted since v0.5's roadmap) remain
+the more likely real bottleneck on an actual Android device, but that
+needs on-device or rendered profiling this headless test environment can't
+do — see Roadmap.
 
 ## Personality System (v0.6)
 
@@ -341,6 +436,7 @@ godot --headless --path . tests/MainSceneTest.tscn
 godot --headless --path . tests/TeamSystemTest.tscn
 godot --headless --path . tests/CharacterPipelineTest.tscn
 godot --headless --path . tests/PersonalityTest.tscn
+godot --headless --path . tests/V0_7MatchTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
@@ -362,16 +458,43 @@ radius all responding to personality, isolated per-trait), event gating
 enforcement, duration/auto-expiry, interruption via `reset_intent()`,
 Gold Ship's bored/sit event specifically, and that player switching, match
 restart, and goal scoring all continue to behave correctly during and
-after an active personality event; the other two re-validate the full
-v0.2/v0.3 mechanics (dribble, pass, shot power/clamp, goal scoring,
-celebration, restart) now running with real characters filling the entire
-pitch.
-274 assertions total across all five suites, all passing.
+after an active personality event; `v0_7_match_test.gd` is the newest
+suite, covering everything that changed or scaled up in v0.7: 22-player/
+11-per-team/2-goalkeeper spawn with every formation slot's role assigned,
+the 4-3-3's slot/role-category data itself, two on-pitch instances of the
+same character (e.g. both teams' Gold Ship) behaving fully independently
+(distinct stamina, distinct personality-event cooldowns), the smart-switch
+scoring formula preferring attacking/defensive relevance over raw distance,
+role-based attacking/defensive shape differences (winger vs. central
+midfielder, ball-challenger vs. non-challenger defender), goalkeeper
+movement staying smooth (no teleporting) when suddenly threatened, gradual
+stamina-fatigue speed scaling with recovery, pass-assist direction logic,
+an AI-controlled forward actually scoring through normal decision-making
+with 22 players on the pitch, `PossessionManager`'s hysteresis margin
+holding an established carrier through jitter while still legitimately
+handing off on a genuine change, and the full 22-player goal/restart reset
+(formation return, both goalkeepers back on their line, cleared personality
+events, retained camera target); the other two re-validate the full v0.2/
+v0.3 mechanics (dribble, pass, shot power/clamp, goal scoring, celebration,
+restart) now running with real characters filling the entire pitch.
+323 assertions total across all six suites, all passing.
 
-## Current Feature Set (v0.6)
+## Current Feature Set (v0.7)
 
-- Everything from v0.3 (3v3+GK match, AI, switching, formations, possession
-  tracking, per-team score) unchanged in feel
+- Full 11v11 match on a data-driven 4-3-3 formation — 22 players, 11 per
+  team, exactly 2 goalkeepers, every non-GK slot assigned a specific role
+  (LB/CB/RB, CM, LW/ST/RW) that generically (never per-character) biases
+  `AIController`'s team shape
+- All 11 currently-integrated character models are used once per team (22
+  player slots from 11 real characters), each a fully independent
+  `FootballPlayer`/`PlayerData`/`PersonalityData` instance — verified by
+  test that two on-pitch copies of the same character never share stamina,
+  cooldowns, or event state
+- Relevance-scored player switching (distance to ball + attacking/
+  defensive positioning), a light pass-direction assist toward an open
+  aligned teammate, gradual stamina fatigue instead of a hard cutoff, and
+  a hysteresis-stabilized `PossessionManager` so a crowded 22-player box
+  doesn't flip the ball carrier on sub-frame jitter
 - 11 real 3D characters integrated (all glTF binary, CC BY 4.0, see
   `assets/characters/CREDITS.md`) via the reusable, data-driven pipeline
   (`CharacterRegistry` + `AnimationController`). Every addition after the
@@ -379,14 +502,10 @@ pitch.
   `PlayerController`/`TeamController`/`PossessionManager`/
   `BallController`/`CameraController`/`MatchManager` — purely data (one
   registry entry, one `visual_id` assignment, one credits block each)
-- All 8 players in the active 3v3(+GK) match are real, distinct characters
-  on both teams — the placeholder capsule no longer appears in a normal
-  match, though it's still exercised directly by the test suite and used
-  automatically for any `PlayerData` without a `visual_id`
-- 3 further models (Grass Wonder, Mejiro McQueen, Silence Suzuka) are
-  registered and fully covered by the test suite but not currently
-  assigned to a match slot (all 8 are filled) — available immediately for
-  a future roster-size increase or manual swap
+- The placeholder capsule no longer appears in a normal match — every one
+  of the 22 slots is a real character — though it's still exercised
+  directly by the test suite and used automatically for any `PlayerData`
+  without a `visual_id`
 - Automatic scale normalization (measured, not guessed) and orientation
   handling for downloaded models with inconsistent conventions — verified
   per-model via geometry (eye vs. hair mesh position), not assumed from
@@ -437,16 +556,24 @@ pitch.
   model isn't in the project — the architecture (data-driven profile map
   + reusable event system) needs nothing new to support them once their
   models arrive
-- Full 11-a-side rosters and formations (would also surface the 3
-  registered-but-unassigned models above)
-- AI passing decisions (currently AI ball-carriers dribble + auto-shoot only)
+- AI passing decisions (AI ball-carriers still only dribble + auto-shoot;
+  v0.7 only added *direction* assist to the human PASS button, not an AI
+  decision of *when* to pass)
+- Additional formations (4-4-2, 3-5-2, 4-2-3-1, ...) and in-match tactic
+  switching — `FormationManager`/`AIController` are already built
+  formation-agnostic for this, so it's purely new formation data plus a UI
+  to pick it
+- Fouls, offsides, substitutions, a match timer, possession stats (all
+  explicitly out of scope for v0.7, per instruction)
 - Ball trapping/first-touch skill mechanics
-- Match timer, possession stats
 - Real animation clips (walk/run/kick cycles) once available, replacing the
   procedural fallback per character
 - Stadium environment, crowd, audio
-- Formation editor / tactic selection UI
+- On-device (or at least rendered, non-headless) performance profiling —
+  draw calls and skinned-mesh bone counts couldn't be measured in this
+  headless test environment and are the more likely real bottleneck on
+  Android at 22 characters than any of the v0.7 AI/logic changes
 - Bone-count optimization pass on skinned character models for Android
   (each model's ~400+ joints are mostly cosmetic cloth/hair physics chains
-  that currently just sit in bind pose; fine with 8 on screen at once so
-  far, worth profiling as more are added)
+  that currently just sit in bind pose; fine with 22 on screen so far in
+  headless testing, worth profiling on-device)
