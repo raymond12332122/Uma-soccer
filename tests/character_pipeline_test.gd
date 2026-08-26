@@ -172,6 +172,21 @@ func _check_registered_model(visual_id: String) -> void:
 		_check("'%s' has a Skeleton3D (skinned mesh imported correctly)" % visual_id, skeleton != null)
 		_check("'%s' skeleton has bones" % visual_id, skeleton != null and skeleton.get_bone_count() > 0)
 
+		# T-pose fix: every shipped model has zero animation clips (verified
+		# below), so without this the upper arms would sit in their bind-pose
+		# horizontal T-pose forever. Check both the diagnostic flag and the
+		# actual posed geometry -- the arm's *current* pose direction (not
+		# rest) must now point mostly downward, not sideways.
+		_check("'%s' AnimationController ran the T-pose arm fix" % visual_id, ac.t_pose_fixed)
+		if skeleton:
+			var arm_l_idx: int = ac._find_bone_exact(skeleton, "Arm_L")
+			var elbow_l_idx: int = ac._find_bone_exact(skeleton, "Elbow_L")
+			if arm_l_idx >= 0 and elbow_l_idx >= 0:
+				var arm_pos: Vector3 = skeleton.get_bone_global_pose(arm_l_idx).origin
+				var elbow_pos: Vector3 = skeleton.get_bone_global_pose(elbow_l_idx).origin
+				var posed_dir: Vector3 = (elbow_pos - arm_pos).normalized()
+				_check("'%s' left upper arm points mostly downward after the T-pose fix (not still horizontal)" % visual_id, posed_dir.y < -0.7)
+
 	for state in ["idle", "walk", "run", "sprint", "dribble"]:
 		ac.set_state(state)
 	for action in ["pass", "shoot", "celebration", "tackle"]:

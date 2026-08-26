@@ -70,6 +70,16 @@ var _pulse_time: float = -1.0
 ## auto-fit scale was applied, in whatever units the source file used.
 var last_measured_height: float = 0.0
 
+## Diagnostic only (read by tests) -- true once _fix_tpose_arms() has run
+## for the current real-model visual (see _setup_real_model).
+var t_pose_fixed: bool = false
+
+## Relaxed-hang target direction for the upper arm bone, in skeleton-local
+## space (Y-up, confirmed empirically for every currently-integrated
+## model). X is mirrored per side; a small outward/forward bias keeps the
+## arm from clipping straight through the torso.
+const _TPOSE_UPPER_ARM_TARGET := Vector3(0.18, -1.0, 0.08)
+
 
 func set_visual(visual_id: String) -> void:
 	if _visual_root:
@@ -80,6 +90,7 @@ func set_visual(visual_id: String) -> void:
 	_action_clip_map.clear()
 	_pulse_kind = ""
 	_pulse_time = -1.0
+	t_pose_fixed = false
 
 	var scene: PackedScene = CharacterRegistry.get_scene(visual_id)
 	if scene:
@@ -257,6 +268,17 @@ func _setup_real_model(scene: PackedScene) -> void:
 	else:
 		_build_clip_maps()
 
+	# Every currently-integrated model ships in a bind pose (T-pose: arms
+	# straight out horizontally) with zero animation clips, so without this
+	# every character would stand/run around looking like a floating cross.
+	# Only relevant on the no-real-clips path -- a model with real clips
+	# handles its own posing once played.
+	if _anim_player == null:
+		var skeleton: Skeleton3D = _find_skeleton(instance)
+		if skeleton:
+			_fix_tpose_arms(skeleton)
+			t_pose_fixed = true
+
 
 func _build_clip_maps() -> void:
 	for clip_name in _anim_player.get_animation_list():
@@ -285,6 +307,74 @@ func _find_animation_player(node: Node) -> AnimationPlayer:
 		if found:
 			return found
 	return null
+
+
+func _find_skeleton(node: Node) -> Skeleton3D:
+	if node is Skeleton3D:
+		return node
+	for child in node.get_children():
+		var found: Skeleton3D = _find_skeleton(child)
+		if found:
+			return found
+	return null
+
+
+## Rotates the upper-arm bone (only) on each side from its bind-pose
+## horizontal T-pose direction down to a relaxed hang. Deliberately the
+## *only* bone touched: rotating just the shoulder joint's own transform
+## carries the elbow/wrist/fingers (its children) rigidly along via normal
+## skeleton hierarchy evaluation -- no separate per-bone position/rotation
+## bookkeeping needed, and nothing to get out of sync. Every
+## currently-integrated model shares one rig convention (verified: same
+## bone names, same near-identical T-pose rest direction on all 11), so
+## one fixed target direction generalizes across the whole roster without
+## per-character special-casing.
+##
+## A static pose fix, not an animation -- legs are already in a natural
+## standing position at rest (not spread) and are left untouched. Full
+## walk/run gait animation is intentionally out of scope here; see the
+## README's Roadmap.
+func _fix_tpose_arms(skeleton: Skeleton3D) -> void:
+	_fix_upper_arm(skeleton, "Arm_L", Vector3(_TPOSE_UPPER_ARM_TARGET.x, _TPOSE_UPPER_ARM_TARGET.y, _TPOSE_UPPER_ARM_TARGET.z))
+	_fix_upper_arm(skeleton, "Arm_R", Vector3(-_TPOSE_UPPER_ARM_TARGET.x, _TPOSE_UPPER_ARM_TARGET.y, _TPOSE_UPPER_ARM_TARGET.z))
+
+
+func _fix_upper_arm(skeleton: Skeleton3D, bone_prefix: String, target_dir_local: Vector3) -> void:
+	var bone_idx: int = _find_bone_exact(skeleton, bone_prefix)
+	var child_idx: int = _find_bone_exact(skeleton, bone_prefix.replace("Arm_", "Elbow_"))
+	if bone_idx < 0 or child_idx < 0:
+		return
+
+	var self_rest: Transform3D = skeleton.get_bone_global_rest(bone_idx)
+	var child_rest: Transform3D = skeleton.get_bone_global_rest(child_idx)
+	var current_dir: Vector3 = child_rest.origin - self_rest.origin
+	if current_dir.length() < 0.001:
+		return
+
+	var delta_rotation := Quaternion(current_dir.normalized(), target_dir_local.normalized())
+	var new_basis: Basis = Basis(delta_rotation) * self_rest.basis
+	# The shoulder joint's own position never moves, only its orientation --
+	# children (elbow/wrist/fingers) automatically follow since they have
+	# no override of their own and inherit this bone's new global transform.
+	skeleton.set_bone_global_pose_override(bone_idx, Transform3D(new_basis, self_rest.origin), 1.0, true)
+
+
+## Exact-match bone lookup: skeleton bone names are "<prefix>_<numeric
+## suffix>" (e.g. "Arm_L_0267"), where the suffix varies per model/import
+## and isn't meaningful -- but several *other* real bones share the same
+## prefix as a plain string (e.g. "Wrist_L_IK_Handle_0302" also starts
+## with "Wrist_L_"), so a plain begins_with() would be ambiguous. Requiring
+## the remainder after "<prefix>_" to be purely numeric picks the actual
+## bone and rejects those IK/Handle helper bones.
+func _find_bone_exact(skeleton: Skeleton3D, prefix: String) -> int:
+	var want: String = prefix + "_"
+	for i in range(skeleton.get_bone_count()):
+		var bone_name: String = skeleton.get_bone_name(i)
+		if bone_name.begins_with(want):
+			var suffix: String = bone_name.substr(want.length())
+			if suffix.is_valid_int():
+				return i
+	return -1
 
 
 ## Bind-pose bounding-box height of every mesh under `root`, in the

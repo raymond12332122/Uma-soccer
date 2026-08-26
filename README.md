@@ -375,11 +375,21 @@ changes required for the second one:
 - **Animation:** if a model ships clips, their names are keyword-matched
   onto gameplay states (`idle`/`walk`/`run`/`sprint`/`dribble`) and actions
   (`pass`/`shoot`/`celebration`/`tackle`) automatically. If it has none —
-  true for both models integrated so far — a lightweight procedural
+  true for every model integrated so far — a lightweight procedural
   fallback (speed-scaled bob/lean while moving, a dip pulse on pass/shoot,
   a hop-spin on celebration, a lunge-tilt on a won tackle) keeps the
   character visibly alive. `FootballPlayer` never knows which path is
   active.
+- **T-pose fix:** every currently-integrated model ships in its raw bind
+  pose (arms out horizontally) with no clips, so on the no-real-clips path
+  `AnimationController._fix_tpose_arms()` rotates just the upper-arm bone
+  on each side (`Arm_L`/`Arm_R`, found by name) from its T-pose direction
+  down to a relaxed hang — the elbow/wrist/fingers are children of that
+  bone and follow automatically via normal skeleton hierarchy, so nothing
+  else needs to be touched. Legs are already in a natural standing pose at
+  rest and are left alone. This is a static pose correction, not a walk/
+  run animation — see Roadmap for real gait animation, deferred to the
+  dedicated visual pass.
 
 **Adding another character model:** drop the file under
 `assets/characters/<name>/`, optionally run
@@ -477,7 +487,7 @@ handing off on a genuine change, and the full 22-player goal/restart reset
 events, retained camera target); the other two re-validate the full v0.2/
 v0.3 mechanics (dribble, pass, shot power/clamp, goal scoring, celebration,
 restart) now running with real characters filling the entire pitch.
-323 assertions total across all six suites, all passing.
+345 assertions total across all six suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
 
 ## Current Feature Set (v0.7)
 
