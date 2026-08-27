@@ -111,6 +111,21 @@ var transition_urgency: float = 0.0
 var shape_ball_pos: Vector3 = Vector3.ZERO
 const SHAPE_BALL_SMOOTH_TIME := 0.25
 
+## An even slower reference, used ONLY for how deep a player holding shape
+## sits (see AIController._cover_space_target).
+##
+## v0.8.5: shape_ball_pos smooths per-frame jitter, but it still tracks a
+## genuine change of the ball's direction closely -- right for a supporting
+## run, wrong for a whole line's depth. Once shape-holders were made to
+## track play at all (they previously stood still while their own team
+## attacked), coupling them to the 0.25s reference passed the ball's every
+## switch of direction straight into ten players' targets: measured
+## reversals per 1000 moving frames rose from 3.19 to 4.65. Lagging this
+## far means a line drops and pushes with the FLOW of play rather than with
+## the ball itself.
+var slow_ball_pos: Vector3 = Vector3.ZERO
+const SLOW_BALL_SMOOTH_TIME := 0.9
+
 var carrier: FootballPlayer = null
 var we_have_ball: bool = false
 ## The opponents' deepest outfield player (their last line). RUN_BEHIND
@@ -153,9 +168,12 @@ func mark_target_of(player: FootballPlayer) -> FootballPlayer:
 func update(players: Array, opponents: Array, ball: RigidBody3D, possession: PossessionManager, delta: float) -> void:
 	if shape_ball_pos == Vector3.ZERO:
 		shape_ball_pos = ball.global_position
+		slow_ball_pos = ball.global_position
 	else:
 		var blend: float = clampf(1.0 - exp(-delta / SHAPE_BALL_SMOOTH_TIME), 0.0, 1.0)
 		shape_ball_pos = shape_ball_pos.lerp(ball.global_position, blend)
+		var slow_blend: float = clampf(1.0 - exp(-delta / SLOW_BALL_SMOOTH_TIME), 0.0, 1.0)
+		slow_ball_pos = slow_ball_pos.lerp(ball.global_position, slow_blend)
 
 	_update_phase(possession, delta)
 	_update_opponent_last_line(opponents, delta)
@@ -170,13 +188,11 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	#     and win a ball that just broke loose.
 	#   * "are we the team attacking?" is a shape question, and uses the
 	#     sticky signal, which does not drop out for the single frame a
-	#     ball bounces off a teammate's foot. Without this the whole slot
-	#     list flipped between the attacking and defending sets several
-	#     times a second, and every player in a slot that exists in only
-	#     one of those two sets got a brand-new job (and a brand-new
-	#     target) each time.
+	#     ball bounces off a teammate's foot.
+	# Note there is deliberately no longer a boolean "are we the attacking
+	# team" used anywhere in slot allocation -- see the comment on the slot
+	# counts below. attack_intent, which is slewed, is the only phase input.
 	we_have_ball = carrier != null and carrier.team_id == team_id
-	var attacking_shape: bool = possession.last_team_with_possession == team_id
 
 	var previous: Dictionary = duties
 	# Keep the previous marking assignments too -- the retention check in
@@ -212,23 +228,48 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 		#    down on a loose ball in our own attacking phase just abandons
 		#    the attack.
 		var ball_depth: float = (ball.global_position.x - _own_goal.x) * signf(_forward_axis.x)
-		if not attacking_shape and carrier != null and ball_depth < FormationManager.FIELD_HALF_LENGTH:
+		# Gated on the SLEWED intent rather than the raw phase flag for the
+		# same reason as the slot counts below: read off the phase directly,
+		# this slot blinked in and out on the frame the phase changed.
+		if attack_intent < 0.0 and carrier != null and ball_depth < FormationManager.FIELD_HALF_LENGTH:
 			var supporter: FootballPlayer = _best_for(available, Duty.PRESS_SUPPORT, previous, ball, opponents)
 			if supporter != null:
 				_assign(supporter, Duty.PRESS_SUPPORT)
 				available.erase(supporter)
 
-	# 3. Attacking slots. Driven by the sticky shape signal, so a momentary
-	#    loose touch never dissolves the attack.
-	if attacking_shape:
-		_fill(available, Duty.SUPPORT_SHORT, MAX_SUPPORT_SHORT, previous, ball, opponents)
-		_fill(available, Duty.RUN_BEHIND, MAX_RUN_BEHIND, previous, ball, opponents)
-		_fill(available, Duty.SUPPORT_WIDE, MAX_SUPPORT_WIDE, previous, ball, opponents)
-	else:
-		# 4. Defensive slots: dedicated markers for the most threatening
-		#    opponents, again capped so we never collapse the whole team
-		#    onto opposition runners.
-		_assign_markers(available, opponents, previous, previous_marks)
+	# 3/4. Attacking and defensive slots, allocated CONTINUOUSLY.
+	#
+	# v0.8.5, and the single most important change in this milestone. This
+	# used to be `if attacking_shape: <attacking slots> else: <markers>` --
+	# a hard binary swap between two disjoint slot sets. v0.8.3 had already
+	# made the DEPTH layer continuous (attack_intent slews over ~1.2s), but
+	# left this layer, fed by the same phase signal, as a switch.
+	#
+	# Measured across three 60s AI-vs-AI matches: the number of duty-set
+	# flips equalled the number of tactical phase changes EXACTLY in every
+	# run (1/1, 9/9, 13/13), and on the single frame of each flip the
+	# players who got a new duty saw their movement target jump 8.10m,
+	# 9.47m and 10.27m on average -- against a 0.01-0.13m baseline on every
+	# other frame. That ~100x one-frame discontinuity, applied to the whole
+	# outfield simultaneously, is the "movement earthquake": not the phase
+	# changing too often (it changed only 0.02-0.22 times per second), but
+	# every phase change reorganising all ten players at once.
+	#
+	# Slot COUNTS are now a function of attack_intent, which is already
+	# smoothly slewed. A team at full attacking intent gets the full
+	# attacking set; at full defensive intent, the full marking set; and in
+	# between it genuinely holds a transitional shape -- one runner still
+	# committed, one marker already picked up. Because the slots appear and
+	# disappear at different points along the ramp, players change job a
+	# couple at a time over more than a second instead of all together on
+	# one frame. That is also just better football than a team that is
+	# either wholly attacking or wholly defending with nothing between.
+	var attacking_weight: float = clampf((attack_intent + 1.0) * 0.5, 0.0, 1.0)
+	_fill(available, Duty.SUPPORT_SHORT, _slots(MAX_SUPPORT_SHORT, attacking_weight), previous, ball, opponents)
+	_fill(available, Duty.RUN_BEHIND, _slots(MAX_RUN_BEHIND, attacking_weight), previous, ball, opponents)
+	_fill(available, Duty.SUPPORT_WIDE, _slots(MAX_SUPPORT_WIDE, attacking_weight), previous, ball, opponents)
+	_assign_markers(available, opponents, previous, previous_marks,
+		_slots(MAX_MARKERS, 1.0 - attacking_weight))
 
 	# 5. Everyone left holds shape. This is a real job, not a leftover --
 	#    see AIController's COVER_SPACE target, which stays ball-relative
@@ -236,6 +277,14 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	#    defenders measured 40% of frames completely stationary).
 	for p in available:
 		_assign(p, Duty.COVER_SPACE)
+
+
+## How many of `max_slots` a phase this committed should fill. Rounding
+## (rather than truncating) means a slot survives to the midpoint of the
+## ramp, so the two sides' slot counts cross over gradually rather than
+## both changing at the same instant.
+static func _slots(max_slots: int, weight: float) -> int:
+	return int(round(max_slots * clampf(weight, 0.0, 1.0)))
 
 
 func _assign(player: FootballPlayer, duty: int) -> void:
@@ -255,8 +304,9 @@ func _update_phase(possession: PossessionManager, delta: float) -> void:
 
 
 ## A short burst of extra urgency right after a turnover in either
-## direction. Matches the old AIController.TRANSITION_WINDOW.
-const TRANSITION_WINDOW := 0.8
+## direction. Owned by PossessionManager along with the clock it is
+## measured against, so the readers cannot drift apart.
+const TRANSITION_WINDOW := PossessionManager.TRANSITION_WINDOW
 
 
 func _update_opponent_last_line(opponents: Array, delta: float) -> void:
@@ -315,7 +365,9 @@ func _fill(available: Array, duty: int, count: int, previous: Dictionary, ball: 
 		available.erase(best)
 
 
-func _assign_markers(available: Array, opponents: Array, previous: Dictionary, previous_marks: Dictionary) -> void:
+func _assign_markers(available: Array, opponents: Array, previous: Dictionary, previous_marks: Dictionary, max_markers: int = MAX_MARKERS) -> void:
+	if max_markers <= 0:
+		return
 	var threats: Array = []
 	for o in opponents:
 		if o == null or not is_instance_valid(o) or o.is_goalkeeper:
@@ -329,7 +381,7 @@ func _assign_markers(available: Array, opponents: Array, previous: Dictionary, p
 
 	var assigned := 0
 	for t in threats:
-		if assigned >= MAX_MARKERS or available.is_empty():
+		if assigned >= max_markers or available.is_empty():
 			return
 		var opponent: FootballPlayer = t["opponent"]
 		var best: FootballPlayer = null

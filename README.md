@@ -310,6 +310,66 @@ the goal, a passer continues its run past the ball. Because the weight
 decays rather than expiring, the player drifts back into normal shape
 instead of snapping out of it.
 
+### Stable possession phases (v0.8.5)
+
+The v0.8.4 playtest reported that the whole team still reorganised on
+individual ball touches: an opponent touches it and the side flips to
+attack, loses it and everyone reassembles, touches it again and the cycle
+repeats -- visible as players reversing direction together.
+
+Instrumenting the full chain (contact -> instantaneous possession ->
+sticky team possession -> `attack_intent` -> duty allocation -> movement
+target -> observed reversal) over three 60-second all-AI matches showed the
+description was not literally what was happening, and pointed at something
+more specific:
+
+* The tactical phase was **not** flipping many times a second. It changed
+  0.02-0.22 times per second, median dwell 0.42-3.97s.
+* But **the number of duty-set flips equalled the number of phase changes
+  exactly in every run** (1/1, 9/9, 13/13).
+* On the single frame of each flip, players who received a new duty saw
+  their movement target jump **8.10m, 9.47m and 10.27m** on average,
+  against a **0.01-0.13m** baseline on every other frame.
+* 30-45% of all movement reversals landed within a second of a phase change.
+
+So v0.8.3 had made the *depth* layer continuous (`attack_intent` slews, and
+measured settled at |intent| > 0.9 for 77-98% of frames) but left the
+**duty allocation** layer -- fed by the same phase signal -- as a hard
+binary switch between two disjoint slot sets. One frame reassigned all ten
+outfielders at once. That switch, not the phase rate, was the earthquake.
+
+Four changes:
+
+1. **Named possession phases.** `PossessionManager` classifies each instant
+   as `LOOSE`, `CONTESTED` or `SETTLED`, and confirms a change of team
+   possession on a two-tier rule: an uncontested hold claims the phase in
+   0.30s, a hold still being fought over needs 0.85s. Coming out of a
+   challenge *with* the ball is a turnover; still being in the challenge is
+   not. A loose ball now *decays* a pending claim instead of resetting it,
+   so a real turnover whose first touch bobbles still converges while a
+   ball that keeps breaking loose never does.
+2. **Continuous duty allocation.** Slot *counts* come from `attack_intent`
+   rather than a boolean, so the duty set migrates across the ~1.2s intent
+   ramp instead of switching on one frame, and the team genuinely holds a
+   transitional shape in between -- one runner still committed, one marker
+   already picked up.
+3. **A rate limit on the aim point** (`TARGET_MAX_SPEED`). The existing
+   exponential filter is a low-pass, not a limit: fed a 10m step it still
+   moved the point at ~35 m/s. The cap sits well above sprinting speed, so
+   it only engages on a discontinuity a player could not have followed.
+4. **Shape-holders track play while attacking.** `_cover_space_target`
+   blended only 0.12 toward play whenever `attack_intent` was positive, so
+   a player holding shape sat on a near-static formation anchor while their
+   own team had the ball -- an attacking-phase bug specifically, and why
+   midfielders measured 88-95% motionless with the ball over 20m away.
+
+Measured after: target jump on a phase-change frame **6.38m -> 0.26m**;
+share of the outfield reassigned per phase change **~57% -> under 1%**;
+reversals landing within half a second of a phase change **30% -> 10-16%**;
+the project's own direction-change guard **0.196 -> 0.105 per player per
+second** (threshold 0.15). Total movement roughly doubled, because the
+midfield is no longer parked.
+
 ## 11v11 Match & Team Shape (v0.7)
 
 The match is now a full 11v11 on a data-driven 4-3-3: `FormationManager`

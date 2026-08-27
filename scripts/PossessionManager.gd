@@ -39,26 +39,66 @@ var last_team_with_possession: int = -1
 ## TRANSITION_ATTACK/TRANSITION_DEFENSE), not just an ordinary loose ball.
 var time_since_last_team_change: float = 0.0
 
-## v0.8.2 hotfix: how long the *other* team must hold the ball continuously
-## before it counts as a genuine change of team possession.
+## v0.8.5: the explicit possession PHASE, distinct from "who touched it".
+##
+## BALL CONTACT IS NOT A POSSESSION CHANGE. Measured over three 60s
+## AI-vs-AI matches, 67-100% of all ball contacts lasted under 0.3s --
+## those are touches, deflections and challenges, not turnovers. Naming the
+## states makes that distinction something the code can actually reason
+## about instead of something each reader has to infer from two int fields.
+enum Phase {
+	LOOSE,      ## nobody has it -- a bouncing/rolling ball with no controller
+	CONTESTED,  ## somebody has it but an opponent is genuinely challenging
+	SETTLED,    ## somebody has it under uncontested control
+}
+
+## Current phase, and whose it is (-1 while LOOSE).
+var phase: int = Phase.LOOSE
+var phase_team: int = -1
+
+## True during the brief window after a confirmed turnover -- the team level
+## reads this as "transition" rather than as a steady attacking/defending
+## phase. Derived, not stored separately, so it can never disagree with
+## time_since_last_team_change.
+func is_in_transition() -> bool:
+	return last_team_with_possession != -1 and time_since_last_team_change < TRANSITION_WINDOW
+
+
+const TRANSITION_WINDOW := 0.8
+
+## v0.8.2 hotfix, retuned in v0.8.5: how long the *other* team must hold the
+## ball before it counts as a genuine change of team possession.
 ##
 ## Without this, a single physics frame of a player having the ball inside
 ## their control radius flipped the whole team's attacking/defending phase
-## -- including a ball merely rolling past someone's feet. Measured
-## directly during a real match: last_team_with_possession was flipping
-## every 11-17 frames (~0.2s) in scrappy passages, and because
-## AIController's TRANSITION_ATTACK target (forward, upfield) and
-## TRANSITION_DEFENSE target (back toward our own goal) sit on opposite
-## sides of the player, every flip swung all 10 outfielders' movement
-## targets 10-21m in the opposite direction. That is the actual mechanism
-## behind the reported "forward -> backward -> forward -> backward"
-## oscillation, and it was visibly synchronized across the whole team
-## because the signal driving it is team-level, not per-player.
+## -- including a ball merely rolling past someone's feet.
 ##
-## Deliberately shorter than a real pass flight time, so a genuine
-## interception still registers promptly -- it only filters out contact
-## too brief to be possession at all.
-const TEAM_POSSESSION_CONFIRM_TIME := 0.3
+## v0.8.5 splits it in two, because one threshold cannot express the
+## difference the playtest actually complained about. Coming out of a
+## challenge WITH the ball is a turnover; still being in the challenge is
+## not. So an uncontested hold confirms quickly (a clean interception should
+## register promptly), while a hold that is still being fought over has to
+## last long enough to prove somebody actually won it.
+const CONFIRM_TIME_SETTLED := 0.30
+const CONFIRM_TIME_CONTESTED := 0.85
+
+## An opponent this close to the ball while somebody carries it makes the
+## possession CONTESTED. Matches the range at which BallContest considers a
+## challenge to be under way at all, so "contested" means the same thing to
+## the phase model and to the tackle system.
+const CONTEST_RANGE := BallContest.CHALLENGE_RANGE
+
+## How fast a pending claim bleeds away while the ball is loose, as a
+## multiple of real time.
+##
+## The v0.8.4 code hard-RESET the pending timer on any frame with no
+## carrier, which made confirmation require 0.3s of strictly unbroken
+## control. A genuine turnover whose first touch bounces (i.e. most of them)
+## therefore kept restarting from zero, while a scrappy passage where one
+## side happened to hold on cleanly for 0.3s flipped the phase immediately.
+## Decaying instead means a bobbled-but-real turnover still converges, and a
+## ball that keeps breaking loose never does.
+const PENDING_DECAY_RATE := 1.5
 
 var _pending_team: int = -1
 var _pending_team_timer: float = 0.0
@@ -112,17 +152,56 @@ func _physics_process(delta: float) -> void:
 		is_loose = true
 
 	time_since_last_team_change += delta
-	_update_team_possession(best, delta)
+	_update_phase(current_carrier)
+	_update_team_possession(current_carrier, delta)
 
 
-## See TEAM_POSSESSION_CONFIRM_TIME. A loose ball never clears or resets
-## anything here -- last_team_with_possession is sticky by design (that's
-## the whole point of it existing alongside possessing_team), so only a
-## *different* team actually holding the ball long enough can change it.
+## Classifies the current instant into one of the three named phases. This
+## is a pure description of right now -- it deliberately has no memory,
+## because the memory belongs to last_team_with_possession below.
+func _update_phase(carrier: FootballPlayer) -> void:
+	if carrier == null:
+		phase = Phase.LOOSE
+		phase_team = -1
+		return
+	phase_team = carrier.team_id
+	phase = Phase.CONTESTED if _is_contested(carrier) else Phase.SETTLED
+
+
+## Is an opponent of `carrier` genuinely challenging for this ball? Uses the
+## opponent's distance to the BALL rather than to the carrier, for the same
+## reason BallContest does: the ball is what is being contested.
+func _is_contested(carrier: FootballPlayer) -> bool:
+	for p in _tracked_players:
+		if p == null or not is_instance_valid(p):
+			continue
+		if p == carrier or p.team_id == carrier.team_id or p.is_goalkeeper:
+			continue
+		if p.global_position.distance_to(_ball.global_position) <= CONTEST_RANGE:
+			return true
+	return false
+
+
+## The sticky team signal that the whole team-shape layer reads.
+##
+## last_team_with_possession is sticky by design (that is the point of it
+## existing alongside possessing_team): a LOOSE or CONTESTED moment never
+## hands the phase to the other side on its own. Only a team that has
+## actually established control long enough -- longer, if they are still
+## being fought for it -- takes it.
 func _update_team_possession(carrier: FootballPlayer, delta: float) -> void:
-	if carrier == null or carrier.team_id == last_team_with_possession:
+	if carrier != null and carrier.team_id == last_team_with_possession:
+		# We still have it. Any partial claim the other side had built up is
+		# spent.
 		_pending_team = -1
 		_pending_team_timer = 0.0
+		return
+
+	if carrier == null:
+		# Loose. Decay rather than reset -- see PENDING_DECAY_RATE.
+		_pending_team_timer = maxf(0.0, _pending_team_timer - PENDING_DECAY_RATE * delta)
+		if _pending_team_timer <= 0.0:
+			_pending_team = -1
 		return
 
 	if carrier.team_id == _pending_team:
@@ -131,9 +210,10 @@ func _update_team_possession(carrier: FootballPlayer, delta: float) -> void:
 		_pending_team = carrier.team_id
 		_pending_team_timer = 0.0
 
+	var required: float = CONFIRM_TIME_CONTESTED if phase == Phase.CONTESTED else CONFIRM_TIME_SETTLED
 	# The very first possession of a match is applied immediately -- there
 	# is no previous team whose shape we'd be protecting from whiplash.
-	if _pending_team_timer >= TEAM_POSSESSION_CONFIRM_TIME or last_team_with_possession == -1:
+	if _pending_team_timer >= required or last_team_with_possession == -1:
 		last_team_with_possession = carrier.team_id
 		time_since_last_team_change = 0.0
 		_pending_team = -1

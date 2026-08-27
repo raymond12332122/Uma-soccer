@@ -69,7 +69,11 @@ enum AIState {
 ## measured at only 1.8% of player-frames in ATTACKING_RUN. A transition
 ## should be a brief burst of urgency right after a turnover, not the
 ## default condition.
-const TRANSITION_WINDOW := 0.8
+##
+## v0.8.5: owned by PossessionManager, which owns the clock it is measured
+## against. Kept as an alias here because this is where callers look for it,
+## and because three copies of the same 0.8 had begun to drift apart.
+const TRANSITION_WINDOW := PossessionManager.TRANSITION_WINDOW
 
 ## Minimum time a *shape-level* AI state must be held before a different
 ## shape-level state can replace it (see _determine_state).
@@ -167,6 +171,24 @@ const FATIGUE_NOISE_SCALE := 1.5
 ## reversal, without the player ever pausing or waiting.
 const TARGET_SMOOTH_TIME := 0.18
 
+## Hard ceiling on how fast the steered-toward point may travel, in m/s.
+##
+## v0.8.5. The exponential filter above is a low-pass, not a limit: fed a
+## step it still moves ~63% of the way within one time constant, so the
+## ~10m one-frame target jump measured at a tactical phase change (see
+## TeamPlan's slot-count comment) still arrived as a ~35 m/s slew of the
+## aim point -- several times any player's top speed, and therefore an
+## instant about-face rather than a turn.
+##
+## Comfortably faster than a sprinting player, so this never makes anyone
+## sluggish or "laggy": a target moving within a player's own reach is
+## untouched, and the limit only engages on a discontinuity the player
+## could not have followed anyway. A 10m reassignment now takes ~0.7s to
+## traverse, over which the player curves onto the new job. This is a rate
+## limit on the AIM POINT only -- the decision itself is still made fresh
+## every frame, and nothing is frozen or delayed.
+const TARGET_MAX_SPEED := 14.0
+
 ## Depth each role holds, in metres along the attacking axis, at full
 ## defensive intent (x) and full attacking intent (y). Interpolated
 ## continuously by TeamPlan.attack_intent -- this is what makes the whole
@@ -186,6 +208,13 @@ const SUPPORT_WIDE_TOUCHLINE := 0.85  ## fraction of half-width to hold
 const RUN_BEHIND_DEPTH := 3.0         ## metres beyond the opponents' last line
 const RUN_BEHIND_MAX_AHEAD := 16.0    ## never further ahead of the ball than a ball can travel
 const MARK_GOALSIDE := 2.0
+## How far BEHIND play a supporting shape-holder sits while our team is
+## attacking. Keeps them level with the move without arriving inside the
+## carrier's own space -- support, not a crowd.
+const COVER_SUPPORT_STANDOFF := 6.0
+## Furthest a player holding shape will drift from their formation anchor.
+## This is the line between "adjusts to play" and "chases the ball".
+const COVER_MAX_DRIFT := 7.0
 
 ## Spacing repulsion is now a small correction on top of real duty
 ## geometry, not the main thing keeping players apart -- the duty slots do
@@ -324,7 +353,13 @@ static func update_player(
 		player._ai_target_initialized = true
 	else:
 		var blend: float = 1.0 - exp(-delta / maxf(TARGET_SMOOTH_TIME, 0.001))
-		player.ai_smoothed_target = player.ai_smoothed_target.lerp(target, clampf(blend, 0.0, 1.0))
+		var smoothed: Vector3 = player.ai_smoothed_target.lerp(target, clampf(blend, 0.0, 1.0))
+		# ...then cap how far that point is allowed to travel this frame.
+		var step: Vector3 = smoothed - player.ai_smoothed_target
+		var max_step: float = TARGET_MAX_SPEED * delta
+		if step.length() > max_step:
+			smoothed = player.ai_smoothed_target + step.normalized() * max_step
+		player.ai_smoothed_target = smoothed
 
 	# A player chasing the ball needs to be precise about it; a player
 	# holding shape does not, and demanding 0.9m precision from them just
@@ -511,11 +546,53 @@ static func _follow_up_target(player: FootballPlayer, ball: RigidBody3D, plan: T
 ## moves -- the old fallback resolved to a near-static formation point,
 ## which is exactly why defenders measured 40% of all frames completely
 ## stationary and midfielders "became inactive when the ball was far away".
+##
+## v0.8.5: that was only half-true. The blend toward play was
+## `0.12 + 0.28 * defend_weight`, and defend_weight is zero whenever the
+## team's attack_intent is positive -- so while OUR side had the ball, a
+## player holding shape sat at 88% of a static formation anchor and stopped
+## dead once they reached it. Measured over three 60s matches: midfielders
+## with the ball more than 20m away were motionless for 91%, 95% and 40% of
+## those frames. That is the reported "midfielders become inactive when the
+## ball is far away", and it was specifically an ATTACKING-phase bug.
+##
+## There is now a play-reference point in BOTH phases:
+##   defending -> drop between our own goal and the ball (unchanged)
+##   attacking -> push up level with play, but hold this player's own
+##                lateral channel
+## Keeping the player's own z is what stops this becoming "everybody runs
+## at the ball": they track play up and down the pitch while staying in
+## their lane, which is what creates a passing option instead of a crowd.
 static func _cover_space_target(shape: Vector3, ball_pos: Vector3, own_goal_pos: Vector3, plan: TeamPlan, category: String) -> Vector3:
 	var defend_weight: float = clampf(-plan.attack_intent, 0.0, 1.0) * ROLE_DEFENSE_MULT.get(category, 1.0)
-	var cover_point: Vector3 = own_goal_pos.lerp(ball_pos, 0.55)
-	cover_point.y = shape.y
-	return shape.lerp(cover_point, clampf(0.12 + 0.28 * defend_weight, 0.0, 0.6))
+	var attack_weight: float = clampf(plan.attack_intent, 0.0, 1.0) * ROLE_ATTACK_MULT.get(category, 1.0)
+
+	var play_point: Vector3
+	var weight: float
+	if plan.attack_intent >= 0.0:
+		# Support the attack: match the DEPTH of play, keep our own width,
+		# and stay out of the carrier's space. Deliberately reads the SLOW
+		# reference -- this is where a line sits, not a run to be made, and
+		# coupling it to the faster one passed every change of the ball's
+		# direction into ten players at once (see TeamPlan.slow_ball_pos).
+		var fwd: Vector3 = plan.forward_axis()
+		var wanted_x: float = plan.slow_ball_pos.x - fwd.x * COVER_SUPPORT_STANDOFF
+		play_point = Vector3(wanted_x, shape.y, shape.z)
+		weight = 0.12 + 0.22 * attack_weight
+	else:
+		play_point = own_goal_pos.lerp(ball_pos, 0.55)
+		play_point.y = shape.y
+		weight = 0.12 + 0.28 * defend_weight
+
+	var result: Vector3 = shape.lerp(play_point, clampf(weight, 0.0, 0.62))
+
+	# Adjusting to play, not chasing it: a shape-holder never strays further
+	# than this from their own formation anchor, so a ball travelling the
+	# length of the pitch shifts the line rather than dragging it out of it.
+	var drift: Vector3 = result - shape
+	if drift.length() > COVER_MAX_DRIFT:
+		result = shape + drift.normalized() * COVER_MAX_DRIFT
+	return result
 
 
 ## A single-player stand-in TeamPlan for isolated callers (see

@@ -660,6 +660,16 @@ func _test_live_match_movement_is_not_oscillating() -> void:
 func _test_live_match_ai_passes_and_shoots_distinguishably() -> void:
 	var main: Node3D = MainScene.instantiate()
 	add_child(main)
+	# v0.8.5: drive all 22. This test counts what the AI does, but it was
+	# leaving a human-controlled player on the pitch with nobody driving
+	# them -- no AI, and no input. That player still collects the ball, and
+	# then simply stands there holding it, because nothing in the game makes
+	# a human pass. Whole passages of the sampled minute were therefore a
+	# frozen match, which is why this measured 5-10 AI passes while a
+	# rendered 60s match of the same build measured 29-61, and why extending
+	# the window from 30s to 60s in v0.8.4 did not make the counts agree.
+	main.home_team.set_human_player(null)
+	main.player_controller.set_controlled_player(null)
 	await get_tree().physics_frame
 	for i in range(120):
 		await get_tree().physics_frame
