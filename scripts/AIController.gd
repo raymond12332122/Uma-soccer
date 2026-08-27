@@ -60,7 +60,41 @@ enum AIState {
 
 ## A short window after last_team_with_possession changes counts as a
 ## genuine transition -- not just an ordinary loose-ball moment.
-const TRANSITION_WINDOW := 1.5
+##
+## v0.8.2 hotfix: shortened from 1.5s. With team possession genuinely
+## changing hands every second or two in a 22-player match, a 1.5s window
+## meant players were in a TRANSITION_* state almost permanently and
+## essentially never reached the stable ATTACKING_RUN / SUPPORTING_ATTACK /
+## MARKING states they're supposed to spend most of the match in --
+## measured at only 1.8% of player-frames in ATTACKING_RUN. A transition
+## should be a brief burst of urgency right after a turnover, not the
+## default condition.
+const TRANSITION_WINDOW := 0.8
+
+## Minimum time a *shape-level* AI state must be held before a different
+## shape-level state can replace it (see _determine_state).
+##
+## The second half of the oscillation fix. Even with a stable team
+## possession signal, _determine_state is recomputed from scratch every
+## single frame off instantaneous inputs, and several of its states have
+## directly opposing movement targets (TRANSITION_ATTACK pushes upfield,
+## TRANSITION_DEFENSE pulls back toward our own goal, SEEKING_BALL leans
+## toward the ball). Any flicker in an input therefore became a full
+## reversal of the player's movement intent -- diagnostics attributed
+## 47 out of 47 observed direction reversals to a state change, and zero
+## to anything else.
+##
+## Holding a shape-level state briefly does NOT freeze the player: the
+## target within a held state is still recomputed every frame (the
+## formation reference is ball-reactive, spacing and support-distance keep
+## updating), so movement stays continuous and natural -- it just stays
+## committed to one intention long enough to actually get somewhere.
+const MIN_SHAPE_STATE_DWELL := 0.7
+
+## Within this distance of the ball, a pressing player is treated as
+## already in contact with it rather than still chasing it -- see the
+## PRESSING branch in update_player(). Roughly the action-area radius.
+const PRESS_CONTACT_RANGE := 1.6
 ## Sprint threshold multiplier during a transition -- react with urgency
 ## to a turnover in either direction rather than casually strolling back.
 const TRANSITION_SPRINT_MULT := 0.5
@@ -120,7 +154,7 @@ static func update_player(
 	delta: float = 1.0 / 60.0
 ) -> void:
 	var category: String = FormationManager.role_category(player.formation_role)
-	var state: int = _determine_state(player, possession, ball_challenger, category)
+	var state: int = _determine_state(player, possession, ball_challenger, category, delta)
 	var target: Vector3
 	# Pure attack-axis direction -- not "straight at the goal mouth", which
 	# makes every role's advance vector converge toward the same central
@@ -168,7 +202,22 @@ static func update_player(
 			target = _keep_support_distance(target, ball.global_position)
 
 		AIState.PRESSING:
-			target = ball.global_position
+			# Chase the ball only while it is genuinely away from us. Once
+			# we are already standing on it, "run at the ball" is a
+			# meaningless instruction -- and it points somewhere entirely
+			# different from HOLDING_POSSESSION's "carry it at goal", so a
+			# player in the act of winning the ball (whose has_possession
+			# naturally toggles as it crosses the control radius) had its
+			# movement intent flip through a ~40m swing on consecutive
+			# frames. At contact range the honest intent is identical
+			# either way -- take it forward -- so the two states agree and
+			# there is nothing left to oscillate between.
+			# Blended continuously rather than switched at a threshold: a
+			# hard if/else here just moves the oscillation onto the
+			# distance boundary (measured -- it produced a fresh crop of
+			# target-jump reversals as the ball crossed the range).
+			var press_closeness: float = clampf(1.0 - player.global_position.distance_to(ball.global_position) / PRESS_CONTACT_RANGE, 0.0, 1.0)
+			target = ball.global_position.lerp(opponent_goal_pos, press_closeness)
 
 		AIState.SEEKING_BALL:
 			# Loose ball, not the designated challenger (exactly one
@@ -204,6 +253,9 @@ static func update_player(
 
 	target += _fatigue_noise(player)
 
+	player.ai_state = state
+	player.ai_target = target
+
 	_move_toward(player, target, ARRIVE_RADIUS)
 	var sprint_threshold: float = _sprint_threshold(player)
 	if state == AIState.TRANSITION_ATTACK or state == AIState.TRANSITION_DEFENSE:
@@ -218,27 +270,88 @@ static func update_player(
 ## every other attacking player's shape) instantly, visibly collapsed back
 ## to defensive recovery on any brief loose touch mid-attack, then
 ## re-advanced a moment later, reading as "gave up the run".
-static func _determine_state(player: FootballPlayer, possession: PossessionManager, ball_challenger: FootballPlayer, category: String) -> int:
+## Resolves the ONE authoritative state for this player this frame:
+## _desired_state() picks by priority, then a dwell rule decides whether
+## we're allowed to act on that yet (see MIN_SHAPE_STATE_DWELL).
+##
+## delta defaults to 0 so this can be called as a pure query (tests, the
+## debug overlay) without advancing the dwell clock.
+static func _determine_state(player: FootballPlayer, possession: PossessionManager, ball_challenger: FootballPlayer, category: String, delta: float = 0.0) -> int:
+	var desired: int = _desired_state(player, possession, ball_challenger, category)
+	var current: int = player.ai_state
+
+	player.ai_state_time += delta
+
+	if current < 0 or desired == current:
+		return desired
+
+	# Priority 1, immediate ball interaction: having the ball, or being
+	# the one nominated to go win it, is never delayed in either
+	# direction. These are unambiguous "the ball is right here" facts
+	# rather than shape opinions, and they're already individually
+	# stabilized (possession by PossessionManager's hysteresis, pressing
+	# by TeamController's sticky challenger), so they can't flicker the
+	# way the shape states could.
+	if _is_ball_interaction(desired) or _is_ball_interaction(current):
+		player.ai_state_time = 0.0
+		return desired
+
+	# Priorities 2-5 (defensive responsibility / attacking support /
+	# formation shape / recovery) are all shape-level opinions about where
+	# to stand. Committing to one for a beat is what stops the whiplash.
+	if player.ai_state_time < MIN_SHAPE_STATE_DWELL:
+		return current
+
+	player.ai_state_time = 0.0
+	return desired
+
+
+static func _is_ball_interaction(state: int) -> bool:
+	return state == AIState.HOLDING_POSSESSION or state == AIState.PRESSING
+
+
+static func _desired_state(player: FootballPlayer, possession: PossessionManager, ball_challenger: FootballPlayer, category: String) -> int:
 	var team_has_ball: bool = possession.last_team_with_possession == player.team_id
 	var in_transition: bool = possession.time_since_last_team_change < TRANSITION_WINDOW
 
+	# 1. Immediate ball interaction.
+	if player.has_possession:
+		return AIState.HOLDING_POSSESSION
+	if player == ball_challenger:
+		return AIState.PRESSING
+
+	# Nobody has claimed the ball yet at all (kickoff, or straight after a
+	# reset) -- there is no attacking/defending phase to be in, so everyone
+	# shapes up around the ball itself.
+	if possession.last_team_with_possession == -1:
+		return AIState.SEEKING_BALL
+
 	if team_has_ball:
-		if player.has_possession:
-			return AIState.HOLDING_POSSESSION
+		# 3. Active attacking / support movement.
 		if in_transition:
 			return AIState.TRANSITION_ATTACK
 		if category == "FWD":
 			return AIState.ATTACKING_RUN
 		return AIState.SUPPORTING_ATTACK
 
-	if player == ball_challenger:
-		return AIState.PRESSING
-	if possession.is_loose:
-		return AIState.SEEKING_BALL
+	# 2. Active defensive responsibility.
+	#
+	# Deliberately does NOT branch on possession.is_loose. Once a team has
+	# claimed the ball, whether it is loose *this instant* is the wrong
+	# question for a player who isn't the one going to win it -- exactly
+	# one player presses (PRESSING, above), and everyone else holds shape.
+	# Branching on is_loose here previously produced two bad behaviors at
+	# once: it was the remaining source of movement oscillation after the
+	# possession-confirm fix (SEEKING_BALL leans toward the ball while
+	# MARKING pulls back toward our own goal, so a flickering is_loose
+	# reversed a defender's direction), and it was itself the "defenders
+	# are ball-obsessed / swarm the ball" behavior. Shape follows WHO has
+	# the ball, not where it momentarily bounced.
 	if in_transition:
 		return AIState.TRANSITION_DEFENSE
 	if category == "DEF" or category == "MID":
 		return AIState.MARKING
+	# 5. Idle / recovery positioning.
 	return AIState.RECOVERING_SHAPE
 
 

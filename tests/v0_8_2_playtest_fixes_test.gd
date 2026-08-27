@@ -190,13 +190,20 @@ func _test_transition_defense_after_turnover() -> void:
 		await get_tree().physics_frame
 	_check("Home has the ball first", pm.last_team_with_possession == 0)
 
-	# Turnover: the ball moves to the away player instead.
-	PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), away_p.global_position + Vector3(0.4, 0.3, 0)))
-	for i in range(10):
+	# Turnover: the ball moves to the away player instead, and stays there.
+	# Held past PossessionManager.TEAM_POSSESSION_CONFIRM_TIME -- as of the
+	# v0.8.2 oscillation hotfix a turnover must be sustained to count, so
+	# that a glancing touch can't swing the whole team's shape (the ball is
+	# re-pinned each frame here because a single teleport would drift out
+	# of the away player's control radius before the confirm time elapses).
+	for i in range(30):
+		PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), away_p.global_position + Vector3(0.4, 0.3, 0)))
+		PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
 		await get_tree().physics_frame
 	_check("Possession genuinely changed to away", pm.last_team_with_possession == 1)
 	_check("time_since_last_team_change resets on a real turnover", pm.time_since_last_team_change < AIController.TRANSITION_WINDOW)
 
+	home_p.ai_state = -1
 	var state: int = AIController._determine_state(home_p, pm, null, "MID")
 	_check("Home player enters TRANSITION_DEFENSE right after losing the ball", state == AIController.AIState.TRANSITION_DEFENSE)
 

@@ -39,6 +39,30 @@ var last_team_with_possession: int = -1
 ## TRANSITION_ATTACK/TRANSITION_DEFENSE), not just an ordinary loose ball.
 var time_since_last_team_change: float = 0.0
 
+## v0.8.2 hotfix: how long the *other* team must hold the ball continuously
+## before it counts as a genuine change of team possession.
+##
+## Without this, a single physics frame of a player having the ball inside
+## their control radius flipped the whole team's attacking/defending phase
+## -- including a ball merely rolling past someone's feet. Measured
+## directly during a real match: last_team_with_possession was flipping
+## every 11-17 frames (~0.2s) in scrappy passages, and because
+## AIController's TRANSITION_ATTACK target (forward, upfield) and
+## TRANSITION_DEFENSE target (back toward our own goal) sit on opposite
+## sides of the player, every flip swung all 10 outfielders' movement
+## targets 10-21m in the opposite direction. That is the actual mechanism
+## behind the reported "forward -> backward -> forward -> backward"
+## oscillation, and it was visibly synchronized across the whole team
+## because the signal driving it is team-level, not per-player.
+##
+## Deliberately shorter than a real pass flight time, so a genuine
+## interception still registers promptly -- it only filters out contact
+## too brief to be possession at all.
+const TEAM_POSSESSION_CONFIRM_TIME := 0.3
+
+var _pending_team: int = -1
+var _pending_team_timer: float = 0.0
+
 var _tracked_players: Array = []
 var _ball: RigidBody3D = null
 
@@ -76,6 +100,29 @@ func _physics_process(delta: float) -> void:
 	is_loose = best == null
 
 	time_since_last_team_change += delta
-	if best != null and best.team_id != last_team_with_possession:
-		last_team_with_possession = best.team_id
+	_update_team_possession(best, delta)
+
+
+## See TEAM_POSSESSION_CONFIRM_TIME. A loose ball never clears or resets
+## anything here -- last_team_with_possession is sticky by design (that's
+## the whole point of it existing alongside possessing_team), so only a
+## *different* team actually holding the ball long enough can change it.
+func _update_team_possession(carrier: FootballPlayer, delta: float) -> void:
+	if carrier == null or carrier.team_id == last_team_with_possession:
+		_pending_team = -1
+		_pending_team_timer = 0.0
+		return
+
+	if carrier.team_id == _pending_team:
+		_pending_team_timer += delta
+	else:
+		_pending_team = carrier.team_id
+		_pending_team_timer = 0.0
+
+	# The very first possession of a match is applied immediately -- there
+	# is no previous team whose shape we'd be protecting from whiplash.
+	if _pending_team_timer >= TEAM_POSSESSION_CONFIRM_TIME or last_team_with_possession == -1:
+		last_team_with_possession = carrier.team_id
 		time_since_last_team_change = 0.0
+		_pending_team = -1
+		_pending_team_timer = 0.0

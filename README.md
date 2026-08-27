@@ -498,6 +498,7 @@ godot --headless --path . tests/V0_7MatchTest.tscn
 godot --headless --path . tests/V0_8PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_1PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_2PlaytestFixesTest.tscn
+godot --headless --path . tests/V0_8_2OscillationTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
@@ -579,7 +580,16 @@ correctly does not, switch-target scoring preferring a relevant nearby
 player over a genuinely distant one, and the kickoff state machine itself
 (starts in KICKOFF, movement frozen, transitions to PLAYING on its own,
 timer only then starts, normal goal scoring still works afterward).
-422 assertions total across all nine suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
+`v0_8_2_oscillation_test.gd` is the newest suite, covering the movement-
+oscillation hotfix: a brief opponent touch not stealing team possession
+while a sustained one does, the shape-state dwell holding through a
+single-frame possession swing but releasing once it elapses (and ball
+interaction preempting it immediately), pressing and carrying pointing the
+same way at contact range, the possession grace absorbing control-radius
+chatter without masking a real dispossession, an AI attacker under a
+genuinely stable game state never reversing direction across 600 frames,
+and live-match AI state churn staying far below the pre-fix rate.
+441 assertions total across all ten suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
 
 ## Current Feature Set (v0.7, extended v0.8, v0.8.1, v0.8.2)
 

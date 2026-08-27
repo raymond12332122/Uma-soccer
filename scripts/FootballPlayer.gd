@@ -82,6 +82,10 @@ var control_loss_angle_threshold: float = 1.2
 @export var control_loss_speed_threshold: float = 2.5
 @export var control_loss_duration: float = 0.35
 @export var possession_release_cooldown: float = 0.35
+## How long has_possession survives the ball leaving the control radius
+## when it was NOT deliberately kicked away -- see _update_possession.
+## Short enough that a real dispossession still registers promptly.
+const POSSESSION_GRACE := 0.15
 
 # ---- Pass / Shoot ----
 # v0.8.2: raised versus v0.8.1 (was 1.4-2.6 pass / 3.0-4.6 shoot) -- passes
@@ -120,6 +124,20 @@ var ball_in_control_range: RigidBody3D = null
 var has_possession: bool = false
 var _facing_angle: float = 0.0
 
+## The single authoritative movement intent AIController resolved for this
+## player on its most recent update, recorded for diagnostics, the F3
+## debug overlay, and regression tests (a test cannot assert "the target
+## stayed stable" without being able to see the target). ai_state is an
+## AIController.AIState value, -1 before any AI update has run.
+## Human-controlled players keep whatever the AI last wrote -- they aren't
+## driven by AIController at all, so these simply go stale, which is fine
+## because nothing reads them for a human-controlled player.
+var ai_state: int = -1
+var ai_target: Vector3 = Vector3.ZERO
+## Seconds the current ai_state has been held -- drives the shape-state
+## dwell rule in AIController._determine_state (see MIN_SHAPE_STATE_DWELL).
+var ai_state_time: float = 0.0
+
 ## v0.8.2: set/cleared exclusively by MatchManager during its brief
 ## PRE_MATCH/KICKOFF hold. Deliberately a flag FootballPlayer itself
 ## checks (rather than MatchManager just zeroing move_input each frame)
@@ -140,6 +158,7 @@ var is_currently_sprinting: bool = false
 
 var _control_lost_timer: float = 0.0
 var _possession_cooldown_timer: float = 0.0
+var _possession_grace_timer: float = 0.0
 
 var _shoot_charging: bool = false
 var _shoot_charge_elapsed: float = 0.0
@@ -341,6 +360,12 @@ func reset_intent() -> void:
 	_shoot_charging = false
 	_shoot_charge_elapsed = 0.0
 
+	# A stale held AI state must not survive a switch/restart -- otherwise
+	# the dwell rule could keep a player committed to a shape decision
+	# made before the reset (see AIController.MIN_SHAPE_STATE_DWELL).
+	ai_state = -1
+	ai_state_time = 0.0
+
 	active_personality_event = ""
 	personality_event_time_left = 0.0
 	personality_visual_state_override = ""
@@ -406,6 +431,8 @@ func _physics_process(delta: float) -> void:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
 	if _possession_cooldown_timer > 0.0:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
+	if _possession_grace_timer > 0.0:
+		_possession_grace_timer = maxf(0.0, _possession_grace_timer - delta)
 
 
 ## Pure bookkeeping for personality triggers -- no gameplay decisions are
@@ -467,10 +494,41 @@ func _get_aim_direction() -> Vector3:
 # RigidBody3D at all times -- this only adds a force on top of normal
 # physics, so collisions, bounces, and knock-aways still behave naturally.
 func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
-	if ball_in_control_range == null or _possession_cooldown_timer > 0.0:
+	# A deliberate kick always ends possession instantly (the cooldown is
+	# set by _apply_kick_impulse) -- the grace below is only for a ball
+	# jittering at the edge of the control radius, never for one the
+	# player just played away on purpose.
+	if _possession_cooldown_timer > 0.0:
+		has_possession = false
+		_possession_grace_timer = 0.0
+		return
+
+	if ball_in_control_range == null:
+		# v0.8.2 hotfix: brief grace instead of dropping possession the
+		# instant the ball crosses the control radius. Without it,
+		# has_possession chattered frame-to-frame for a player in the act
+		# of winning the ball, and because that flag selects between two
+		# states with violently opposing targets -- HOLDING_POSSESSION
+		# aims at the opponent goal, PRESSING aims at the ball underfoot
+		# -- the contesting player's movement intent flipped through a
+		# ~40m swing on consecutive frames. Diagnostics caught this as a
+		# literal one-frame PRESSING->HOLDING_POSSESSION->PRESSING loop.
+		# Everything downstream of has_possession (PossessionManager's
+		# carrier election, the contested-ball steering gate, the AI
+		# state machine) gets a steadier signal as a result.
+		if has_possession and _possession_grace_timer > 0.0:
+			return
+		# Possession genuinely ends here (grace expired, and this wasn't a
+		# deliberate kick -- that path returned above on the cooldown), so
+		# this is the correct place to arm the "lost possession"
+		# personality trigger. Firing it the instant the ball crossed the
+		# radius instead would cry wolf on every touch the grace absorbs.
+		if has_possession:
+			just_lost_possession_window = _MOMENTARY_TRIGGER_WINDOW
 		has_possession = false
 		return
 
+	_possession_grace_timer = POSSESSION_GRACE
 	has_possession = true
 
 	if _control_lost_timer > 0.0:
@@ -746,12 +804,11 @@ func _on_control_area_entered(body: Node3D) -> void:
 		ball_in_control_range = body
 
 
+## Only drops the ball reference -- whether that actually ends possession
+## is _update_possession's call alone (it applies POSSESSION_GRACE first),
+## so there is exactly one place that clears has_possession. Clearing it
+## here too would defeat the grace, since the ball crossing the control
+## radius is precisely the event the grace exists to absorb.
 func _on_control_area_exited(body: Node3D) -> void:
 	if body == ball_in_control_range:
 		ball_in_control_range = null
-		# Distinguish a deliberate kick (possession_release_cooldown is
-		# already counting down from _apply_kick_impulse) from genuinely
-		# being dispossessed, for the "lost possession" personality trigger.
-		if has_possession and _possession_cooldown_timer <= 0.0:
-			just_lost_possession_window = _MOMENTARY_TRIGGER_WINDOW
-		has_possession = false
