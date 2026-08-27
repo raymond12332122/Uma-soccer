@@ -37,6 +37,11 @@ var opponent_goal_pos: Vector3
 ## was a hair's-breadth closer would flip frame to frame, so both would
 ## visibly dash in and out toward the ball instead of exactly one of them
 ## committing to press while the other held shape.
+## This team's tactical plan for the current frame -- the team level of the
+## decision hierarchy. Created in setup(), ticked once per physics frame
+## before any player is updated.
+var plan: TeamPlan = null
+
 var _current_challenger: FootballPlayer = null
 ## A challenger candidate must be closer than the current one by more than
 ## this margin to take over -- same spirit as PossessionManager's own
@@ -50,6 +55,8 @@ func setup(p_players: Array, p_ball: RigidBody3D, p_possession: PossessionManage
 	possession = p_possession
 	own_goal_pos = p_own_goal
 	opponent_goal_pos = p_opponent_goal
+	plan = TeamPlan.new()
+	plan.setup(team_id, own_goal_pos, opponent_goal_pos)
 
 
 func set_opponent_team(team: TeamController) -> void:
@@ -73,7 +80,15 @@ func _physics_process(delta: float) -> void:
 	# non-challenging player used to redo an equivalent O(opponents) scan
 	# independently at 11-a-side, which is real duplicated work.
 	# AIController.update_player just reads the shared result below.
-	var ball_challenger: FootballPlayer = _pick_ball_challenger()
+	# v0.8.3: THE team-level pass. One call, once per team per frame, that
+	# decides the phase and allocates every player's duty before any
+	# individual is updated -- see TeamPlan. Everything below is now the
+	# player level acting on a decision that was already made for the side
+	# as a whole, which is the structural difference between a team and 11
+	# agents that each happen to be looking at the same ball.
+	plan.update(players, opponent_team.players, ball, possession, delta)
+
+	var ball_challenger: FootballPlayer = plan._contester
 	var dangerous_opponent: Node3D = AIController.find_dangerous_opponent(opponent_team.players, own_goal_pos)
 
 	for player in players:
@@ -91,7 +106,7 @@ func _physics_process(delta: float) -> void:
 		else:
 			var category: String = FormationManager.role_category(player.formation_role)
 			var target: Vector3 = FormationManager.get_dynamic_position(player.formation_slot, team_id, ball.global_position, category)
-			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target, ball_challenger, dangerous_opponent, delta)
+			AIController.update_player(player, ball, possession, players, opponent_team.players, own_goal_pos, opponent_goal_pos, target, ball_challenger, dangerous_opponent, delta, plan)
 
 		if personality_events and mood:
 			personality_events.maybe_trigger(player, delta, ctx)

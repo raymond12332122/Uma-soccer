@@ -81,6 +81,9 @@ var dribble_accel: float = 13.0
 var control_loss_angle_threshold: float = 1.2
 @export var control_loss_speed_threshold: float = 2.5
 @export var control_loss_duration: float = 0.35
+## Fraction of normal dribble steering that survives a heavy touch. Not
+## zero -- see _update_possession.
+const CONTROL_LOSS_STEER_SCALE := 0.3
 @export var possession_release_cooldown: float = 0.35
 ## How long has_possession survives the ball leaving the control radius
 ## when it was NOT deliberately kicked away -- see _update_possession.
@@ -88,14 +91,36 @@ var control_loss_angle_threshold: float = 1.2
 const POSSESSION_GRACE := 0.15
 
 # ---- Pass / Shoot ----
-# v0.8.2: raised versus v0.8.1 (was 1.4-2.6 pass / 3.0-4.6 shoot) -- passes
-# were dying out well short of teammates at realistic pitch distances
-# against the ball's linear_damp. The two ranges still never overlap.
-var pass_power: float = 2.8
-var shoot_min_power: float = 4.2
-var shoot_max_power: float = 7.6
+# v0.8.3: these are LAUNCH SPEEDS in m/s, not impulse magnitudes. The old
+# fields were raw impulses, which made them impossible to reason about
+# (they only became a speed after dividing by the ball's mass) and left the
+# v0.8.2 comment below actively wrong: it claimed pass power had been
+# raised to 2.8, but apply_player_data() unconditionally overwrote that
+# with the v0.8.1 range of 1.4-2.6 for every player actually spawned with
+# player_data -- i.e. every player in a real match. At 0.45kg that is a
+# launch speed of 3.1-5.8 m/s, barely faster than a player jogging, and
+# (measured: roll distance ~= 1.66 * speed - 1.4) a total carry of 3.7-8.2m
+# while the pass search happily selected teammates up to 26m away. That
+# single unit-level bug is the bulk of "passes are often not useful".
+#
+# Working in speeds also makes the shot/pass distinction checkable rather
+# than a matter of opinion: the two bands below cannot overlap, and a test
+# asserts it (see SHOT_SPEED_MIN vs PassEvaluator.PASS_SPEED_MAX).
+const SHOT_SPEED_MIN := 12.5
+const SHOT_SPEED_MAX := 17.0
+var shoot_min_speed: float = SHOT_SPEED_MIN
+var shoot_max_speed: float = SHOT_SPEED_MAX
+## Multiplier applied to PassEvaluator's solved launch speed -- a better
+## passer strikes the ball a touch more cleanly. Deliberately small: the
+## distance solve does the real work, skill only trims it.
+var pass_speed_scale: float = 1.0
 @export var shoot_charge_time: float = 1.1
-@export var kick_lift: float = 0.35
+## Vertical launch speed added to a kick, m/s (v0.8.3: was an impulse;
+## 0.78 m/s reproduces the old 0.35 N.s on a 0.45kg ball exactly).
+@export var kick_lift: float = 0.78
+## Passes stay on the deck -- see _apply_kick_impulse. Just enough to stop
+## the ball scuffing into the pitch, not enough to make it bounce.
+const PASS_LIFT := 0.05
 @export var momentum_transfer: float = 0.25
 
 # ---- Pass assist tunables (see _get_pass_direction / _find_pass_target) ----
@@ -124,6 +149,34 @@ var ball_in_control_range: RigidBody3D = null
 var has_possession: bool = false
 var _facing_angle: float = 0.0
 
+## v0.8.3: every kick this player makes is recorded here, so "was that a
+## shot or a pass?" is an observable fact rather than something a human (or
+## a test) has to infer from how fast the ball happened to end up moving.
+## The playtest report specifically could not distinguish AI shots from AI
+## passes on screen; without a recorded intent there was no way to tell
+## whether that was a presentation problem or the AI genuinely never
+## shooting. Written by _apply_kick_impulse only; never read by gameplay.
+enum KickKind { NONE, PASS, SHOT }
+var last_kick_kind: int = KickKind.NONE
+var last_kick_power: float = 0.0
+var last_kick_dir: Vector3 = Vector3.ZERO
+## For a pass: the teammate it was actually aimed at (null if none was
+## found and it was a blind clearance). For a shot: always null.
+var last_kick_target: FootballPlayer = null
+## Monotonic per-player kick counter -- lets a test detect "a kick happened
+## this frame" without polling ball velocity.
+var kick_count: int = 0
+
+## v0.8.3: the ball-carrier decision, made observable. The playtest could
+## not tell shots from passes on screen; these make the reasoning itself
+## inspectable from a test or the F3 overlay rather than something that has
+## to be inferred from outcomes. Written by
+## AIController._decide_possession_action; never read by gameplay.
+var last_shoot_score: float = 0.0
+var last_shoot_threshold: float = 0.0
+var last_pass_score: float = 0.0
+var last_pass_threshold: float = 0.0
+
 ## The single authoritative movement intent AIController resolved for this
 ## player on its most recent update, recorded for diagnostics, the F3
 ## debug overlay, and regression tests (a test cannot assert "the target
@@ -137,6 +190,16 @@ var ai_target: Vector3 = Vector3.ZERO
 ## Seconds the current ai_state has been held -- drives the shape-state
 ## dwell rule in AIController._determine_state (see MIN_SHAPE_STATE_DWELL).
 var ai_state_time: float = 0.0
+## v0.8.3: the TeamPlan.Duty this player was allocated by the team layer on
+## the most recent frame (see TeamPlan). Written by TeamPlan only; read by
+## AIController to build the movement target, and by tests/the debug
+## overlay to assert things like "at most two players hold RUN_BEHIND".
+var ai_duty: int = TeamPlan.Duty.COVER_SPACE
+## Smoothed movement target. AIController writes the raw intent to
+## ai_target and this is the low-pass-filtered point actually steered
+## toward -- see AIController.TARGET_SMOOTH_TIME.
+var ai_smoothed_target: Vector3 = Vector3.ZERO
+var _ai_target_initialized: bool = false
 
 ## v0.8.2: set/cleared exclusively by MatchManager during its brief
 ## PRE_MATCH/KICKOFF hold. Deliberately a flag FootballPlayer itself
@@ -155,6 +218,11 @@ var movement_locked: bool = false
 ## actually sprinting (requesting it, moving, and had stamina left) this
 ## tick, for the HUD's sprint indicator to read on the controlled player.
 var is_currently_sprinting: bool = false
+
+## Seconds this player has continuously had the ball. Read by the AI
+## carrier layer so "I have been holding this too long" is a fact rather
+## than a dice roll, and by tests.
+var possession_time: float = 0.0
 
 var _control_lost_timer: float = 0.0
 var _possession_cooldown_timer: float = 0.0
@@ -216,13 +284,14 @@ func apply_player_data(data: PlayerData) -> void:
 	max_stamina = data.stamina
 	current_stamina = max_stamina
 
-	# v0.8.1: pass and shoot power ranges no longer overlap at all (old
-	# 1.6-3.2 pass vs. 2.4-4.2 shoot could put a high-passing player's tap
-	# ahead of a low-shooting player's release) -- a pass should always
-	# read as clearly weaker than any shot, never coincidentally similar.
-	pass_power = lerp(1.4, 2.6, data.passing / 100.0)
-	shoot_min_power = lerp(3.0, 4.6, data.shooting / 100.0)
-	shoot_max_power = lerp(5.0, 8.5, data.shooting / 100.0)
+	# v0.8.3: a shot is always decisively harder than any pass, by
+	# construction -- the whole shot band sits above PassEvaluator's whole
+	# pass band, so no combination of stats can make a good passer's ball
+	# read like a poor shooter's. Shooting stat moves a player within the
+	# shot band; it can never drag them out of it.
+	pass_speed_scale = lerp(0.9, 1.1, data.passing / 100.0)
+	shoot_min_speed = lerp(SHOT_SPEED_MIN, SHOT_SPEED_MIN + 1.5, data.shooting / 100.0)
+	shoot_max_speed = lerp(SHOT_SPEED_MAX - 2.0, SHOT_SPEED_MAX, data.shooting / 100.0)
 	dribble_accel = lerp(16.0, 30.0, data.dribbling / 100.0)
 	control_loss_angle_threshold = lerp(0.9, 1.5, data.dribbling / 100.0)
 
@@ -365,6 +434,9 @@ func reset_intent() -> void:
 	# made before the reset (see AIController.MIN_SHAPE_STATE_DWELL).
 	ai_state = -1
 	ai_state_time = 0.0
+	ai_duty = TeamPlan.Duty.COVER_SPACE
+	_ai_target_initialized = false
+	possession_time = 0.0
 
 	active_personality_event = ""
 	personality_event_time_left = 0.0
@@ -405,8 +477,21 @@ func _physics_process(delta: float) -> void:
 		if has_possession and _control_lost_timer <= 0.0 and angle_delta > angle_threshold and velocity.length() > control_loss_speed_threshold:
 			_control_lost_timer = control_loss_duration
 
-		_facing_angle = target_angle
-		model.rotation.y = lerp_angle(model.rotation.y, _facing_angle, turn_lerp_speed * delta)
+		# v0.8.3: the facing angle itself now turns at a finite rate instead
+		# of snapping to the input direction while only the MODEL turned
+		# smoothly. This is the root cause of "the human player's ball
+		# control feels wrong/stiff" while the AI's felt fine, and it is a
+		# genuine asymmetry rather than a perception problem: the dribble
+		# target point is computed from _facing_angle (see
+		# _update_possession), so a joystick flicked 180 degrees teleported
+		# that point straight through the player to the opposite side, and
+		# the spring yanked the ball across their feet. AI players never
+		# triggered it because their move_input is a direction-to-a-target
+		# that rotates gradually, so their facing never jumped. Now both are
+		# driven by the same finite turn rate, and the ball sweeps around
+		# the player instead of being snapped across them.
+		_facing_angle = lerp_angle(_facing_angle, target_angle, clampf(turn_lerp_speed * delta, 0.0, 1.0))
+		model.rotation.y = _facing_angle
 
 		velocity.x = move_toward(velocity.x, direction.x * target_speed, effective_acceleration * delta)
 		velocity.z = move_toward(velocity.z, direction.z * target_speed, effective_acceleration * delta)
@@ -426,6 +511,11 @@ func _physics_process(delta: float) -> void:
 	_process_shoot_input(delta)
 	_update_animation_state()
 	_update_personality_bookkeeping(delta)
+
+	if has_possession:
+		possession_time += delta
+	else:
+		possession_time = 0.0
 
 	if _control_lost_timer > 0.0:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
@@ -529,10 +619,21 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 		return
 
 	_possession_grace_timer = POSSESSION_GRACE
+	if not has_possession:
+		possession_time = 0.0
 	has_possession = true
 
+	# v0.8.3: a heavy touch used to cut the steering force to exactly zero
+	# for control_loss_duration, so the ball simply stopped being dribbled
+	# for a third of a second on every sharp turn -- combined with the
+	# snapping facing angle above, that is what made human close control
+	# feel like the ball kept escaping. It now keeps a weak pull instead:
+	# the ball still runs away from the player on a bad touch (it is a
+	# fully simulated RigidBody3D being nudged, never attached), but it
+	# stays recoverable, which is what a real heavy touch looks like.
+	var control_quality := 1.0
 	if _control_lost_timer > 0.0:
-		return
+		control_quality = CONTROL_LOSS_STEER_SCALE
 
 	# Contested-ball fix: has_possession above is purely local (sensor
 	# range + cooldown), so two opposing players standing in the same
@@ -556,8 +657,8 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	# Close control also degrades gradually with fatigue (weaker steering
 	# force back to the target dribble point) -- at full stamina this is
 	# identical to the pre-fatigue behavior.
-	var accel_coeff: float = dribble_accel * lerp(0.75, 1.0, stamina_ratio)
-	var damping_coeff := dribble_damping_accel
+	var accel_coeff: float = dribble_accel * lerp(0.75, 1.0, stamina_ratio) * control_quality
+	var damping_coeff: float = dribble_damping_accel * control_quality
 	if sprinting:
 		accel_coeff *= 0.6
 		damping_coeff *= 0.7
@@ -638,19 +739,42 @@ func notify_shoot_release(elapsed_seconds: float) -> void:
 ## then kick using the default narrow forward-only cone that excludes
 ## that exact same teammate and silently fall back to aiming at nothing
 ## in particular.
-func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO) -> void:
+func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO, plan: TeamPlan = null) -> void:
 	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
 	if ball == null:
 		return
-	_apply_kick_impulse(ball, pass_power, false, _get_pass_direction(min_alignment, forward_axis))
+	var aim: Vector3 = _get_aim_direction()
+	var option: PassEvaluator.Option = PassEvaluator.best_option(self, aim, forward_axis, plan, min_alignment)
+	if option == null:
+		# Nothing worth playing to -- clear it in the aimed direction rather
+		# than swallowing the input. Still a pass, not a shot: it keeps the
+		# pass speed band, so it can never be mistaken for a strike at goal.
+		last_kick_target = null
+		_apply_kick_impulse(ball, PassEvaluator.PASS_SPEED_MAX * pass_speed_scale, false, aim)
+		return
+
+	var to_point: Vector3 = option.aim_point - global_position
+	to_point.y = 0.0
+	var dir: Vector3 = to_point.normalized() if to_point.length() > 0.01 else aim
+	# The human PASS button is an aimed action, so their own direction keeps
+	# a say (PASS_ASSIST_BLEND). The AI search is omnidirectional and its
+	# "aim" is just whichever way it happens to be running -- blending that
+	# in only ever drags the ball off the teammate it deliberately chose,
+	# which is precisely the reported "passes do not feel properly
+	# directional".
+	if min_alignment > PASS_SEARCH_MIN_ALIGNMENT_OMNI:
+		dir = aim.slerp(dir, PASS_ASSIST_BLEND).normalized()
+	last_kick_target = option.target
+	_apply_kick_impulse(ball, option.speed * pass_speed_scale, false, dir)
 
 
 func execute_shot(charge_ratio: float) -> void:
 	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
 	if ball == null:
 		return
-	var power: float = lerp(shoot_min_power, shoot_max_power, clampf(charge_ratio, 0.0, 1.0))
-	_apply_kick_impulse(ball, power, true)
+	var speed: float = lerp(shoot_min_speed, shoot_max_speed, clampf(charge_ratio, 0.0, 1.0))
+	last_kick_target = null
+	_apply_kick_impulse(ball, speed, true)
 
 
 ## Default aim direction, nudged toward a nearby, roughly-ahead, unblocked
@@ -705,34 +829,8 @@ const _PASS_ROLE_BONUS := {"FWD": 0.15, "MID": 0.05, "DEF": 0.0, "GK": -0.3}
 ## (progression being one of them) rather than only ever describing where
 ## the passer happened to be aiming.
 func _find_pass_target(base_dir: Vector3, min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO) -> FootballPlayer:
-	var best: FootballPlayer = null
-	var best_score := -INF
-	var base_dir_n: Vector3 = base_dir.normalized()
-	var forward_axis_n: Vector3 = forward_axis.normalized() if forward_axis != Vector3.ZERO else Vector3.ZERO
-
-	for mate in teammates:
-		if mate == self or mate == null or not is_instance_valid(mate):
-			continue
-		var to_mate: Vector3 = mate.global_position - global_position
-		to_mate.y = 0.0
-		var dist: float = to_mate.length()
-		if dist < 0.5 or dist > PASS_ASSIST_MAX_DISTANCE:
-			continue
-		var to_mate_dir: Vector3 = to_mate / dist
-		var alignment: float = base_dir_n.dot(to_mate_dir)
-		if alignment < min_alignment:
-			continue
-		var score: float = alignment - dist * 0.01
-		if _lane_is_obstructed(to_mate, dist):
-			score -= 0.5
-		score -= (1.0 - _openness(mate)) * 0.4
-		score += _PASS_ROLE_BONUS.get(FormationManager.role_category(mate.formation_role), 0.0)
-		if forward_axis_n != Vector3.ZERO:
-			score += forward_axis_n.dot(to_mate_dir) * 0.3
-		if score > best_score:
-			best_score = score
-			best = mate
-	return best
+	var option: PassEvaluator.Option = PassEvaluator.best_option(self, base_dir, forward_axis, null, min_alignment)
+	return option.target if option != null else null
 
 
 ## 1.0 = no opponent within OPENNESS_FULL_RADIUS of this teammate (fully
@@ -770,12 +868,30 @@ func _lane_is_obstructed(to_mate: Vector3, dist: float) -> bool:
 	return false
 
 
-func _apply_kick_impulse(ball: RigidBody3D, power: float, is_shot: bool, aim_dir_override: Vector3 = Vector3.ZERO) -> void:
+## `speed` is the intended launch speed of the ball in m/s (see the Pass /
+## Shoot block above). Converting to an impulse here, at the one place that
+## actually has the ball, keeps every caller working in units a human can
+## reason about and makes the shot/pass bands directly comparable.
+func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir_override: Vector3 = Vector3.ZERO) -> void:
 	var aim_dir: Vector3 = aim_dir_override if aim_dir_override != Vector3.ZERO else _get_aim_direction()
-	var impulse: Vector3 = aim_dir * power + velocity * momentum_transfer
-	impulse.y = kick_lift * (1.0 if is_shot else 0.6)
+	aim_dir = aim_dir.normalized()
+	# Running onto the ball adds pace, but only ALONG the aim. Adding the
+	# whole velocity vector (as before v0.8.3) rotated every kick away from
+	# where it was aimed by up to the player's full speed -- for a pass that
+	# means missing the teammate the evaluator just carefully chose.
+	var launch_speed: float = speed + maxf(0.0, velocity.dot(aim_dir)) * momentum_transfer
+	var delta_v: Vector3 = aim_dir * launch_speed
+	# A pass is a GROUND pass -- it stays on the deck, which is both what a
+	# pass looks like and what keeps PassEvaluator's distance solve (fitted
+	# to a rolling ball) applicable to it.
+	delta_v.y = kick_lift if is_shot else PASS_LIFT
 
-	ball.apply_central_impulse(impulse)
+	ball.apply_central_impulse(delta_v * ball.mass)
+
+	last_kick_kind = KickKind.SHOT if is_shot else KickKind.PASS
+	last_kick_power = launch_speed
+	last_kick_dir = aim_dir
+	kick_count += 1
 
 	has_possession = false
 	_control_lost_timer = 0.0

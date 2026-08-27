@@ -269,17 +269,29 @@ func _test_role_based_shape(main: Node3D) -> void:
 	# under otherwise-identical conditions.
 	var winger := _make_player("silence_suzuka", Vector3(0, 1, -10), "LW")
 	var mid := _make_player("grass_wonder", Vector3(0, 1, -10), "CM")
+	# v0.8.3: this check needs a genuine attacking phase, which means a real
+	# team possession AND a real carrier. Setting only possessing_team (as
+	# this test did before) left last_team_with_possession at -1, so both
+	# players were actually being scored as "nobody has claimed the ball
+	# yet" -- the assertion passed, but never on the attacking-shape code it
+	# names. A carrier teammate is supplied so winger and mid are genuinely
+	# supporting an attack rather than both being nominated to go win a
+	# loose ball (which would, correctly, give them identical intent).
+	var carrier := _make_player("carrier_for_shape", Vector3(5, 1, -10), "CM")
 	possession.possessing_team = 0
+	possession.last_team_with_possession = 0
+	possession.current_carrier = carrier
 	possession.is_loose = false
 	var slot := Vector3(5, 1, -10)
-	AIController.update_player(winger, ball, possession, [winger], [], Vector3(-26, 1, 0), Vector3(26, 1, 0), slot)
-	AIController.update_player(mid, ball, possession, [mid], [], Vector3(-26, 1, 0), Vector3(26, 1, 0), slot)
+	AIController.update_player(winger, ball, possession, [winger, carrier], [], Vector3(-26, 1, 0), Vector3(26, 1, 0), slot)
+	AIController.update_player(mid, ball, possession, [mid, carrier], [], Vector3(-26, 1, 0), Vector3(26, 1, 0), slot)
 	_check("A winger's attacking-support movement differs from a central midfielder's under identical conditions (role genuinely affects shape)", winger.move_input != mid.move_input)
 
 	defender.queue_free()
 	teammate.queue_free()
 	winger.queue_free()
 	mid.queue_free()
+	carrier.queue_free()
 
 
 # ------------------------------------------------- E. goalkeeper no-teleport

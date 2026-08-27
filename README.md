@@ -35,6 +35,8 @@ Each system is a small, single-purpose script (no giant manager):
 | `FootballPlayer` | `scripts/FootballPlayer.gd` | Shared entity for every player (human, AI, GK). Simulates movement/dribbling/kicking from *intent* fields it never sets itself |
 | `PlayerController` | `scripts/PlayerController.gd` | Drives the one human-controlled `FootballPlayer` from touch/keyboard input |
 | `AIController` | `scripts/AIController.gd` | Stateless per-frame offense/defense/goalkeeper decision logic; role-category-aware team shape (v0.7) |
+| `TeamPlan` | `scripts/TeamPlan.gd` | **Team level (v0.8.3).** One per team, ticked once per frame before any player: decides the attacking/defending phase as a continuous scalar and *allocates* every player a single named duty (contest / press support / short support / wide / run in behind / mark / cover space) |
+| `PassEvaluator` | `scripts/PassEvaluator.gd` | **(v0.8.3)** Scores every reachable teammate on openness, lane, progression, distance, pressure relief and role; solves the launch speed a pass needs from the measured ball-roll model. Shared by the AI carrier and the human PASS button |
 | `TeamController` | `scripts/TeamController.gd` | Owns one team's roster; runs `AIController` on every member except the human target; computes each team's shared ball-challenger/dangerous-opponent once per frame (v0.7) |
 | `PossessionManager` | `scripts/PossessionManager.gd` | Single source of truth for who/which team currently has the ball, or if it's loose; hysteresis-stabilized for 22-player crowds (v0.7) |
 | `FormationManager` | `scripts/FormationManager.gd` | Data-driven formations (4-3-3), role-labeled slots, normalized/mirrored per team; `role_category()` maps a specific slot to a generic GK/DEF/MID/FWD bucket (v0.7) |
@@ -204,12 +206,10 @@ formation targets themselves alive:
   target was the actual cause of players "not moving" -- a defender whose
   slot happened to be far from wherever play currently was just sat at
   that exact spot indefinitely.
-- **Support spacing (v0.8).** Supporting attackers advance along the pure
-  attack axis (not "straight at the goal mouth", which made every role's
-  run converge toward the same central point) and are pushed outward if
-  they'd end up within `AIController.MIN_SUPPORT_DISTANCE_FROM_BALL` of the
-  carrier -- teammates spread into open passing lanes instead of stacking
-  on whoever (human or AI) currently has the ball.
+- **Support spacing (v0.8, replaced in v0.8.3).** Spacing used to be a
+  mutual repulsion between nearby teammates plus a minimum distance from
+  the ball. v0.8.3 replaced that with allocated duty geometry (below);
+  repulsion survives only as short-range collision avoidance.
 - **Offense** (own team has the ball): the carrier dribbles toward goal and
   auto-shoots once in range; teammates push into space ahead of their
   formation slot and keep spacing from each other (repel when too close, so
@@ -224,6 +224,45 @@ formation targets themselves alive:
   dribbling around the box. A keeper standing in the goal mouth also blocks
   shots simply through normal collision — no separate block-detection code
   needed.
+
+### Team level -> player level -> ball carrier (v0.8.3)
+
+Before v0.8.3 there was no team layer at all: every player independently
+re-derived "what phase are we in / should I go at the ball / where do I
+stand" from the same global inputs. That is why 22 players behaved like 22
+agents reacting to one ball -- nothing anywhere *allocated* a
+responsibility, so any job that looked attractive to one player looked
+equally attractive to every similar player at once.
+
+- **Team level (`TeamPlan`, once per team per frame).** `attack_intent` is
+  a continuous scalar from -1 (fully defending) to +1 (fully attacking)
+  that *slews* rather than switching (`INTENT_SLEW_RATE`), so a change of
+  possession moves every downstream target smoothly instead of teleporting
+  it. It then fills a fixed list of duty slots -- one CONTEST, at most one
+  PRESS_SUPPORT, at most `MAX_RUN_BEHIND` runners, `MAX_SUPPORT_WIDE` wide
+  players, up to `MAX_MARKERS` markers, everyone else COVER_SPACE. Those
+  ceilings *are* the "not every player should contest / make the same run"
+  rule, expressed structurally. Assignment carries a retention bonus so
+  near-equal candidates don't trade jobs on positional noise.
+- **Player level (`AIController._duty_target`).** One duty becomes one
+  position. Every branch derives from the same continuous inputs (the
+  smoothed play position, `attack_intent`, the player's own formation
+  anchor), so a duty handover moves a target a few metres rather than to
+  the opposite side of the pitch.
+- **Ball carrier (`AIController._decide_possession_action`).** A
+  deterministic hierarchy -- shoot if the chance is genuinely good, else
+  pass if `PassEvaluator`'s best option beats a threshold that falls under
+  pressure and the longer the ball is held and rises with clear grass
+  ahead, else carry. Carrying is the default, not the leftover.
+
+Two signals are deliberately kept separate and it matters: whether the ball
+is under our control *this instant* (reactive -- decides who chases a loose
+ball) versus whether we are the team attacking (a shape question, which
+uses `PossessionManager`'s sticky signal so a one-frame loose touch never
+dissolves the attack). Team shape also reacts to `TeamPlan.shape_ball_pos`,
+a smoothed "where is play" point, rather than to a contested rigid body's
+frame-to-frame jitter -- only the player actually going to win the ball
+uses its true position.
 
 ## 11v11 Match & Team Shape (v0.7)
 
@@ -499,6 +538,7 @@ godot --headless --path . tests/V0_8PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_1PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_2PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_2OscillationTest.tscn
+godot --headless --path . tests/V0_8_3AIBehaviorTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
@@ -589,7 +629,21 @@ same way at contact range, the possession grace absorbing control-radius
 chatter without masking a real dispossession, an AI attacker under a
 genuinely stable game state never reversing direction across 600 frames,
 and live-match AI state churn staying far below the pre-fix rate.
-441 assertions total across all ten suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
+`v0_8_3_ai_behavior_test.gd` covers the v0.8.3 team-AI pass: duty slot
+ceilings holding in a live match, no teammate ever contesting our own
+carrier, `attack_intent` ramping rather than snapping, arrival without
+overshoot or recoil, the pass and shot speed bands being non-overlapping
+for every stat combination, kick instrumentation recording intent, passes
+actually reaching their target at 5/9/13m, an AI pass being aimed at the
+teammate it chose, the human-controlled teammate being a normal pass
+option, a carrier releasing rather than holding forever, the facing angle
+turning at a finite rate, midfielders staying active with the ball parked
+in a far corner, forwards holding an advanced line, a carrier's teammates
+giving them space, defenders staying goal-side, live-match movement not
+looping, AI passing and shooting being distinguishable, an AI shooting
+from a real chance but never from the halfway line, and goalkeepers being
+unaffected.
+495 assertions total across all eleven suites, all passing (`character_pipeline_test.gd` also verifies the T-pose fix below: the diagnostic flag plus the actual posed arm-bone geometry, per model).
 
 ## Current Feature Set (v0.7, extended v0.8, v0.8.1, v0.8.2)
 

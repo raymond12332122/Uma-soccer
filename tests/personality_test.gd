@@ -159,13 +159,21 @@ func _test_ai_modifiers(gold_ship: FootballPlayer, rudolf: FootballPlayer, opera
 		"High aggression/risk-taking (Gold Ship) gets a bigger forward-run advance distance than disciplined Rudolf",
 		AIController._advance_distance(gold_ship) > AIController._advance_distance(rudolf)
 	)
-	# gold_ship and rudolf are spawned exactly 5 units apart (see
-	# _make_player calls below) -- using each as the other's "teammate"
-	# exercises the teamwork-driven spacing_radius formula directly:
-	# better teamwork (Rudolf) keeps a bigger spacing radius, so at a
-	# fixed 5-unit separation Rudolf's repulsion push is stronger.
+	# v0.8.3: spacing became short-range collision avoidance rather than a
+	# formation force (duty geometry does the spreading now), so its radius
+	# band moved from 4-8m down to 2.5-4m and the original fixed 5-unit
+	# separation is outside it for BOTH characters -- the check would pass
+	# or fail on two zero vectors. Moved to a separation inside the new
+	# band; the property under test (better teamwork -> bigger radius ->
+	# stronger push at the same distance) is unchanged.
+	var near_a: Vector3 = gold_ship.global_position
+	var near_b: Vector3 = rudolf.global_position
+	gold_ship.global_position = Vector3(0, 1, 0)
+	rudolf.global_position = Vector3(2.0, 1, 0)
 	var gold_repel: Vector3 = AIController._spacing_offset(gold_ship, [rudolf])
 	var rudolf_repel: Vector3 = AIController._spacing_offset(rudolf, [gold_ship])
+	gold_ship.global_position = near_a
+	rudolf.global_position = near_b
 	_check(
 		"Better teamwork (Rudolf) keeps a larger spacing radius, producing a stronger repel-from-teammate push at the same distance than Gold Ship",
 		rudolf_repel.length() > gold_repel.length()
