@@ -46,6 +46,13 @@ var opponents: Array = []
 ## never read for anything else here.
 var possession_manager: PossessionManager = null
 
+## This player's own side's tactical plan, wired once by MatchManager. Read
+## only by execute_pass(), so a HUMAN pass is evaluated with the same team
+## context an AI pass gets -- the forward axis in particular, without which
+## the largest term in PassEvaluator's scoring silently contributed nothing
+## to every pass the player made. Never mutated here.
+var team_plan: TeamPlan = null
+
 # ---- Intent, written externally each physics frame ----
 var move_input: Vector2 = Vector2.ZERO
 var sprint_requested: bool = false
@@ -73,6 +80,22 @@ var current_stamina: float = 100.0
 # accel/damping/clamp than v0.8.1's 24/9/30) so the ball trails and
 # settles naturally on a turn instead of snapping rigidly onto the target
 # point every frame, which is what read as "welded to the player".
+#
+# v0.8.6: the leash is longer and the spring softer. v0.8.2-v0.8.5 fixed
+# the ball ESCAPING (the heavy-touch cutout, the snapping facing angle);
+# what was left was the opposite complaint -- the ball being rigid, "hard
+# to interact with", not really a separate object from the player. That is
+# a straightforward consequence of holding it 0.62m ahead with a spring
+# stiff enough (accel 16-30, clamped at 18 m/s^2) to saturate at well under
+# a metre of error: within its own radius the ball simply cannot lag, lead,
+# or be knocked off line, so there is nothing to feel.
+#
+# Deliberately NOT done here, per the brief: the player capsule and the
+# ControlArea radius are untouched, and the ball remains a fully simulated
+# RigidBody3D that is only ever nudged -- never parented, never dragged.
+# A longer leash also makes the ball marginally EASIER to take (BallContest
+# scores a challenger on their distance to the BALL, not to the carrier),
+# which is the right direction and does not regress stealing.
 @export var dribble_distance: float = 0.62
 @export var dribble_distance_sprint: float = 1.05
 var dribble_accel: float = 13.0
@@ -84,6 +107,10 @@ var control_loss_angle_threshold: float = 1.2
 ## Fraction of normal dribble steering that survives a heavy touch. Not
 ## zero -- see _update_possession.
 const CONTROL_LOSS_STEER_SCALE := 0.3
+## Ceiling on how much speed a single frame's shove can add to the ball --
+## see _push_ball_on_contact(). A nudge that resolves over a few frames,
+## which is also what a foot does to a ball.
+const BALL_PUSH_MAX_DELTA_V := 2.5
 ## How long a player stays committed to the play they just made. Long
 ## enough to follow a shot in for the rebound or continue a run after
 ## laying the ball off; short enough that it is a follow-up, not a refusal
@@ -113,6 +140,12 @@ const POSSESSION_GRACE := 0.15
 # asserts it (see SHOT_SPEED_MIN vs PassEvaluator.PASS_SPEED_MAX).
 const SHOT_SPEED_MIN := 12.5
 const SHOT_SPEED_MAX := 17.0
+## Charge floor and the distance at which a shot is struck at full power --
+## see shot_charge_for_distance(). 14m is a shade over the widest personal
+## shooting range any personality produces, so a shot taken at the very edge
+## of a player's range is hit flat out.
+const SHOT_CHARGE_MIN := 0.4
+const SHOT_CHARGE_FULL_DISTANCE := 14.0
 var shoot_min_speed: float = SHOT_SPEED_MIN
 var shoot_max_speed: float = SHOT_SPEED_MAX
 ## Multiplier applied to PassEvaluator's solved launch speed -- a better
@@ -132,6 +165,15 @@ const PASS_LIFT := 0.05
 const PASS_ASSIST_MAX_DISTANCE := 26.0
 const PASS_ASSIST_MIN_ALIGNMENT := 0.25  ## cos(~75deg) -- candidate must be roughly ahead of the aim direction
 const PASS_ASSIST_BLEND := 0.7           ## 0 = pure raw aim, 1 = dead-on at the chosen teammate
+## v0.8.6: how much of an AIMED human pass goes dead at the teammate the
+## player picked out. Deliberately near 1: having made alignment decide WHO
+## receives the ball, sending it 30% of the way back toward the raw stick
+## angle just reintroduces the miss at the last step.
+const PASS_ASSIST_BLEND_AIMED := 0.92
+## Speed of a pass with no teammate to play to -- a knock into space, kept
+## far enough below SHOT_SPEED_MIN that it can never read as a strike at
+## goal. See the fallback branch in execute_pass().
+const PASS_NO_TARGET_SPEED := 7.0
 const PASS_OBSTRUCTION_RADIUS := 1.3     ## opponent within this perpendicular distance of the lane counts as blocking it
 ## AIController's pass search uses this instead of PASS_ASSIST_MIN_ALIGNMENT
 ## -- an AI carrier's "aim" is usually just "toward goal" (see
@@ -147,6 +189,14 @@ const PASS_SEARCH_MIN_ALIGNMENT_OMNI := -1.0
 @onready var animation_controller: AnimationController = $Model/AnimationController
 @onready var name_label: Label3D = $NameLabel
 @onready var control_indicator: MeshInstance3D = $ControlIndicator
+## v0.8.6: a small team-coloured ring on the grass under every player, so
+## which shirts are yours is readable at a glance without memorising eleven
+## character models. Deliberately the smallest thing that answers the
+## question: no UI panels, no overhead arrows on twenty-two players, nothing
+## that covers the pitch. The controlled player keeps their own larger
+## ControlIndicator ring on top of this, so "which one am I" and "which ones
+## are mine" stay two distinguishable answers.
+@onready var team_ring: MeshInstance3D = $TeamRing
 
 var ball_in_action_range: RigidBody3D = null
 var ball_in_control_range: RigidBody3D = null
@@ -309,6 +359,11 @@ func apply_player_data(data: PlayerData) -> void:
 	pass_speed_scale = lerp(0.9, 1.1, data.passing / 100.0)
 	shoot_min_speed = lerp(SHOT_SPEED_MIN, SHOT_SPEED_MIN + 1.5, data.shooting / 100.0)
 	shoot_max_speed = lerp(SHOT_SPEED_MAX - 2.0, SHOT_SPEED_MAX, data.shooting / 100.0)
+	# v0.8.6: softened from lerp(16, 30). See the dribble block above -- at
+	# that stiffness the spring reached its 18 m/s^2 clamp within ~0.6m of
+	# error, so the ball was effectively pinned rather than steered. The
+	# dribbling stat still spans the same relative range, so a good dribbler
+	# keeps the ball noticeably tighter than a poor one.
 	dribble_accel = lerp(16.0, 30.0, data.dribbling / 100.0)
 	control_loss_angle_threshold = lerp(0.9, 1.5, data.dribbling / 100.0)
 
@@ -341,9 +396,31 @@ func set_possession_manager(pm: PossessionManager) -> void:
 	possession_manager = pm
 
 
+## Wired once by MatchManager right after both TeamControllers are set up.
+## The TeamPlan instance is created once and mutated in place each frame, so
+## this reference stays current for the whole match.
+func set_team_plan(p_plan: TeamPlan) -> void:
+	team_plan = p_plan
+
+
 func set_team_color(color: Color) -> void:
 	if animation_controller:
 		animation_controller.set_team_color(color)
+	_tint_team_ring(color)
+
+
+## The ground ring is unlit and emissive so it reads the same in shadow as
+## in sunlight, and stays legible on a phone screen at match camera distance.
+func _tint_team_ring(color: Color) -> void:
+	if team_ring == null:
+		return
+	var mat: StandardMaterial3D = team_ring.get_surface_override_material(0)
+	if mat == null:
+		return
+	mat = mat.duplicate()
+	mat.albedo_color = Color(color.r, color.g, color.b, 0.8)
+	mat.emission = color
+	team_ring.set_surface_override_material(0, mat)
 
 
 ## Name labels stay hidden for every AI player by default (22 of them
@@ -555,7 +632,30 @@ func _physics_process(delta: float) -> void:
 	else:
 		velocity.y -= gravity * delta
 
+	# Captured BEFORE move_and_slide, which overwrites `velocity` with what
+	# the body actually achieved -- and what it achieves when it runs into
+	# the ball is close to zero, which is the very thing being fixed below.
+	# The shove has to be driven by the speed the player was TRYING to move
+	# at, not the speed the ball just denied them.
+	var intended_velocity: Vector3 = velocity
+	var pre_move_y: float = global_position.y
+	var was_grounded: bool = is_on_floor()
+
 	move_and_slide()
+
+	_push_ball_on_contact(intended_velocity)
+	# Nothing in this game jumps, and the pitch is flat, so a player who was
+	# on the ground before moving must still be on it afterwards. Without
+	# this a player running onto the ball RIDES UP IT -- a capsule sliding
+	# over a 0.35m sphere is redirected upward by the contact normal, and
+	# measured with the shove above enabled a sprinting carrier climbed to
+	# y=1.1 and was then flung off by the depenetration at 26 m/s against a
+	# sprint speed of 8.5. Constraining the plane is exact here rather than
+	# approximate, and it leaves the horizontal collision response -- which
+	# is what actually keeps the ball in front of a dribbler -- untouched.
+	if was_grounded and global_position.y > pre_move_y:
+		global_position.y = pre_move_y
+		velocity.y = 0.0
 
 	_update_possession(sprinting, stamina_ratio)
 	_process_pass_input()
@@ -584,6 +684,50 @@ func _physics_process(delta: float) -> void:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
 	if _possession_grace_timer > 0.0:
 		_possession_grace_timer = maxf(0.0, _possession_grace_timer - delta)
+
+
+## v0.8.6: let a player actually SHOVE the ball they run into.
+##
+## This is a root cause of "human ball control is stiff / the ball feels
+## rigid and hard to interact with", and it is not a tuning problem. A
+## CharacterBody3D does not push RigidBody3Ds -- Godot simply stops it dead
+## against them, and the player's collision_mask includes the ball's layer.
+## So a carrier was being physically braked by a 0.45kg football: measured in
+## an isolated 1v0, a player told to sprint in a straight line with the ball
+## at their feet reached 0.9 m/s against a base speed of 5.0 and a sprint
+## speed of 8.5. Dribbling was not "carrying the ball", it was grinding along
+## behind an obstacle -- which is exactly what "rigid" describes, and it is
+## why the ball could never be seen to run ahead, lag, or be knocked off line.
+##
+## The shove is the impulse that brings the ball up to the player's own speed
+## along the contact normal, capped per frame. That makes it self-limiting (a
+## ball already travelling with the player receives nothing), keeps the ball a
+## fully simulated body rather than something dragged, and changes no
+## collision shape: opponents still knock it, contests are still physical.
+func _push_ball_on_contact(intended_velocity: Vector3) -> void:
+	for i in range(get_slide_collision_count()):
+		var collision: KinematicCollision3D = get_slide_collision(i)
+		var collider: Object = collision.get_collider()
+		if not (collider is RigidBody3D) or not collider.is_in_group("ball"):
+			continue
+		var push_dir: Vector3 = -collision.get_normal()
+		push_dir.y = 0.0
+		if push_dir.length() < 0.01:
+			continue
+		push_dir = push_dir.normalized()
+		var player_along: float = Vector3(intended_velocity.x, 0.0, intended_velocity.z).dot(push_dir)
+		if player_along <= 0.0:
+			continue
+		# Only a player actively driving into the ball shoves it. A player
+		# coasting to a stop still carries real velocity for a few tenths of
+		# a second, and letting that boot the ball away meant a stationary
+		# player could nudge it several metres after releasing the stick.
+		if move_input.length() <= 0.1:
+			continue
+		var ball_along: float = collider.linear_velocity.dot(push_dir)
+		if ball_along >= player_along:
+			continue
+		collider.apply_central_impulse(push_dir * minf(player_along - ball_along, BALL_PUSH_MAX_DELTA_V) * collider.mass)
 
 
 ## Pure bookkeeping for personality triggers -- no gameplay decisions are
@@ -720,9 +864,21 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	# identical to the pre-fatigue behavior.
 	var accel_coeff: float = dribble_accel * lerp(0.75, 1.0, stamina_ratio) * control_quality
 	var damping_coeff: float = dribble_damping_accel * control_quality
-	if sprinting:
-		accel_coeff *= 0.6
-		damping_coeff *= 0.7
+	# v0.8.6: the old `if sprinting: accel_coeff *= 0.6` produced the exact
+	# opposite of the looser control it was meant to model. The ball has real
+	# drag (linear_damp plus rolling friction, ~3 m/s^2 at a sprint), so the
+	# spring must do continuous work just to keep it travelling with the
+	# player at all; weakening the spring at precisely the moment that work
+	# is highest meant the ball fell BEHIND its target point, was overrun by
+	# the player, and ended up NEARER them at a sprint than at a standstill
+	# -- measured 0.74m sprinting against 0.89m stationary. The parameter
+	# named dribble_distance_sprint was, in practice, a tighter leash.
+	#
+	# Looser control at pace is now carried by the one thing that actually
+	# expresses it: the ball is targeted further out in front. That is more
+	# visible, and it is what genuinely makes a sprinting carrier easier to
+	# dispossess (BallContest scores a challenger on their distance to the
+	# BALL).
 
 	# Close at a standstill/walk, knocked further ahead while sprinting --
 	# "sprinting should loosen control" per the brief -- driven off actual
@@ -740,7 +896,32 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	var ball_vel: Vector3 = ball_in_control_range.linear_velocity
 	var horizontal_vel := Vector3(ball_vel.x, 0.0, ball_vel.z)
 
-	var accel_total: Vector3 = to_target * accel_coeff - horizontal_vel * damping_coeff
+	# v0.8.6: the damper now opposes the ball's velocity RELATIVE TO THE
+	# PLAYER rather than its absolute velocity. This is the fix for close
+	# control feeling rigid, and it is a correctness fix rather than a
+	# tuning one.
+	#
+	# Damping the absolute velocity means that whenever the player moves at
+	# all, the damper fights the very motion the spring is trying to produce.
+	# At a sprint the two are not close: carrying the ball at 8.5 m/s
+	# demanded roughly 30 m/s^2 of damper force against a total force budget
+	# (dribble_force_accel_clamp) of 18, so the net force on the ball was
+	# BACKWARDS for the whole run. The ball could never be pushed out in
+	# front -- it was run over and shoved along by the player's capsule,
+	# which is exactly why it read as an object welded to the player, and why
+	# dribble_distance_sprint had no observable effect whatsoever (measured:
+	# the ball sat at 0.83m at a sprint against a 1.45m target -- that 0.83
+	# is simply the two collision shapes touching).
+	#
+	# Relative damping still kills the oscillation the damper exists for (a
+	# ball hunting around its target point), but a ball already travelling
+	# with the player is left alone -- so it can sit genuinely further ahead
+	# at speed, trail on a turn, and be run onto. The ball remains a fully
+	# simulated body that is only ever nudged; nothing here attaches it.
+	var player_horizontal_vel := Vector3(velocity.x, 0.0, velocity.z)
+	var relative_vel: Vector3 = horizontal_vel - player_horizontal_vel
+
+	var accel_total: Vector3 = to_target * accel_coeff - relative_vel * damping_coeff
 	accel_total = accel_total.limit_length(dribble_force_accel_clamp)
 
 	ball_in_control_range.apply_central_force(accel_total * ball_in_control_range.mass)
@@ -805,37 +986,81 @@ func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis
 	if ball == null:
 		return
 	var aim: Vector3 = _get_aim_direction()
-	var option: PassEvaluator.Option = PassEvaluator.best_option(self, aim, forward_axis, plan, min_alignment)
+	# A pass with a hard alignment cone is by definition one somebody aimed
+	# -- that cone only ever comes from the human PASS button (the AI search
+	# passes PASS_SEARCH_MIN_ALIGNMENT_OMNI). See W_ALIGNMENT_AIMED.
+	var aimed: bool = min_alignment > PASS_SEARCH_MIN_ALIGNMENT_OMNI
+	# v0.8.6: the human path now supplies a forward axis and the team plan
+	# too. Without them W_PROGRESSION -- the single largest term in the
+	# evaluation at 0.34 -- scored a flat zero on every human pass, because
+	# _process_pass_input() called this with no arguments at all.
+	var axis: Vector3 = forward_axis
+	var effective_plan: TeamPlan = plan
+	if effective_plan == null:
+		effective_plan = team_plan
+	if axis == Vector3.ZERO and effective_plan != null:
+		axis = effective_plan.forward_axis()
+	var option: PassEvaluator.Option = PassEvaluator.best_option(self, aim, axis, effective_plan, min_alignment, aimed)
 	if option == null:
-		# Nothing worth playing to -- clear it in the aimed direction rather
-		# than swallowing the input. Still a pass, not a shot: it keeps the
-		# pass speed band, so it can never be mistaken for a strike at goal.
+		# Nothing worth playing to -- knock it into the aimed direction
+		# rather than swallowing the input.
+		#
+		# v0.8.6: at a SHORT speed. This used to fire at PASS_SPEED_MAX
+		# (11.0) scaled by pass_speed_scale (up to 1.1), i.e. 12.1 m/s
+		# against a SHOT_SPEED_MIN of 12.5 -- a blind full-power punt
+		# essentially indistinguishable from a shot, which is exactly the
+		# reported "PASS often behaves like a weak shot or launches the
+		# ball". A pass with no target is a knock into space, and should
+		# look like one.
 		last_kick_target = null
-		_apply_kick_impulse(ball, PassEvaluator.PASS_SPEED_MAX * pass_speed_scale, false, aim)
+		_apply_kick_impulse(ball, PASS_NO_TARGET_SPEED * pass_speed_scale, false, aim)
 		return
 
 	var to_point: Vector3 = option.aim_point - global_position
 	to_point.y = 0.0
 	var dir: Vector3 = to_point.normalized() if to_point.length() > 0.01 else aim
-	# The human PASS button is an aimed action, so their own direction keeps
-	# a say (PASS_ASSIST_BLEND). The AI search is omnidirectional and its
-	# "aim" is just whichever way it happens to be running -- blending that
-	# in only ever drags the ball off the teammate it deliberately chose,
-	# which is precisely the reported "passes do not feel properly
-	# directional".
-	if min_alignment > PASS_SEARCH_MIN_ALIGNMENT_OMNI:
-		dir = aim.slerp(dir, PASS_ASSIST_BLEND).normalized()
+	# The AI search is omnidirectional and its "aim" is just whichever way it
+	# happens to be running -- blending that in only ever drags the ball off
+	# the teammate it deliberately chose. An aimed human pass keeps a trace
+	# of the raw stick direction so a deliberate near-miss still reads as
+	# the player's own, but only a trace: at the old 0.7 the ball landed
+	# nearly a third of the way back toward wherever the stick pointed
+	# rather than at the teammate the player was pointing AT.
+	if aimed:
+		dir = aim.slerp(dir, PASS_ASSIST_BLEND_AIMED).normalized()
 	last_kick_target = option.target
 	_apply_kick_impulse(ball, option.speed * pass_speed_scale, false, dir)
 
 
-func execute_shot(charge_ratio: float) -> void:
+## `aim_dir_override` is how an AI shot says WHERE it is shooting. Without
+## it the kick falls back to _get_aim_direction(), which is move_input --
+## and move_input is Vector2.ZERO for any carrier already inside their
+## arrive radius, so the shot went wherever _facing_angle last happened to
+## point. The human's charge-release path deliberately keeps the default:
+## for them, "where I am facing/aiming" is the intent.
+func execute_shot(charge_ratio: float, aim_dir_override: Vector3 = Vector3.ZERO) -> void:
 	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
 	if ball == null:
 		return
 	var speed: float = lerp(shoot_min_speed, shoot_max_speed, clampf(charge_ratio, 0.0, 1.0))
 	last_kick_target = null
-	_apply_kick_impulse(ball, speed, true)
+	_apply_kick_impulse(ball, speed, true, aim_dir_override)
+
+
+## How hard to strike a shot that has to travel `distance` metres.
+##
+## v0.8.6. The AI previously derived its shot power from "range quality",
+## which is highest when the shooter is CLOSEST to goal -- so it hit the
+## ball hardest from point-blank range and softest from the edge of its own
+## shooting range, the opposite of how shooting works and the direct cause
+## of "their shots are still too weak" (the shots being complained about are
+## the long ones). Power now rises with distance, floored well above nothing
+## so even a tap-in is struck rather than rolled.
+##
+## Returns a 0..1 charge ratio, so it stays inside the shot speed band and a
+## shot can never be confused with a pass no matter what is passed in.
+func shot_charge_for_distance(distance: float) -> float:
+	return clampf(SHOT_CHARGE_MIN + distance / SHOT_CHARGE_FULL_DISTANCE, SHOT_CHARGE_MIN, 1.0)
 
 
 ## Default aim direction, nudged toward a nearby, roughly-ahead, unblocked

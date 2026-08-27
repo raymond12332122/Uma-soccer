@@ -61,6 +61,38 @@ const W_RELIEF := 0.12
 const W_ALIGNMENT := 0.08
 const W_ROLE := 0.10
 
+## v0.8.6: a completely separate weighting for a HUMAN-AIMED pass, and the
+## reason the PASS button did not do what the player told it to.
+##
+## The weights above are right for an AI carrier, whose "aim" is just
+## whichever way they happen to be running -- there, alignment deserves to
+## be a tiebreak worth 0.08. They are badly wrong for a human who has
+## deliberately pointed the stick at a teammate and pressed PASS: alignment
+## was 8% of a decision that openness (0.26), progression (0.34), distance
+## (0.14) and role (0.10) between them owned outright, so the ball went to
+## whichever teammate the evaluator liked best among everyone inside a
+## 75-degree cone. Aiming barely participated.
+##
+## Aimed passes therefore score alignment on the RAW dot product rather than
+## a remapped 0..1 (so a teammate off to the side loses most of the term
+## rather than half of it) and weight it above everything else combined. The
+## other factors still break ties between two teammates in roughly the same
+## direction -- which is the useful part of assistance -- but they can no
+## longer overrule where the player pointed.
+const W_ALIGNMENT_AIMED := 0.60
+const W_OPENNESS_AIMED := 0.16
+const W_PROGRESSION_AIMED := 0.12
+const W_DISTANCE_AIMED := 0.10
+const W_ROLE_AIMED := 0.04
+
+## An aimed pass reaches further and closer than the AI's own search does.
+## A teammate 3m away that the player is pointing directly at is a pass they
+## meant to make; refusing it (MIN_PASS_DISTANCE is 3.5) just swallowed the
+## button press. The far end stays inside what the ball can actually carry
+## at PASS_SPEED_MAX.
+const AIMED_MIN_PASS_DISTANCE := 2.0
+const AIMED_MAX_PASS_DISTANCE := 18.0
+
 ## A teammate on a run in behind is the pass every coach wants played.
 const DUTY_RUN_BEHIND_BONUS := 0.14
 const ROLE_BONUS := {"FWD": 1.0, "MID": 0.6, "DEF": 0.25, "GK": -1.0}
@@ -68,6 +100,10 @@ const ROLE_BONUS := {"FWD": 1.0, "MID": 0.6, "DEF": 0.25, "GK": -1.0}
 ## A blocked lane is not disqualifying (a firm pass can still beat a
 ## covering opponent) but it must lose to any clear alternative.
 const BLOCKED_LANE_PENALTY := 0.45
+## Softer for an aimed pass: the player can see the covering defender and
+## chose to play it anyway. Still enough that a clear teammate in the same
+## direction is preferred, never enough to send the ball somewhere else.
+const BLOCKED_LANE_PENALTY_AIMED := 0.18
 
 ## Ball roll model, fitted to measured data (see the class doc):
 ##   roll_distance ~= ROLL_PER_SPEED * launch_speed - ROLL_OFFSET
@@ -104,46 +140,67 @@ class Option extends RefCounted:
 ## PASS button (whose aim is a real expressed intent). The AI passes -1.0,
 ## meaning "consider every direction" -- alignment then still contributes to
 ## the score, it just stops excluding teammates outright.
+## `aimed` marks a pass the HUMAN deliberately aimed with the stick, which
+## is scored on an entirely different weighting -- see W_ALIGNMENT_AIMED.
 static func best_option(
 	passer: FootballPlayer,
 	aim_dir: Vector3,
 	forward_axis: Vector3,
 	plan: TeamPlan = null,
-	min_alignment: float = -1.0
+	min_alignment: float = -1.0,
+	aimed: bool = false
 ) -> Option:
 	var best: Option = null
 	var aim_n: Vector3 = aim_dir.normalized() if aim_dir.length() > 0.01 else Vector3.ZERO
 	var fwd_n: Vector3 = forward_axis.normalized() if forward_axis.length() > 0.01 else Vector3.ZERO
 	var passer_pressure: float = _pressure_on(passer.global_position, passer.opponents)
+	var min_dist: float = AIMED_MIN_PASS_DISTANCE if aimed else MIN_PASS_DISTANCE
+	var max_dist: float = AIMED_MAX_PASS_DISTANCE if aimed else MAX_PASS_DISTANCE
 
 	for mate in passer.teammates:
 		if mate == passer or mate == null or not is_instance_valid(mate):
 			continue
+		# Never pass to a teammate who cannot legally be in the play.
+		if FormationManager.is_behind_goal_line(mate.global_position):
+			continue
 		var to_mate: Vector3 = mate.global_position - passer.global_position
 		to_mate.y = 0.0
 		var dist: float = to_mate.length()
-		if dist < MIN_PASS_DISTANCE or dist > MAX_PASS_DISTANCE:
+		if dist < min_dist or dist > max_dist:
 			continue
 		var dir: Vector3 = to_mate / dist
 		if aim_n != Vector3.ZERO and min_alignment > -1.0 and aim_n.dot(dir) < min_alignment:
 			continue
 
 		var score := 0.0
-		score += W_OPENNESS * _openness(mate.global_position, passer.opponents)
-		if fwd_n != Vector3.ZERO:
-			score += W_PROGRESSION * clampf((fwd_n.dot(dir) + 1.0) * 0.5, 0.0, 1.0)
-		score += W_DISTANCE * _distance_quality(dist)
-		# Is the receiver in less trouble than we are? That is the whole
-		# point of releasing the ball under pressure.
-		var relief: float = clampf(_pressure_on(mate.global_position, passer.opponents) - passer_pressure, -1.0, 1.0)
-		score += W_RELIEF * (0.5 - relief * 0.5)
-		if aim_n != Vector3.ZERO:
-			score += W_ALIGNMENT * clampf((aim_n.dot(dir) + 1.0) * 0.5, 0.0, 1.0)
-		score += W_ROLE * ROLE_BONUS.get(FormationManager.role_category(mate.formation_role), 0.0)
-		if plan != null and plan.duty_of(mate) == TeamPlan.Duty.RUN_BEHIND:
-			score += DUTY_RUN_BEHIND_BONUS
-		if _lane_blocked(passer.global_position, dir, dist, passer.opponents):
-			score -= BLOCKED_LANE_PENALTY
+		if aimed:
+			# Where the player pointed decides this, and the rest only
+			# separates teammates who are in roughly that direction.
+			var alignment: float = clampf(aim_n.dot(dir), 0.0, 1.0) if aim_n != Vector3.ZERO else 0.0
+			score += W_ALIGNMENT_AIMED * alignment
+			score += W_OPENNESS_AIMED * _openness(mate.global_position, passer.opponents)
+			if fwd_n != Vector3.ZERO:
+				score += W_PROGRESSION_AIMED * clampf((fwd_n.dot(dir) + 1.0) * 0.5, 0.0, 1.0)
+			score += W_DISTANCE_AIMED * _distance_quality(dist)
+			score += W_ROLE_AIMED * ROLE_BONUS.get(FormationManager.role_category(mate.formation_role), 0.0)
+			if _lane_blocked(passer.global_position, dir, dist, passer.opponents):
+				score -= BLOCKED_LANE_PENALTY_AIMED
+		else:
+			score += W_OPENNESS * _openness(mate.global_position, passer.opponents)
+			if fwd_n != Vector3.ZERO:
+				score += W_PROGRESSION * clampf((fwd_n.dot(dir) + 1.0) * 0.5, 0.0, 1.0)
+			score += W_DISTANCE * _distance_quality(dist)
+			# Is the receiver in less trouble than we are? That is the whole
+			# point of releasing the ball under pressure.
+			var relief: float = clampf(_pressure_on(mate.global_position, passer.opponents) - passer_pressure, -1.0, 1.0)
+			score += W_RELIEF * (0.5 - relief * 0.5)
+			if aim_n != Vector3.ZERO:
+				score += W_ALIGNMENT * clampf((aim_n.dot(dir) + 1.0) * 0.5, 0.0, 1.0)
+			score += W_ROLE * ROLE_BONUS.get(FormationManager.role_category(mate.formation_role), 0.0)
+			if plan != null and plan.duty_of(mate) == TeamPlan.Duty.RUN_BEHIND:
+				score += DUTY_RUN_BEHIND_BONUS
+			if _lane_blocked(passer.global_position, dir, dist, passer.opponents):
+				score -= BLOCKED_LANE_PENALTY
 
 		if best == null or score > best.score:
 			var opt := Option.new()

@@ -171,6 +171,15 @@ func _setup_controllers() -> void:
 	home_team.set_opponent_team(away_team)
 	away_team.set_opponent_team(home_team)
 
+	# The human is skipped by TeamController's own per-player loop, so this
+	# is the only place they ever get a reference to their side's plan --
+	# and execute_pass() needs one to evaluate a pass the way an AI pass is
+	# evaluated (see FootballPlayer.team_plan).
+	for p in home_players:
+		p.set_team_plan(home_team.plan)
+	for p in away_players:
+		p.set_team_plan(away_team.plan)
+
 	player_controller = PlayerController.new()
 	add_child(player_controller)
 

@@ -370,6 +370,92 @@ the project's own direction-change guard **0.196 -> 0.105 per player per
 second** (threshold 0.15). Total movement roughly doubled, because the
 midfield is no longer parked.
 
+### Off-ball intelligence, aimed passing, play continuation (v0.8.6)
+
+v0.8.5 made the team's SHAPE stable. The v0.8.6 playtest report was about
+what the players were then doing inside that stable shape, which was mostly
+nothing: forwards and midfielders stood still off the ball, and anyone who
+passed or shot turned for home. Five measured root causes, all structural
+rather than tuning:
+
+1. **Post-action was a blend fighting an allocation, not a state.** The
+   instant a player kicked, `TeamPlan` re-allocated them: they are 0m from
+   the ball, which scores badly for `SUPPORT_SHORT` (it wants ~9m) and is
+   explicitly penalised for `RUN_BEHIND`, so they fell through to
+   `COVER_SPACE` -- the leftover -- whose target was 70-88% of a *static*
+   formation anchor. `post_action_involvement()` then spent 2.5s partially
+   cancelling a "go home" instruction the same system had just issued.
+   There is now a real allocated `Duty.FOLLOW_UP`, decided before the
+   attacking slots, so the instruction is never issued in the first place.
+
+2. **Four to six outfielders per side had no job at all.** The attacking
+   slot ceilings totalled six (`SUPPORT_SHORT` 2 + `RUN_BEHIND` 2 +
+   `SUPPORT_WIDE` 2) against ten outfielders. The ceilings are correct --
+   not every forward should make the same run -- but there was no second
+   tier of off-ball work beneath them, so "not selected for a run" and
+   "nothing to do" were the same thing. New `Duty.PUSH_UP` (advance into
+   your own channel ahead of the ball and hold a lane, lanes fanned apart
+   so several advancing players are several options rather than a crowd).
+
+3. **Shape-holders could not move sideways.** `_cover_space_target`'s
+   attacking branch held `shape.z` fixed, so play switching flanks -- the
+   most common thing in a football match -- moved their target by exactly
+   zero. It now tracks play in both axes, at a much higher weight
+   (0.20-0.70 rather than 0.12-0.31), bounded by `COVER_MAX_DRIFT`.
+
+4. **The human PASS button barely consulted the player's aim.**
+   `_process_pass_input()` called `execute_pass()` with no `forward_axis`
+   and no plan, so `W_PROGRESSION` -- the largest weight at 0.34 -- scored
+   a flat **zero** on every human pass; `W_ALIGNMENT` was 0.08, so where
+   you pointed was ~8% of a decision owned by openness, distance and role.
+   And with nothing inside the 3.5-14m band it fired
+   `PASS_SPEED_MAX * pass_speed_scale` = up to **12.1 m/s** against a
+   `SHOT_SPEED_MIN` of **12.5** -- the reported "PASS behaves like a weak
+   shot" was a full-power blind punt. Aimed passes now score on a separate
+   weighting where alignment dominates (0.60, on the raw dot product), get
+   the team context the AI gets, use a 2-18m band, and fall back to a 7 m/s
+   knock into space.
+
+5. **AI shots were unaimed and their power was inverted.**
+   `execute_shot()` took no direction, so the kick fell back to
+   `_get_aim_direction()` -- which is `move_input`, and that is
+   `Vector2.ZERO` for any carrier inside its arrive radius, leaving the
+   shot to go wherever `_facing_angle` last pointed. Power was
+   `0.45 + range_quality*0.55`, and `range_quality` is highest when
+   *closest*, so the AI struck hardest from 2m and softest from 13m. Shots
+   are now aimed at a chosen point inside the real goal mouth, away from
+   the keeper, with power solved from the distance.
+
+Two further defects fell out of the same investigation:
+
+**There was no model of the pitch.** `FIELD_HALF_LENGTH` (26) is a
+formation-layout box; `Field.tscn` puts the goal mouth at **x = ±29** and
+the perimeter wall at **±35**, so every attacking decision aimed at a point
+3m *in front of* the goal, and the 6m strip behind each goal was
+unmodelled. Worse, the shot angle test used
+`absf(goal_dir.dot(forward_axis))` -- so a shot pointing directly *away*
+from the attacking direction, which is exactly what a shot from behind the
+net looks like, scored a perfect 1.0. That is the reported "opponent moved
+behind the goal and tried to score from there". `FormationManager` now
+carries the real geometry (`GOAL_LINE_X`, `GOAL_HALF_WIDTH`,
+`clamp_to_playable`, `is_behind_goal_line`), the angle term is signed, and
+a player behind the goal line does not shoot.
+
+**A carrier was being physically braked by the ball.** A `CharacterBody3D`
+cannot push a `RigidBody3D` -- Godot stops it dead -- and the player's
+`collision_mask` includes the ball's layer. Measured in an isolated 1v0, a
+player told to sprint in a straight line with the ball at their feet
+reached **0.9 m/s** against a sprint speed of 8.5. Dribbling was not
+carrying the ball, it was grinding along behind an obstacle. Separately the
+dribble damper opposed the ball's *absolute* velocity, so it fought the
+motion the spring was producing (carrying the ball at a sprint demanded
+~30 m/s² of damper against a total budget of 18) -- which is why
+`dribble_distance_sprint` had no observable effect at all, and why the ball
+sat *nearer* the player at a sprint (0.74m) than standing still (0.89m).
+Players now shove the ball they run into, the damper is relative to the
+player, and no player can climb the ball. Neither collision shape changed
+size.
+
 ## 11v11 Match & Team Shape (v0.7)
 
 The match is now a full 11v11 on a data-driven 4-3-3: `FormationManager`

@@ -128,7 +128,11 @@ const SPACING_RADIUS := 6.0
 const ARRIVE_RADIUS := 0.9
 ## Deadband for players holding a shape position rather than chasing the
 ## ball -- see the call site in update_player.
-const SHAPE_ARRIVE_RADIUS := 1.6
+##
+## v0.8.6: trimmed from 1.6. With ARRIVE_RELEASE_MULT that was a 2.88m zone
+## a shape-holder could stop dead inside and stay in, which was fine when
+## their target barely moved and is not now that it genuinely tracks play.
+const SHAPE_ARRIVE_RADIUS := 1.2
 ## Deadband for a player actively challenging for the ball -- effectively
 ## none, so they press onto it rather than parking beside it.
 const CONTEST_ARRIVE_RADIUS := 0.15
@@ -212,9 +216,42 @@ const MARK_GOALSIDE := 2.0
 ## attacking. Keeps them level with the move without arriving inside the
 ## carrier's own space -- support, not a crowd.
 const COVER_SUPPORT_STANDOFF := 6.0
+## How much of a shape-holder's position is decided by where play is rather
+## than by their formation slot. v0.8.5 used 0.12 + 0.22*attack_weight,
+## which for a midfielder capped out at 0.31 -- i.e. a player who was
+## supposedly "tracking play" was still standing 69% on a fixed spawn point,
+## which is what the 75%-idle measurement was actually measuring.
+const COVER_BASE_WEIGHT := 0.20
+const COVER_MAX_WEIGHT := 0.70
+## How far a shape-holder slides across with play laterally, as a fraction
+## of the way to the ball's own channel. Well short of 1.0 on purpose: a
+## line shifts across together, it does not collapse onto the ball.
+const COVER_LATERAL_TRACKING := 0.45
+
 ## Furthest a player holding shape will drift from their formation anchor.
 ## This is the line between "adjusts to play" and "chases the ball".
-const COVER_MAX_DRIFT := 7.0
+##
+## v0.8.6: raised from 7.0. On a 58m-long pitch, seven metres is barely more
+## than a player's own stride pattern, so a shape-holder was effectively
+## pinned to their spawn slot no matter where the game went. Twelve still
+## keeps a defensive line recognisably a line (the whole back four shifts
+## together, none of them ends up in midfield) while letting it actually
+## travel with play.
+const COVER_MAX_DRIFT := 12.0
+
+## PUSH_UP geometry -- see _push_up_target.
+## How far ahead of the ball an advancing player looks to get, before the
+## commitment term below pushes them further.
+const PUSH_UP_AHEAD_OF_BALL := 6.0
+## Fraction of the way to the opponents' last line a fully-committed
+## attacking phase takes them. Not 1.0: that is RUN_BEHIND's job, and this
+## player is offering a lane, not running offside.
+const PUSH_UP_LINE_COMMIT := 0.65
+## How far an advancing player's own lateral channel is stretched away from
+## the ball's. Above 1.0 so the attacking line spreads as it pushes up --
+## see the width block in _push_up_target for why this is a multiplier and
+## not a minimum separation.
+const PUSH_UP_LANE_SPREAD := 2.0
 
 ## Spacing repulsion is now a small correction on top of real duty
 ## geometry, not the main thing keeping players apart -- the duty slots do
@@ -245,10 +282,6 @@ const PASS_THRESHOLD_HOLD_RELIEF := 0.18
 const HOLD_TOO_LONG_SECONDS := 2.5
 const MIN_SETTLE_BEFORE_ACTION := 0.15
 
-## How strongly a just-shot/just-passed player is pulled toward staying in
-## the play, at full involvement. Not 1.0 -- they keep some of their normal
-## shape, so this reads as "follow it in" rather than "abandon your post".
-const MAX_FOLLOW_UP_WEIGHT := 0.8
 ## A player who has just shot holds a rebound position this far off the
 ## goal, on the ball's side of it.
 const REBOUND_STANDOFF := 7.0
@@ -315,34 +348,34 @@ static func update_player(
 		# The ball-carrier layer. Carry at goal by default; the decision
 		# hierarchy below may instead release the ball this frame (which
 		# clears has_possession immediately, so there is no stale target to
-		# act on afterwards).
-		target = opponent_goal_pos
+		# act on afterwards). v0.8.6: at the REAL goal, not the formation
+		# point three metres in front of it -- the final clamp below then
+		# stops them a metre short of the line rather than running through it.
+		target = FormationManager.attacking_goal_mouth(forward_axis)
+		target.y = player.global_position.y
 		_decide_possession_action(player, ball, opponent_goal_pos, opponents, forward_axis, effective_plan, delta)
 	else:
 		target = _duty_target(player, ball, effective_plan, formation_target, own_goal_pos, opponent_goal_pos, category)
 		target += _spacing_offset(player, teammates)
 
-	# v0.8.4: stay in the play you just made. Measured over a live match,
-	# a player who had just SHOT closed 0.86m back toward their own
-	# formation slot in the following second (a passer, by contrast,
-	# already moved 0.92m further away -- so this was specific to shooting,
-	# and it is exactly the reported "shoots, then immediately returns to
-	# formation" behaviour). The cause is that a shot hands the ball to the
-	# keeper, which flips team possession, which slews attack_intent
-	# negative and drops the whole forward line -- including the player
-	# who is standing in the six-yard box where a rebound will land.
-	#
-	# Blended by a decaying weight rather than switched on and off, so the
-	# player drifts back into normal shape instead of snapping out of the
-	# follow-up.
-	var involvement: float = player.post_action_involvement()
-	if involvement > 0.0 and not player.has_possession:
-		var follow_up: Vector3 = _follow_up_target(player, ball, effective_plan, opponent_goal_pos)
-		target = target.lerp(follow_up, involvement * MAX_FOLLOW_UP_WEIGHT)
+	# v0.8.6: "stay in the play you just made" is no longer blended in here.
+	# It is an allocated duty (TeamPlan.Duty.FOLLOW_UP) resolved inside
+	# _duty_target like every other job -- see the allocation comment in
+	# TeamPlan._fill_follow_up for why a blend on top of the ordinary
+	# allocation could never fix this properly: the allocation underneath
+	# had already decided the player was a leftover and pointed them at
+	# their formation anchor, and a 0.8-weighted blend against a "go home"
+	# instruction still reads on screen as going home.
 
 	target += _fatigue_noise(player)
-	target.x = clampf(target.x, -FormationManager.FIELD_HALF_LENGTH - 2.0, FormationManager.FIELD_HALF_LENGTH + 2.0)
-	target.z = clampf(target.z, -FormationManager.FIELD_HALF_WIDTH - 1.0, FormationManager.FIELD_HALF_WIDTH + 1.0)
+	# The single enforcement point for the playing area. Before v0.8.6 this
+	# clamped to the FORMATION box (±28 x, ±18 z), which has nothing to do
+	# with the built pitch: the real goal line is at ±29 and the perimeter
+	# wall at ±35, so "clamped" still allowed an aim point level with the
+	# goal, and a sprinting player decelerating from it ended up behind the
+	# goal -- where, thanks to the absf() in the shot angle test (see
+	# _decide_possession_action), they would happily shoot backwards at it.
+	target = FormationManager.clamp_to_playable(target)
 
 	player.ai_state = state
 	player.ai_target = target
@@ -500,6 +533,20 @@ static func _duty_target(
 			x = minf(x, limit) if fwd.x > 0.0 else maxf(x, limit)
 			return Vector3(x, shape.y, shape.z)
 
+		TeamPlan.Duty.FOLLOW_UP:
+			# The move this player started is still live, so their job IS the
+			# move -- see the allocation comment in TeamPlan. Eased toward
+			# normal shape by how much of the follow-up window is left, so
+			# rejoining the shape is a drift rather than a snap; by the time
+			# involvement reaches zero this duty is no longer allocated at
+			# all and they take an ordinary job seamlessly.
+			var follow_up: Vector3 = _follow_up_target(player, ball, plan, opponent_goal_pos)
+			follow_up.y = shape.y
+			return shape.lerp(follow_up, clampf(player.post_action_involvement(), 0.0, 1.0))
+
+		TeamPlan.Duty.PUSH_UP:
+			return _push_up_target(player, shape, ball_pos, plan, opponent_goal_pos)
+
 		TeamPlan.Duty.MARK:
 			var opponent: FootballPlayer = plan.mark_target_of(player)
 			if opponent == null or not is_instance_valid(opponent):
@@ -541,6 +588,63 @@ static func _follow_up_target(player: FootballPlayer, ball: RigidBody3D, plan: T
 	return spot
 
 
+## Off-ball advancement: get up the pitch and hold a lane the ball can be
+## played into. This is what an outfield player without a specific job does
+## while their side has the ball, and before v0.8.6 nothing in the game
+## expressed it -- see TeamPlan.MAX_PUSH_UP.
+##
+## Depth is taken between the ball and the opponents' last line, so pushing
+## up means genuinely getting ahead of play rather than following it around.
+## WIDTH is taken from this player's own formation channel and deliberately
+## nudged AWAY from the ball's channel: that is the difference between three
+## midfielders creating three separate passing options and three
+## midfielders converging on the same piece of grass. Nobody is running at
+## the ball here -- they are running into the space it can be played into.
+static func _push_up_target(player: FootballPlayer, shape: Vector3, ball_pos: Vector3, plan: TeamPlan, opponent_goal_pos: Vector3) -> Vector3:
+	var fwd: Vector3 = plan.forward_axis()
+	# Between the ball and their last line, biased by how attacking the
+	# moment is -- at neutral intent this sits level with the ball, at full
+	# attacking intent it sits most of the way up to the last line.
+	var ahead_of_ball: float = ball_pos.x + fwd.x * PUSH_UP_AHEAD_OF_BALL
+	var last_line: float = plan.opponent_last_line_x
+	# Personality decides how far up an individual commits, exactly as it
+	# already does for a supporting run (_advance_distance spans 2..10m) --
+	# an adventurous midfielder pushes right up to the last line, a
+	# disciplined one holds nearer the ball.
+	var commit: float = clampf(plan.attack_intent, 0.0, 1.0) * clampf(_advance_distance(player) / 9.0, 0.3, 1.0)
+	var wanted_x: float = lerp(ahead_of_ball, last_line, commit * PUSH_UP_LINE_COMMIT)
+	# Never beyond the goal line, and never so far ahead of the ball that a
+	# pass could not reach -- the same rule RUN_BEHIND already obeys.
+	var cap: float = ball_pos.x + fwd.x * RUN_BEHIND_MAX_AHEAD
+	wanted_x = minf(wanted_x, cap) if fwd.x > 0.0 else maxf(wanted_x, cap)
+	var limit: float = opponent_goal_pos.x - fwd.x * 2.0
+	wanted_x = minf(wanted_x, limit) if fwd.x > 0.0 else maxf(wanted_x, limit)
+
+	# Hold our own channel, pushed a little further from the ball's so the
+	# lane is genuinely open rather than occupied by the carrier.
+	# WIDTH: stretch this player's own formation channel away from the ball's,
+	# proportionally. This is what turns several advancing players into
+	# several separate passing options instead of a crowd.
+	#
+	# Deliberately a MULTIPLIER on their existing offset rather than a
+	# minimum separation pushed outward. A "push anyone closer than X to
+	# exactly X" rule collapses lanes instead of spreading them: measured in
+	# a live match, a centre-back sitting near the ball's channel was pushed
+	# out to precisely the lane a right-back was already occupying, and the
+	# two ran at the same piece of grass (McQueen z=10.26, Oguri z=10.26).
+	# Scaling is strictly monotonic in the offset, so two players who start
+	# in different channels can never be mapped into the same one.
+	var offset: float = shape.z - ball_pos.z
+	var lane_z: float = ball_pos.z + offset * PUSH_UP_LANE_SPREAD
+	# Squashed to the FORMATION width, not the playable width. tanh is also
+	# monotonic, so it folds a wide lane back onto the pitch without ever
+	# merging two of them, and the margin leaves room for the spacing nudge
+	# applied downstream to never reach the playable-area clamp.
+	var lane_limit: float = FormationManager.FIELD_HALF_WIDTH
+	lane_z = lane_limit * tanh(lane_z / lane_limit)
+	return Vector3(wanted_x, shape.y, lane_z)
+
+
 ## Holding shape is a real job, not "nothing to do". The point is always
 ## derived from where the ball currently is, so it keeps moving as play
 ## moves -- the old fallback resolved to a near-static formation point,
@@ -570,21 +674,32 @@ static func _cover_space_target(shape: Vector3, ball_pos: Vector3, own_goal_pos:
 	var play_point: Vector3
 	var weight: float
 	if plan.attack_intent >= 0.0:
-		# Support the attack: match the DEPTH of play, keep our own width,
-		# and stay out of the carrier's space. Deliberately reads the SLOW
-		# reference -- this is where a line sits, not a run to be made, and
-		# coupling it to the faster one passed every change of the ball's
-		# direction into ten players at once (see TeamPlan.slow_ball_pos).
+		# Support the attack: match the DEPTH of play, and shift laterally
+		# with it. Deliberately reads the SLOW reference -- this is where a
+		# line sits, not a run to be made, and coupling it to the faster one
+		# passed every change of the ball's direction into ten players at
+		# once (see TeamPlan.slow_ball_pos).
+		#
+		# v0.8.6: the lateral term is new, and its absence was half of
+		# "midfielders are still too inactive". The old version held
+		# shape.z fixed, so a shape-holder could only ever move up and down
+		# a single fixed lane -- play switching from one flank to the other,
+		# the most common thing that happens in a football match, moved
+		# their target by exactly nothing. They now slide across with the
+		# ball while keeping most of their own width, which is a line
+		# shuffling across rather than a crowd converging on it.
 		var fwd: Vector3 = plan.forward_axis()
 		var wanted_x: float = plan.slow_ball_pos.x - fwd.x * COVER_SUPPORT_STANDOFF
-		play_point = Vector3(wanted_x, shape.y, shape.z)
-		weight = 0.12 + 0.22 * attack_weight
+		var wanted_z: float = lerp(shape.z, plan.slow_ball_pos.z, COVER_LATERAL_TRACKING)
+		play_point = Vector3(wanted_x, shape.y, wanted_z)
+		weight = COVER_BASE_WEIGHT + 0.42 * attack_weight
 	else:
 		play_point = own_goal_pos.lerp(ball_pos, 0.55)
+		play_point.z = lerp(shape.z, ball_pos.z, COVER_LATERAL_TRACKING)
 		play_point.y = shape.y
-		weight = 0.12 + 0.28 * defend_weight
+		weight = COVER_BASE_WEIGHT + 0.34 * defend_weight
 
-	var result: Vector3 = shape.lerp(play_point, clampf(weight, 0.0, 0.62))
+	var result: Vector3 = shape.lerp(play_point, clampf(weight, 0.0, COVER_MAX_WEIGHT))
 
 	# Adjusting to play, not chasing it: a shape-holder never strays further
 	# than this from their own formation anchor, so a ball travelling the
@@ -764,9 +879,27 @@ static func _decide_possession_action(
 	#    chance away instead -- and it made shooting statistically
 	#    indistinguishable from passing to anyone watching.
 	var shoot_range: float = _shoot_range(player)
-	var dist_to_goal: float = player.global_position.distance_to(opponent_goal_pos)
-	if dist_to_goal < shoot_range:
-		var to_goal: Vector3 = opponent_goal_pos - player.global_position
+	# v0.8.6: measured against the REAL goal mouth (x = ±29, see
+	# FormationManager.GOAL_LINE_X), not the nominal formation point at
+	# ±26 that every attacking decision used to aim at. Three metres short
+	# of the goal is three metres of a fourteen-metre shooting range, and it
+	# meant a shot "at the goal" was really a shot at a spot in front of it
+	# that the ball happened to roll through on its way.
+	var goal_mouth: Vector3 = FormationManager.attacking_goal_mouth(forward_axis)
+	var aim_point: Vector3 = FormationManager.goal_aim_point(
+		forward_axis, player.global_position, _opponent_keeper_pos(opponents))
+	var dist_to_goal: float = player.global_position.distance_to(goal_mouth)
+	# A player who has ended up level with or behind the goal line is out of
+	# the field of play lengthways and has no shot to take, however close to
+	# the goal they happen to be standing. Without this the angle test below
+	# scored a backwards shot from behind the net as a perfect chance -- the
+	# reported "opponent moved behind the goal and tried to score from
+	# there". The positional cause is fixed separately (see the playable-area
+	# clamp in update_player); this is the decision refusing to compound it.
+	if FormationManager.is_behind_goal_line(player.global_position):
+		pass
+	elif dist_to_goal < shoot_range:
+		var to_goal: Vector3 = aim_point - player.global_position
 		to_goal.y = 0.0
 		var goal_dir: Vector3 = _safe_normalize(to_goal)
 		# Being inside your own shooting range at all is worth something --
@@ -778,7 +911,14 @@ static func _decide_possession_action(
 		var closeness: float = clampf(1.0 - dist_to_goal / shoot_range, 0.0, 1.0)
 		var range_quality: float = lerp(0.35, 1.0, closeness)
 		# Shooting from a tight angle is a bad chance even from close in.
-		var angle_quality: float = clampf(absf(goal_dir.dot(forward_axis)), 0.0, 1.0)
+		#
+		# v0.8.6: the absf() here was a genuine bug, not a simplification. It
+		# made a shot pointing DIRECTLY AWAY from the attacking direction --
+		# which is what a shot taken from behind the goal looks like -- score
+		# a perfect 1.0 for angle. A player who wandered behind the net was
+		# therefore handed the best-scoring chance on the pitch. Signed, a
+		# backwards shot now scores zero, which is what it is worth.
+		var angle_quality: float = clampf(goal_dir.dot(forward_axis), 0.0, 1.0)
 		angle_quality = lerp(0.45, 1.0, angle_quality)
 		var shoot_score: float = range_quality * angle_quality * lerp(1.0, 0.45, shot_pressure)
 		# The keeper is deliberately NOT counted as blocking the lane: they
@@ -794,7 +934,24 @@ static func _decide_possession_action(
 		player.last_shoot_score = shoot_score
 		player.last_shoot_threshold = shoot_threshold
 		if shoot_score >= shoot_threshold:
-			player.execute_shot(clampf(0.45 + range_quality * 0.55, 0.0, 1.0))
+			# v0.8.6, and the direct fix for "AI shots are still too weak".
+			# Two separate defects, both here:
+			#
+			#  1. POWER WAS INVERTED. The old argument was
+			#     0.45 + range_quality*0.55, and range_quality is HIGHEST
+			#     when the shooter is CLOSEST -- so the AI struck the ball
+			#     hardest from two metres and softest from thirteen, exactly
+			#     backwards from how distance works. Power is now solved from
+			#     the distance the ball actually has to travel.
+			#  2. THE SHOT WAS NOT AIMED. execute_shot() took no direction, so
+			#     _apply_kick_impulse fell back to _get_aim_direction() --
+			#     which is move_input, and move_input is Vector2.ZERO the
+			#     moment the carrier is inside their arrive radius, leaving
+			#     the shot to go wherever _facing_angle happened to be
+			#     pointing. It is now aimed at a chosen point inside the goal
+			#     mouth, away from the keeper.
+			var shot_dir: Vector3 = goal_dir
+			player.execute_shot(player.shot_charge_for_distance(dist_to_goal), shot_dir)
 			return
 
 	# 2/3. Pass. A real evaluation with a real threshold, so the decision is
@@ -894,6 +1051,16 @@ static func _forward_space(player: FootballPlayer, opponents: Array, forward_axi
 			continue
 		nearest = minf(nearest, along)
 	return clampf(nearest / FORWARD_SPACE_RANGE, 0.0, 1.0)
+
+
+## Where the opposing goalkeeper is standing, so a shot can be placed away
+## from them (see FormationManager.goal_aim_point). Vector3.INF when there
+## isn't one -- an isolated test setup, or a squad without a keeper.
+static func _opponent_keeper_pos(opponents: Array) -> Vector3:
+	for opp in opponents:
+		if opp != null and is_instance_valid(opp) and opp.is_goalkeeper:
+			return opp.global_position
+	return Vector3.INF
 
 
 static func _nearest_opponent_distance(player: FootballPlayer, opponents: Array, skip_goalkeeper: bool = false) -> float:

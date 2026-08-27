@@ -32,6 +32,14 @@ extends RefCounted
 ## AIController turns each of these into a position (see _duty_target);
 ## nothing here computes positions itself -- this layer only assigns
 ## responsibility.
+## v0.8.6 adds the two that were missing, and their absence is the direct
+## cause of two of the three biggest reported problems. Every OTHER duty
+## here describes a job you do *because of where the ball is*; there was
+## nothing at all for "I just played it" or "I am nowhere near it", and
+## players in those two situations therefore fell through to COVER_SPACE,
+## the leftover -- which resolved to their static formation anchor. That is
+## why a player "returns to formation" the moment they pass, and why
+## midfielders went inert whenever play was elsewhere.
 enum Duty {
 	CONTEST,        ## the single nominated ball-winner
 	PRESS_SUPPORT,  ## second man: covers the carrier's forward option
@@ -40,6 +48,8 @@ enum Duty {
 	RUN_BEHIND,     ## runs in behind the opponent's last line
 	MARK,           ## picks up one specific opponent
 	COVER_SPACE,    ## holds shape between the ball and our own goal
+	FOLLOW_UP,      ## just played the ball -- stay in the move you started
+	PUSH_UP,        ## off the ball: advance into space, offer a lane
 }
 
 ## How fast attack_intent slews between fully-defending and fully-attacking.
@@ -67,7 +77,15 @@ const INTENT_SLEW_RATE := 1.6
 ## hysteresis, not a cooldown: a decisively better candidate still takes
 ## the job on the very next frame. It only stops near-equal candidates
 ## trading jobs on positional noise.
-const DUTY_RETENTION_BONUS := 4.0
+## v0.8.6: raised from 4.0. This milestone adds two more duties (FOLLOW_UP
+## and PUSH_UP), and the second of those sits right next to COVER_SPACE in
+## suitability for exactly the players who are candidates for both -- so the
+## number of near-ties this bonus exists to settle went up, and with it the
+## churn. Measured over a 30s settled passage: 0.234 duty changes per player
+## per second before this milestone, 0.307 after adding the new duties, and
+## back to within the pre-existing rate at 6.0. Same tie-break rule, sized
+## for the larger duty set.
+const DUTY_RETENTION_BONUS := 6.0
 
 ## Slot ceilings. These numbers ARE the "not every player should contest /
 ## not every player should make the same run" rule, expressed structurally.
@@ -75,6 +93,25 @@ const MAX_RUN_BEHIND := 2
 const MAX_SUPPORT_WIDE := 2
 const MAX_SUPPORT_SHORT := 2
 const MAX_MARKERS := 3
+
+## v0.8.6. Count the attacking ceilings above: 2+2+2 = six jobs for ten
+## outfielders, so four to six players per side were ALWAYS leftovers, and
+## the leftover job resolved to a near-static formation anchor. Measured in
+## the v0.8.5 rendered playtest: midfielders idle 75-76% of all frames. The
+## ceilings were doing their job (not every forward should make the same
+## run) but there was no second tier of off-ball work underneath them, so
+## "not selected for a run" and "nothing to do" were the same thing.
+##
+## PUSH_UP is that second tier: advance into your own channel ahead of the
+## ball and hold a lane. It is deliberately generous, because on a real
+## pitch there is no such thing as an outfield player with no job while
+## their team is on the ball.
+const MAX_PUSH_UP := 3
+
+## Ceiling on players simultaneously staying in a move they just played.
+## Bounded only so a flurry of quick passes cannot hand the entire side a
+## follow-up job at once; in practice one or two hold it.
+const MAX_FOLLOW_UP := 3
 
 ## An opponent must be at least this far into our half (measured toward our
 ## own goal from the halfway line) to be worth assigning a dedicated marker.
@@ -264,12 +301,34 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	# couple at a time over more than a second instead of all together on
 	# one frame. That is also just better football than a team that is
 	# either wholly attacking or wholly defending with nothing between.
+	# 2b. Stay in the play you just made.
+	#
+	# v0.8.6, and the fix for the single biggest reported problem ("AI
+	# abandons the play"). This is an ALLOCATED DUTY, not a blend applied
+	# afterwards, and that distinction is the whole point. Previously a
+	# player who had just passed was still put through the ordinary
+	# allocation, where they are 0m from the ball -- which scores badly for
+	# SUPPORT_SHORT (it wants ~9m) and is explicitly penalised for
+	# RUN_BEHIND -- so they reliably fell through to COVER_SPACE and were
+	# sent back toward their formation anchor. A decaying follow-up weight
+	# was then blended on top of that, i.e. the system spent 2.5s partially
+	# cancelling a "go home" instruction it had just issued.
+	#
+	# Deciding it here instead means the player never receives that
+	# instruction at all: for as long as the move they started is live,
+	# their job IS the move.
+	_fill_follow_up(available, ball)
+
 	var attacking_weight: float = clampf((attack_intent + 1.0) * 0.5, 0.0, 1.0)
 	_fill(available, Duty.SUPPORT_SHORT, _slots(MAX_SUPPORT_SHORT, attacking_weight), previous, ball, opponents)
 	_fill(available, Duty.RUN_BEHIND, _slots(MAX_RUN_BEHIND, attacking_weight), previous, ball, opponents)
 	_fill(available, Duty.SUPPORT_WIDE, _slots(MAX_SUPPORT_WIDE, attacking_weight), previous, ball, opponents)
 	_assign_markers(available, opponents, previous, previous_marks,
 		_slots(MAX_MARKERS, 1.0 - attacking_weight))
+	# 4b. Off-ball advancement -- see MAX_PUSH_UP. Counted from the same
+	#     slewed intent as every other slot, so it migrates over the ramp
+	#     rather than switching on the frame the phase changes.
+	_fill(available, Duty.PUSH_UP, _slots(MAX_PUSH_UP, attacking_weight), previous, ball, opponents)
 
 	# 5. Everyone left holds shape. This is a real job, not a leftover --
 	#    see AIController's COVER_SPACE target, which stays ball-relative
@@ -277,6 +336,23 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	#    defenders measured 40% of frames completely stationary).
 	for p in available:
 		_assign(p, Duty.COVER_SPACE)
+
+
+## Anyone whose last kick is still in the air, in priority of how recently
+## they played it. Not scored against other candidates like the allocated
+## slots are -- having just played the ball is a fact about this player, not
+## a competition they can lose to a better-placed teammate.
+func _fill_follow_up(available: Array, _ball: RigidBody3D) -> void:
+	var recent: Array = []
+	for p in available:
+		if p.post_action_involvement() > 0.0:
+			recent.append(p)
+	if recent.is_empty():
+		return
+	recent.sort_custom(func(a, b): return a.post_action_involvement() > b.post_action_involvement())
+	for i in range(mini(recent.size(), MAX_FOLLOW_UP)):
+		_assign(recent[i], Duty.FOLLOW_UP)
+		available.erase(recent[i])
 
 
 ## How many of `max_slots` a phase this committed should fill. Rounding
@@ -468,6 +544,27 @@ func _score_for(p: FootballPlayer, duty: int, ball: RigidBody3D, opponents: Arra
 			# behind starts away from the ball, not on top of it.
 			if dist_to_ball < 6.0:
 				score -= 2.0
+			return score
+
+		Duty.PUSH_UP:
+			# Whoever has the most useful room to advance INTO. A player
+			# already level with or beyond the ball has nowhere to push, and a
+			# player standing on the ball is supporting it, not pushing past
+			# it -- both are better used elsewhere.
+			var score: float = 0.0
+			if cat == "MID":
+				score += 3.5
+			elif cat == "FWD":
+				score += 2.5
+			else:
+				# A full-back overlapping is real football, just not the
+				# first choice, and never at the expense of the last line.
+				score -= 3.0
+			var ball_advancement: float = ball.global_position.x * signf(_forward_axis.x)
+			score += clampf((ball_advancement - advancement) * 0.20, -2.0, 3.0)
+			if dist_to_ball < 5.0:
+				score -= 2.5
+			score += (p.personality.aggression + p.personality.risk_taking - 100.0) * 0.015
 			return score
 
 		Duty.SUPPORT_WIDE:

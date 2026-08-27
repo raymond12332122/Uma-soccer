@@ -59,9 +59,20 @@ func _test_close_control_then_loosens_while_sprinting() -> void:
 	_check("Ball settles close to the player's feet at a standstill (%.2fm)" % stationary_dist, stationary_dist < 1.0)
 
 	# Now sprint in a straight line -- the leash should visibly lengthen.
+	#
+	# v0.8.6: settle for 120 frames rather than 40. The player needs ~0.6s
+	# just to reach sprint speed, and the dribble spring then needs about as
+	# long again to push the ball out to its longer sprint target -- so at 40
+	# frames this was sampling the middle of the acceleration transient,
+	# where the player has closed on a ball that has not been pushed ahead
+	# yet, and calling that the steady-state leash. It only ever passed by a
+	# rounding hair (measured on the v0.8.5 build it was asserting
+	# 0.8299m > 0.8298m, with both figures pinned at the distance where the
+	# two collision shapes touch), so it was not measuring the leash at all.
+	# Same assertion, sampled where the quantity it names actually exists.
 	player.move_input = Vector2(0, 1)
 	player.sprint_requested = true
-	for i in range(40):
+	for i in range(120):
 		await get_tree().physics_frame
 	var sprint_dist: float = player.global_position.distance_to(ball.global_position)
 	_check("Sprinting still keeps the ball under close control (still following, %.2fm)" % sprint_dist, player.has_possession and sprint_dist < 2.0)

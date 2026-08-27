@@ -16,8 +16,42 @@ extends RefCounted
 ## work generically off role_category() rather than a specific formation
 ## name or slot count, so nothing there needs to change.
 
+## The FORMATION field -- the box formation slots are laid out inside. This
+## is deliberately smaller than the pitch the players can physically stand
+## on, so a 4-3-3 drawn at ±1.0 still sits comfortably inside the touchlines.
 const FIELD_HALF_LENGTH := 26.0
 const FIELD_HALF_WIDTH := 17.0
+
+## v0.8.6: the REAL geometry the match is actually played in, read straight
+## off scenes/Field.tscn. Before this existed there was no model of the
+## pitch anywhere -- FIELD_HALF_LENGTH/WIDTH were a formation-layout box
+## that positioning code then reused as if it were the playing area, and
+## the two do not line up with the built stadium at all:
+##
+##   goal mouth (posts)   x = ±29.0,  z = ±4.0
+##   net back             x = ±32.2
+##   perimeter walls      x = ±35.0,  z = ±23.0
+##
+## So "the goal" that every attacking decision aimed at (x = ±26) was a
+## point 3m IN FRONT of the actual goal line, and the strip from x=29 out to
+## the wall at x=35 -- the whole area behind each goal -- was somewhere the
+## code had no opinion about whatsoever. That is the root of the reported
+## "an opponent moved behind the goal and tried to score from there": there
+## was no such thing as being behind the goal as far as the AI was concerned.
+const GOAL_LINE_X := 29.0
+## Half the distance between the posts (they sit at z = ±4.0 and are 0.3
+## wide, so the clear opening is a shade under 4). Aim points are kept
+## inside this so a shot goes between the posts rather than at one.
+const GOAL_HALF_WIDTH := 3.4
+
+## The area a player is allowed to have a movement target inside. Stops a
+## metre short of the goal line, so an AI player's aim point can never be
+## level with or behind the goal -- they play up to the line and no further,
+## which is what a footballer does.
+const PLAYABLE_HALF_LENGTH := GOAL_LINE_X - 1.0
+## Comfortably inside the perimeter walls at ±23, and outside the formation
+## box at ±17 so wide players can still genuinely hug a touchline.
+const PLAYABLE_HALF_WIDTH := 21.0
 
 const FORMATIONS := {
 	"4_3_3": [
@@ -57,6 +91,69 @@ static func get_slots(formation_name: String) -> Array:
 
 static func role_category(role: String) -> String:
 	return ROLE_CATEGORY.get(role, "MID")
+
+
+## Centre of the goal a team attacking along `forward_axis` is shooting at,
+## on the REAL goal line rather than the nominal formation point 3m in front
+## of it. Takes the axis rather than a team id so every caller that already
+## has a TeamPlan can use it without threading an extra argument through.
+static func attacking_goal_mouth(forward_axis: Vector3) -> Vector3:
+	var side: float = signf(forward_axis.x) if forward_axis.x != 0.0 else 1.0
+	return Vector3(side * GOAL_LINE_X, 0.0, 0.0)
+
+
+## The goal a team attacking along `forward_axis` is defending.
+static func defending_goal_mouth(forward_axis: Vector3) -> Vector3:
+	return attacking_goal_mouth(-forward_axis)
+
+
+## Where inside the goal mouth to actually strike the ball, given where the
+## shot is being taken from and who is in the way.
+##
+## Aiming at the exact centre of the goal means aiming at the goalkeeper,
+## who stands there by definition. This picks the half of the mouth the
+## keeper is NOT covering and aims just inside the post on that side, which
+## is both a better chance and legibly a *placed* shot rather than a hoof at
+## the middle. Falls back to the far side relative to the shooter when there
+## is no keeper to read.
+static func goal_aim_point(forward_axis: Vector3, from_pos: Vector3, keeper_pos: Vector3 = Vector3.INF) -> Vector3:
+	var mouth: Vector3 = attacking_goal_mouth(forward_axis)
+	# Just inside the post -- never AT it.
+	var inset: float = GOAL_HALF_WIDTH * 0.7
+	var side: float
+	if keeper_pos != Vector3.INF:
+		# Away from wherever the keeper is standing.
+		side = -signf(keeper_pos.z) if absf(keeper_pos.z) > 0.15 else -signf(from_pos.z)
+	else:
+		side = -signf(from_pos.z)
+	if side == 0.0:
+		side = 1.0
+	mouth.z = side * inset
+	mouth.y = from_pos.y
+	return mouth
+
+
+## True when `pos` is beyond the deepest point of the field of play --
+## level with or behind a goal. Players should never be *targeted* here.
+##
+## The comparison is strict against PLAYABLE_HALF_LENGTH so that a target
+## which clamp_to_playable() has just pulled back TO the limit is legal:
+## playing right up to the byline is football, being behind the net is not.
+static func is_behind_goal_line(pos: Vector3) -> bool:
+	return absf(pos.x) > PLAYABLE_HALF_LENGTH
+
+
+## Confines a movement target to the area football is actually played in.
+## This is the single place the playable area is enforced, and it is applied
+## to a TARGET, never to a player's position -- a player who has carried
+## their own momentum past the line walks back in of their own accord rather
+## than being teleported, which is the difference between a rule and a
+## band-aid.
+static func clamp_to_playable(pos: Vector3) -> Vector3:
+	return Vector3(
+		clampf(pos.x, -PLAYABLE_HALF_LENGTH, PLAYABLE_HALF_LENGTH),
+		pos.y,
+		clampf(pos.z, -PLAYABLE_HALF_WIDTH, PLAYABLE_HALF_WIDTH))
 
 
 ## team_id 0 (home) attacks +X, defends -X (own goal near -X).
