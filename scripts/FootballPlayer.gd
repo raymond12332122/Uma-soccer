@@ -84,6 +84,11 @@ var control_loss_angle_threshold: float = 1.2
 ## Fraction of normal dribble steering that survives a heavy touch. Not
 ## zero -- see _update_possession.
 const CONTROL_LOSS_STEER_SCALE := 0.3
+## How long a player stays committed to the play they just made. Long
+## enough to follow a shot in for the rebound or continue a run after
+## laying the ball off; short enough that it is a follow-up, not a refusal
+## to defend.
+const POST_ACTION_WINDOW := 2.5
 @export var possession_release_cooldown: float = 0.35
 ## How long has_possession survives the ball leaving the control radius
 ## when it was NOT deliberately kicked away -- see _update_possession.
@@ -218,6 +223,18 @@ var movement_locked: bool = false
 ## actually sprinting (requesting it, moving, and had stamina left) this
 ## tick, for the HUD's sprint indicator to read on the controlled player.
 var is_currently_sprinting: bool = false
+
+## v0.8.4: how far through a tackle attempt this player currently is, in
+## seconds of sustained full-strength challenge (see BallContest). Written
+## by PossessionManager via BallContest; read by tests and the debug
+## overlay. Always 0 for the player who currently has the ball.
+var challenge_progress: float = 0.0
+
+## v0.8.4: seconds left in which this player is still "in the play" they
+## just made -- see post_action_involvement(). Set when a kick is executed,
+## counted down every frame.
+var post_action_timer: float = 0.0
+var post_action_kind: int = KickKind.NONE
 
 ## Seconds this player has continuously had the ball. Read by the AI
 ## carrier layer so "I have been holding this too long" is a fact rather
@@ -391,6 +408,37 @@ func get_shoot_charge_ratio() -> float:
 	return clampf(_shoot_charge_elapsed / shoot_charge_time, 0.0, 1.0)
 
 
+## True while the last touch was heavy enough that the ball is running away
+## from this player's feet -- the moment a defender most wants to strike.
+func is_heavy_touch() -> bool:
+	return _control_lost_timer > 0.0
+
+
+## Called by BallContest when this player is tackled. Ends possession and
+## blocks re-acquiring it (and, because the dribble spring is gated on the
+## same cooldown, stops the ball being pulled straight back to their feet).
+func notify_dispossessed(cooldown: float) -> void:
+	has_possession = false
+	possession_time = 0.0
+	challenge_progress = 0.0
+	_possession_grace_timer = 0.0
+	_control_lost_timer = 0.0
+	_possession_cooldown_timer = maxf(_possession_cooldown_timer, cooldown)
+	just_lost_possession_window = _MOMENTARY_TRIGGER_WINDOW
+
+
+## 1.0 immediately after this player shot or passed, decaying to 0 across
+## POST_ACTION_WINDOW. AIController blends a follow-up position in by this
+## amount, so a player who has just played the ball stays involved in the
+## move instead of turning for home the instant it leaves their foot --
+## and, because it decays rather than expiring, they drift back into normal
+## shape smoothly rather than snapping.
+func post_action_involvement() -> float:
+	if post_action_timer <= 0.0 or POST_ACTION_WINDOW <= 0.0:
+		return 0.0
+	return clampf(post_action_timer / POST_ACTION_WINDOW, 0.0, 1.0)
+
+
 func has_active_personality_event() -> bool:
 	return active_personality_event != ""
 
@@ -437,6 +485,9 @@ func reset_intent() -> void:
 	ai_duty = TeamPlan.Duty.COVER_SPACE
 	_ai_target_initialized = false
 	possession_time = 0.0
+	challenge_progress = 0.0
+	post_action_timer = 0.0
+	post_action_kind = KickKind.NONE
 
 	active_personality_event = ""
 	personality_event_time_left = 0.0
@@ -516,6 +567,16 @@ func _physics_process(delta: float) -> void:
 		possession_time += delta
 	else:
 		possession_time = 0.0
+	# NOTE: challenge_progress is owned entirely by BallContest (which
+	# decays it for the carrier and for anyone not actually challenging).
+	# It must NOT be cleared on has_possession here: that flag is purely
+	# local -- a challenger standing over the ball has it set too, because
+	# the ball is inside their own control radius -- so doing so wiped
+	# every challenger's progress on the very frame they got close enough
+	# to matter, and no tackle could ever complete.
+
+	if post_action_timer > 0.0:
+		post_action_timer = maxf(0.0, post_action_timer - delta)
 
 	if _control_lost_timer > 0.0:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
@@ -892,6 +953,8 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 	last_kick_power = launch_speed
 	last_kick_dir = aim_dir
 	kick_count += 1
+	post_action_kind = last_kick_kind
+	post_action_timer = POST_ACTION_WINDOW
 
 	has_possession = false
 	_control_lost_timer = 0.0

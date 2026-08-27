@@ -93,8 +93,20 @@ const MIN_SHAPE_STATE_DWELL := 0.7
 
 ## Within this distance of the ball, a pressing player is treated as
 ## already in contact with it rather than still chasing it -- see the
-## PRESSING branch in update_player(). Roughly the action-area radius.
-const PRESS_CONTACT_RANGE := 1.6
+## CONTEST branch in _duty_target().
+##
+## v0.8.4: cut from 1.6m. That radius existed to stop a press target and a
+## carry target flipping through a ~40m swing as has_possession toggled,
+## and it still does -- but 1.6m is most of a challenge, and blending the
+## target toward the GOAL across it meant the contester spent the entire
+## final approach aimed somewhere other than the ball. Measured in an
+## isolated 1v1: a challenger hand-steered straight at the ball beat a
+## STATIONARY carrier from 7 of 8 approach angles, while the real
+## AIController-driven challenger managed only 4 of 8 -- it arced past a
+## ball that was not moving. At 0.8m the blend still does its original job
+## (the two intents agree once the ball is genuinely underfoot) without
+## eating the challenge itself.
+const PRESS_CONTACT_RANGE := 0.8
 ## Sprint threshold multiplier during a transition -- react with urgency
 ## to a turnover in either direction rather than casually strolling back.
 const TRANSITION_SPRINT_MULT := 0.5
@@ -113,6 +125,9 @@ const ARRIVE_RADIUS := 0.9
 ## Deadband for players holding a shape position rather than chasing the
 ## ball -- see the call site in update_player.
 const SHAPE_ARRIVE_RADIUS := 1.6
+## Deadband for a player actively challenging for the ball -- effectively
+## none, so they press onto it rather than parking beside it.
+const CONTEST_ARRIVE_RADIUS := 0.15
 const SPRINT_DISTANCE := 8.0
 
 const GK_LATERAL_RANGE := 3.5
@@ -200,9 +215,25 @@ const PASS_THRESHOLD_PRESSURE_RELIEF := 0.22
 const PASS_THRESHOLD_HOLD_RELIEF := 0.18
 const HOLD_TOO_LONG_SECONDS := 2.5
 const MIN_SETTLE_BEFORE_ACTION := 0.15
+
+## How strongly a just-shot/just-passed player is pulled toward staying in
+## the play, at full involvement. Not 1.0 -- they keep some of their normal
+## shape, so this reads as "follow it in" rather than "abandon your post".
+const MAX_FOLLOW_UP_WEIGHT := 0.8
+## A player who has just shot holds a rebound position this far off the
+## goal, on the ball's side of it.
+const REBOUND_STANDOFF := 7.0
 ## An unpressured carrier takes at least this long on the ball before
 ## looking for a pass at all -- long enough to actually be dribbling.
-const MIN_CARRY_BEFORE_PASS := 0.45
+##
+## v0.8.4: cut from 0.45s. That figure was chosen in v0.8.3, when a carrier
+## kept the ball until they chose to give it up; with a real ball contest
+## (see BallContest) they are frequently dispossessed before 0.45s has even
+## elapsed, so the gate was silently suppressing most passes -- measured AI
+## passing in a live 30s match fell from 13-45 to 5. A quicker release is
+## also the correct football answer once the ball can actually be taken off
+## you.
+const MIN_CARRY_BEFORE_PASS := 0.25
 ## How much clear space ahead raises the bar a pass has to clear.
 const CARRY_SPACE_BONUS := 0.20
 ## How much easier a pass becomes as the carrier closes on the opponent
@@ -210,6 +241,11 @@ const CARRY_SPACE_BONUS := 0.20
 const FINAL_THIRD_RELEASE := 0.22
 ## Space ahead is measured out to this distance.
 const FORWARD_SPACE_RANGE := 12.0
+## How much an in-progress tackle against us lowers the bar for passing.
+const CHALLENGE_RELEASE_RELIEF := 0.30
+## Fraction of a completed tackle at which the carrier stops waiting for
+## the minimum carry time and looks to release immediately.
+const CHALLENGE_RELEASE_TRIGGER := 0.12
 
 
 static func update_player(
@@ -257,6 +293,24 @@ static func update_player(
 		target = _duty_target(player, ball, effective_plan, formation_target, own_goal_pos, opponent_goal_pos, category)
 		target += _spacing_offset(player, teammates)
 
+	# v0.8.4: stay in the play you just made. Measured over a live match,
+	# a player who had just SHOT closed 0.86m back toward their own
+	# formation slot in the following second (a passer, by contrast,
+	# already moved 0.92m further away -- so this was specific to shooting,
+	# and it is exactly the reported "shoots, then immediately returns to
+	# formation" behaviour). The cause is that a shot hands the ball to the
+	# keeper, which flips team possession, which slews attack_intent
+	# negative and drops the whole forward line -- including the player
+	# who is standing in the six-yard box where a rebound will land.
+	#
+	# Blended by a decaying weight rather than switched on and off, so the
+	# player drifts back into normal shape instead of snapping out of the
+	# follow-up.
+	var involvement: float = player.post_action_involvement()
+	if involvement > 0.0 and not player.has_possession:
+		var follow_up: Vector3 = _follow_up_target(player, ball, effective_plan, opponent_goal_pos)
+		target = target.lerp(follow_up, involvement * MAX_FOLLOW_UP_WEIGHT)
+
 	target += _fatigue_noise(player)
 	target.x = clampf(target.x, -FormationManager.FIELD_HALF_LENGTH - 2.0, FormationManager.FIELD_HALF_LENGTH + 2.0)
 	target.z = clampf(target.z, -FormationManager.FIELD_HALF_WIDTH - 1.0, FormationManager.FIELD_HALF_WIDTH + 1.0)
@@ -278,7 +332,20 @@ static func update_player(
 	# geometry. Deadband is therefore a property of the job.
 	var duty_now: int = effective_plan.duty_of(player)
 	var arrive: float = ARRIVE_RADIUS
-	if not player.has_possession and duty_now != TeamPlan.Duty.CONTEST and duty_now != TeamPlan.Duty.PRESS_SUPPORT:
+	if player.has_possession:
+		pass
+	elif duty_now == TeamPlan.Duty.CONTEST or duty_now == TeamPlan.Duty.PRESS_SUPPORT:
+		# v0.8.4: a player challenging for the ball keeps pressing right
+		# onto it. At the normal 0.9m arrive radius the contester parked
+		# just short of the ball and stopped -- which reads as backing off,
+		# and (because BallContest scores how hard a challenger is closing)
+		# let a challenge decay instead of completing. Measured: the real
+		# AI challenger peaked at 0.32 of the 1.0 progress a tackle needs,
+		# while the same challenger hand-steered into the ball reached a
+		# full 1.00. They are stopped by the carrier's capsule either way;
+		# the difference is whether they are still pressing into it.
+		arrive = CONTEST_ARRIVE_RADIUS
+	else:
 		arrive = SHAPE_ARRIVE_RADIUS
 	_move_toward(player, player.ai_smoothed_target, arrive)
 
@@ -409,6 +476,34 @@ static func _duty_target(
 			return shape.lerp(spot, 0.7)
 
 	return _cover_space_target(shape, ball_pos, own_goal_pos, plan, category)
+
+
+## Where a player who has just played the ball should be while the move
+## they started is still live.
+##
+## After a SHOT: follow it in. Hold a rebound position between the ball and
+## the goal rather than turning for home -- if the keeper parries, that is
+## where the ball comes back to.
+## After a PASS: keep going. Continue past the ball's new position on the
+## attacking axis, which is what makes a give-and-go possible at all.
+static func _follow_up_target(player: FootballPlayer, ball: RigidBody3D, plan: TeamPlan, opponent_goal_pos: Vector3) -> Vector3:
+	var fwd: Vector3 = plan.forward_axis()
+	var ball_pos: Vector3 = ball.global_position
+
+	if player.post_action_kind == FootballPlayer.KickKind.SHOT:
+		var from_goal: Vector3 = player.global_position - opponent_goal_pos
+		from_goal.y = 0.0
+		var spot: Vector3 = opponent_goal_pos + _safe_normalize(from_goal) * REBOUND_STANDOFF
+		spot.y = player.global_position.y
+		return spot
+
+	# A pass: push on beyond where the ball now is, staying in our own lane
+	# so this is a supporting run rather than a chase after our own pass.
+	var spot := Vector3(
+		ball_pos.x + fwd.x * TeamPlan.SUPPORT_SHORT_DISTANCE,
+		player.global_position.y,
+		player.global_position.z)
+	return spot
 
 
 ## Holding shape is a real job, not "nothing to do". The point is always
@@ -648,12 +743,22 @@ static func _decide_possession_action(
 		# one carrier ever got within shooting range of a goal, because
 		# nobody ever actually ran at one).
 		threshold += CARRY_SPACE_BONUS * _forward_space(player, opponents, forward_axis)
+		# v0.8.4: a carrier who can feel a tackle coming gets rid of it.
+		# Without this the new ball-contest system and the pass decision
+		# worked against each other -- challenges took the ball off carriers
+		# before they had held it long enough to even look for a pass, and
+		# measured AI passing in a live match fell from ~13-45 per 30s to 5.
+		# Reacting to the challenge is both the fix and the realistic
+		# behaviour: under a genuine challenge you play the ball early.
+		var challenge_ratio: float = _incoming_challenge(player, opponents)
+		threshold -= CHALLENGE_RELEASE_RELIEF * challenge_ratio
 		# ...but inside the final third, keep the ball moving. A carrier who
 		# is nearly in shooting range should be looking for the killer ball,
 		# not holding it because there happens to be grass ahead.
 		var goal_proximity: float = clampf(1.0 - (player.global_position.distance_to(opponent_goal_pos) - _shoot_range(player)) / 14.0, 0.0, 1.0)
 		threshold -= FINAL_THIRD_RELEASE * goal_proximity
-		var must_release: bool = pressure > 0.5 or player.possession_time > HOLD_TOO_LONG_SECONDS
+		var must_release: bool = pressure > 0.5 or player.possession_time > HOLD_TOO_LONG_SECONDS \
+			or challenge_ratio > CHALLENGE_RELEASE_TRIGGER
 		if not must_release and player.possession_time < MIN_CARRY_BEFORE_PASS:
 			return
 		player.last_pass_score = option.score
@@ -680,6 +785,18 @@ static func _shot_lane_blocked(player: FootballPlayer, dir: Vector3, dist: float
 		if (to_opp - dir * along).length() < 1.2:
 			return true
 	return false
+
+
+## How far through a tackle the most advanced challenge against this player
+## is, as a fraction of a completed one (see BallContest). 0 when nobody is
+## challenging.
+static func _incoming_challenge(player: FootballPlayer, opponents: Array) -> float:
+	var worst := 0.0
+	for opp in opponents:
+		if opp == null or not is_instance_valid(opp):
+			continue
+		worst = maxf(worst, opp.challenge_progress)
+	return clampf(worst / maxf(BallContest.CHALLENGE_TIME_REQUIRED, 0.001), 0.0, 1.0)
 
 
 ## 0.0 = an opponent is directly in front of us, 1.0 = clear grass ahead

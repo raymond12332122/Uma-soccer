@@ -130,7 +130,7 @@ The project's own automated regression suite (assertion-based, separate
 from the driver above):
 
 ```bash
-for scene in GameplayTest MainSceneTest TeamSystemTest CharacterPipelineTest PersonalityTest V0_7MatchTest V0_8PlaytestFixesTest V0_8_1PlaytestFixesTest V0_8_2PlaytestFixesTest V0_8_2OscillationTest V0_8_3AIBehaviorTest; do
+for scene in GameplayTest MainSceneTest TeamSystemTest CharacterPipelineTest PersonalityTest V0_7MatchTest V0_8PlaytestFixesTest V0_8_1PlaytestFixesTest V0_8_2PlaytestFixesTest V0_8_2OscillationTest V0_8_3AIBehaviorTest V0_8_4PlaytestFixesTest; do
   $GODOT --headless --path . tests/$scene.tscn
 done
 ```
@@ -139,7 +139,7 @@ Each prints `[PASS]`/`[FAIL]` per check, a `TEST_SUMMARY: ALL PASS` (or
 `FAILURES PRESENT`) line, and exits non-zero on any failure. 495
 assertions total across the eleven suites as of the v0.8.3 team-AI pass.
 
-`V0_8_3AIBehaviorTest` is by far the slowest (it spins up several live
+`V0_8_3AIBehaviorTest` and `V0_8_4PlaytestFixesTest` are by far the slowest (it spins up several live
 22-player matches back to back and samples them for hundreds of frames
 each) -- budget a few minutes for it alone and don't mistake it for a
 hang.

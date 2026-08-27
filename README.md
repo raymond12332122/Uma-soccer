@@ -36,6 +36,7 @@ Each system is a small, single-purpose script (no giant manager):
 | `PlayerController` | `scripts/PlayerController.gd` | Drives the one human-controlled `FootballPlayer` from touch/keyboard input |
 | `AIController` | `scripts/AIController.gd` | Stateless per-frame offense/defense/goalkeeper decision logic; role-category-aware team shape (v0.7) |
 | `TeamPlan` | `scripts/TeamPlan.gd` | **Team level (v0.8.3).** One per team, ticked once per frame before any player: decides the attacking/defending phase as a continuous scalar and *allocates* every player a single named duty (contest / press support / short support / wide / run in behind / mark / cover space) |
+| `BallContest` | `scripts/BallContest.gd` | **(v0.8.4)** The actual contest for the ball. A challenger who stays in a genuine challenge long enough wins it outright -- scored on proximity, how hard they are closing, how exposed the carrier is (a stationary carrier is the most vulnerable), and defensive/dribbling stats plus personality. Evaluated once per frame by `PossessionManager` |
 | `PassEvaluator` | `scripts/PassEvaluator.gd` | **(v0.8.3)** Scores every reachable teammate on openness, lane, progression, distance, pressure relief and role; solves the launch speed a pass needs from the measured ball-roll model. Shared by the AI carrier and the human PASS button |
 | `TeamController` | `scripts/TeamController.gd` | Owns one team's roster; runs `AIController` on every member except the human target; computes each team's shared ball-challenger/dangerous-opponent once per frame (v0.7) |
 | `PossessionManager` | `scripts/PossessionManager.gd` | Single source of truth for who/which team currently has the ball, or if it's loose; hysteresis-stabilized for 22-player crowds (v0.7) |
@@ -263,6 +264,51 @@ dissolves the attack). Team shape also reacts to `TeamPlan.shape_ball_pos`,
 a smoothed "where is play" point, rather than to a contested rigid body's
 frame-to-frame jitter -- only the player actually going to win the ball
 uses its true position.
+
+### Winning the ball back (v0.8.4)
+
+Before v0.8.4 there was **no tackle mechanic at all**. Possession went to
+whichever player with the ball inside their control radius happened to be
+closest to it, and two facts made that close to unwinnable for a defender:
+the carrier's dribble spring pins the ball 0.62m in front of them, and both
+players are 0.4m-radius capsules, so a challenger's centre can never get
+nearer than 0.8m to the carrier's. Outside an almost exactly head-on
+challenge, the carrier was closer to the ball by construction, forever.
+Measured in an isolated 1v1: a challenger hand-steered straight at the ball
+beat a *stationary* carrier from 7 of 8 approach angles, but the real AI
+challenger managed only 4 of 8 -- because `PRESS_CONTACT_RANGE` blended its
+target toward the goal across the final 1.6m, so it arced past a ball that
+was not moving.
+
+Possession now changes hands two ways. The old geometric election still
+applies (running onto a loose ball, winning a head-on 50/50), and on top of
+it `BallContest` accumulates a challenge while the conditions for one hold
+and decays it when they stop. It is deliberately **not** random: the
+outcome is a readable consequence of what both players did. A completed
+tackle knocks the ball clear and puts the loser on a short cooldown -- and
+because the dribble spring is gated on that same cooldown, the ball is
+genuinely free for a moment rather than being pulled straight back.
+
+The carrier reacts to it too: an AI player who can feel a tackle coming
+lowers its own bar for releasing the ball, which is both realistic and what
+keeps passing frequency up now that carriers can be dispossessed.
+
+### Staying in the play (v0.8.4)
+
+Measured over a live match: in the second after kicking, a player who had
+**shot** closed 0.86m back toward its own formation slot, while a player
+who had **passed** moved 0.92m further away. The reported "shoots, then
+immediately returns to formation" was real and specific to shooting -- a
+shot hands the ball to the keeper, which flips team possession, which slews
+`attack_intent` negative and drops the entire forward line, including the
+player standing where a rebound would land.
+
+`FootballPlayer.post_action_involvement()` now decays from 1 to 0 across
+`POST_ACTION_WINDOW` after any kick, and `AIController` blends in a
+follow-up position by that weight: a shooter holds a rebound position off
+the goal, a passer continues its run past the ball. Because the weight
+decays rather than expiring, the player drifts back into normal shape
+instead of snapping out of it.
 
 ## 11v11 Match & Team Shape (v0.7)
 
@@ -539,6 +585,7 @@ godot --headless --path . tests/V0_8_1PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_2PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_2OscillationTest.tscn
 godot --headless --path . tests/V0_8_3AIBehaviorTest.tscn
+godot --headless --path . tests/V0_8_4PlaytestFixesTest.tscn
 ```
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.

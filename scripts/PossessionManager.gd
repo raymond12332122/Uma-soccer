@@ -99,6 +99,18 @@ func _physics_process(delta: float) -> void:
 	possessing_team = best.team_id if best else -1
 	is_loose = best == null
 
+	# v0.8.4: a real challenge for the ball, on top of the geometric
+	# election above. See BallContest for why the election alone made a
+	# carrier close to impossible to dispossess. Run AFTER the election so
+	# it always evaluates against the carrier the rest of the frame agrees
+	# on; a successful tackle takes effect from the next frame, when the
+	# loser's fresh possession cooldown removes them from contention.
+	var tackler: FootballPlayer = BallContest.resolve(current_carrier, _tracked_players, _ball, delta)
+	if tackler != null:
+		current_carrier = null
+		possessing_team = -1
+		is_loose = true
+
 	time_since_last_team_change += delta
 	_update_team_possession(best, delta)
 
