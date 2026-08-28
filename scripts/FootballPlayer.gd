@@ -211,6 +211,7 @@ const SETTLE_ACCEL_CLAMP := 10.0
 ## counts as the carrier, so an over-large bubble makes possession sticky
 ## for whoever is merely nearest the ball rather than genuinely on it.
 const CONTROL_RADIUS_LEASH_MARGIN := 1.15
+
 ## Fraction of normal dribble steering that survives a heavy touch. Not
 ## zero -- see _update_possession.
 const CONTROL_LOSS_STEER_SCALE := 0.3
@@ -228,6 +229,30 @@ const POST_ACTION_WINDOW := 2.5
 ## when it was NOT deliberately kicked away -- see _update_possession.
 ## Short enough that a real dispossession still registers promptly.
 const POSSESSION_GRACE := 0.15
+## How close the ball must be to GAIN possession, as opposed to keeping it.
+## Keeping it still works out to the full ControlArea; see _update_possession.
+##
+## Sized by sweeping it against how much of a match the ball is actually
+## under someone's control, rather than picked for feel. At 0.95m -- barely
+## more than the two collision shapes touching (0.40 capsule + 0.16 ball) --
+## nobody could collect a LOOSE ball either, and the ball ran ownerless for
+## 83% of a match, which is not football. Measured ownership across a
+## 25s match, two runs each: 0.95m -> 17%, 1.20m -> 35%, 1.45m -> 32%,
+## 1.75m -> 46%.
+##
+## 1.20m is about one stride. It sits well inside BallContest's 2.4m
+## challenge range, and well below the distances the pre-v0.8.8 bug was
+## handing possession over at (measured 1.61m mean, 2.74m max), so the
+## reported steals from unrealistic range stay impossible. 1.75m recovers
+## the most possession but is essentially the old behaviour, i.e. the bug.
+const POSSESSION_CONTACT_RADIUS := 1.20
+## Live value, so a diagnostic can sweep it. Always the constant in play.
+@export var possession_contact_radius: float = POSSESSION_CONTACT_RADIUS
+## How long after winning a challenge a player may take possession from
+## outside the contact radius. BallContest pokes the ball toward the winner,
+## so they need a moment to actually collect it -- without this the tackle
+## lands and then nobody can pick the ball up.
+const CONTEST_WIN_GRACE := 0.6
 
 # ---- Pass / Shoot ----
 # v0.8.3: these are LAUNCH SPEEDS in m/s, not impulse magnitudes. The old
@@ -402,6 +427,9 @@ var _control_lost_timer: float = 0.0
 ## Time until this player may touch the ball again -- see the touch model
 ## constants above. Public read-only for tests/diagnostics.
 var _touch_timer: float = 0.0
+## Time left in which this player may take possession from outside the
+## contact radius because they just won a challenge -- see CONTEST_WIN_GRACE.
+var _contest_win_timer: float = 0.0
 ## Set for one frame whenever a touch actually lands, so tests and the
 ## animation layer can see individual touches rather than a continuous pull.
 var touched_ball_this_frame: bool = false
@@ -566,6 +594,12 @@ func set_controlled_visual(is_controlled: bool) -> void:
 ## opponent (as opposed to picking up a loose ball) -- a reasonable, cheap
 ## proxy for "successfully tackled" without a dedicated tackle mechanic.
 func notify_possession_won_from_opponent() -> void:
+	# v0.8.8: winning a challenge is the OTHER legitimate way to take the
+	# ball, alongside simply being on it. BallContest knocks the ball toward
+	# the winner rather than into their feet, so without this grace the
+	# tackler is outside POSSESSION_CONTACT_RADIUS at the moment they win
+	# and could not collect what they just won.
+	_contest_win_timer = CONTEST_WIN_GRACE
 	if animation_controller == null:
 		return
 	# A notably competitive/aggressive character reacts more visibly to
@@ -809,6 +843,8 @@ func _physics_process(delta: float) -> void:
 
 	if _control_lost_timer > 0.0:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
+	if _contest_win_timer > 0.0:
+		_contest_win_timer = maxf(0.0, _contest_win_timer - delta)
 	if _possession_cooldown_timer > 0.0:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
 	if _possession_grace_timer > 0.0:
@@ -950,6 +986,35 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 		if has_possession:
 			just_lost_possession_window = _MOMENTARY_TRIGGER_WINDOW
 		has_possession = false
+		return
+
+	# v0.8.8: ACQUIRE TIGHT, RETAIN LOOSE.
+	#
+	# This is the root cause of "AI steals the ball from unrealistic
+	# distances", and it is one flag doing two incompatible jobs.
+	# has_possession answered "is the ball inside my ControlArea", and
+	# ControlArea has to be wide enough to contain the dribble leash (v0.8.7
+	# sized it at ~1.55-1.90m so a sprinting carrier does not knock the ball
+	# out of their own possession radius). PossessionManager then elected a
+	# carrier straight from that flag -- so simply standing within ~1.7m of
+	# a ball someone else was dribbling won it, with no contact and no
+	# challenge. Measured over a 40s match: possession changed hands between
+	# opponents 40 times, the dispossessed player was on average 1.61m from
+	# the ball (max 2.74m), and 40% of those steals had NO challenge built
+	# at all -- pure geometry taking the ball.
+	#
+	# The two jobs are now separated. GAINING possession requires the ball
+	# to be genuinely at your feet (POSSESSION_CONTACT_RADIUS, which is the
+	# two collision shapes nearly touching) or to have just won a contest.
+	# KEEPING it works out to the full control radius, so touch dribbling is
+	# completely unaffected -- the ball can still be knocked 1.35m ahead.
+	var ball_gap: float = Vector2(
+		ball_in_control_range.global_position.x - global_position.x,
+		ball_in_control_range.global_position.z - global_position.z).length()
+	if not has_possession and ball_gap > possession_contact_radius and _contest_win_timer <= 0.0:
+		# Near the ball, but not on it. Keep steering nothing and let the
+		# approach continue; this is the frame the old code handed the ball
+		# over on.
 		return
 
 	_possession_grace_timer = POSSESSION_GRACE
@@ -1261,8 +1326,61 @@ func notify_shoot_release(elapsed_seconds: float) -> void:
 ## then kick using the default narrow forward-only cone that excludes
 ## that exact same teammate and silently fall back to aiming at nothing
 ## in particular.
+## The ball this player is entitled to strike, or null.
+##
+## v0.8.8: passing and shooting now REQUIRE POSSESSION. This is the root
+## cause of "the AI passes and shoots from unrealistic distances", and it
+## was a missing check rather than a wrong number: execute_pass and
+## execute_shot took the ball from `ball_in_action_range` -- the ActionArea,
+## radius 2.5m -- and asked nothing else of it. Any player, human or AI,
+## could strike a ball two and a half metres away that somebody else was
+## dribbling. Measured over a 40s match before this: 64 kicks, up to 2.54m
+## from the ball, and 14% of them struck by a player who was not the elected
+## carrier at all.
+##
+## Possession is the licence to kick; the ActionArea is only about reach.
+## The control-range ball is preferred because that is the one at this
+## player's feet, with the action-range reference kept as a fallback for the
+## frame or two where a touch has nudged the ball just outside the tighter
+## sensor while POSSESSION_GRACE still holds -- action_area being a strict
+## superset means this can only ever resolve to the same real ball.
+func _kickable_ball() -> RigidBody3D:
+	if not has_possession:
+		return null
+	# has_possession is per-player and two opponents can both hold it at
+	# once; only ONE of them actually has the ball, and PossessionManager is
+	# what decides which. Requiring that election closes the remaining gap
+	# where the loser of a contest could still play the ball (measured at 6%
+	# of kicks after the possession check alone). Falls back to the local
+	# flag when there is no manager, which is only ever the case in isolated
+	# unit tests.
+	if possession_manager != null and possession_manager.current_carrier != self:
+		return null
+	# v0.8.8: BOUNDING this fallback was tried and REVERTED -- recorded so it
+	# is not retried without the measurement that killed it.
+	#
+	# The concern is real on its face. The retain radius tops out at 1.90m
+	# (dribble_distance_sprint * CONTROL_RADIUS_LEASH_MARGIN, plus up to 0.35
+	# for defensive ability) while the ActionArea reaches 2.5m, so the band
+	# between them is strikeable by whoever is the elected carrier. Measured
+	# over a live match that is 1 kick in 39, at 2.40m against a 2.40m
+	# challenge range -- on the line rather than past it, with the mean kick
+	# struck from 0.99m.
+	#
+	# Bounding it at the control radius plus a ball diameter cost four
+	# DETERMINISTIC assertions in v0_8_3's kick instrumentation: shots stopped
+	# being recorded as shots at all, because a carrier who still legitimately
+	# holds the ball under POSSESSION_GRACE -- precisely the case this
+	# fallback exists for -- was left with nothing kickable and execute_shot
+	# returned early. The touch model needs this fallback WIDER than the
+	# sensor by construction, so bounding it against that sensor fights the
+	# design. Trading "shots are recorded correctly" for a boundary case
+	# sitting exactly on the limit is a bad trade.
+	return ball_in_control_range if ball_in_control_range else ball_in_action_range
+
+
 func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis: Vector3 = Vector3.ZERO, plan: TeamPlan = null) -> void:
-	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
+	var ball: RigidBody3D = _kickable_ball()
 	if ball == null:
 		return
 	var aim: Vector3 = _get_aim_direction()
@@ -1319,7 +1437,7 @@ func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis
 ## point. The human's charge-release path deliberately keeps the default:
 ## for them, "where I am facing/aiming" is the intent.
 func execute_shot(charge_ratio: float, aim_dir_override: Vector3 = Vector3.ZERO) -> void:
-	var ball: RigidBody3D = ball_in_action_range if ball_in_action_range else ball_in_control_range
+	var ball: RigidBody3D = _kickable_ball()
 	if ball == null:
 		return
 	var speed: float = lerp(shoot_min_speed, shoot_max_speed, clampf(charge_ratio, 0.0, 1.0))

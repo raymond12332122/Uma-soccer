@@ -111,6 +111,10 @@ const MIN_SHAPE_STATE_DWELL := 0.7
 ## (the two intents agree once the ball is genuinely underfoot) without
 ## eating the challenge itself.
 const PRESS_CONTACT_RANGE := 0.8
+## A nominated ball-winner sprints until they are this close to the ball --
+## see the sprint override. Far enough out that the race is decided, close
+## enough in that the final stride is controlled rather than an overshoot.
+const CONTEST_SPRINT_MIN_DISTANCE := 2.0
 # ---- Lane-aware off-ball positioning (see _lane_aware_target) ----
 ## Points sampled in a ring around the duty's own target. Kept small: this
 ## runs per supporting player per frame and the ring only has to find a
@@ -123,8 +127,8 @@ const LANE_SAMPLE_RADIUS_WIDE := 6.0
 ## Weights. Shape is deliberately comparable to the lane term so a player
 ## adjusts a couple of metres to show for the ball rather than deserting
 ## their tactical job to hunt space.
-const LANE_W_CLEAR := 1.0
-const LANE_W_OPEN := 0.55
+const LANE_W_CLEAR := 1.45
+const LANE_W_OPEN := 0.75
 const LANE_W_RANGE := 0.45
 const LANE_W_PROGRESS := 0.30
 const LANE_W_SHAPE := 0.75
@@ -452,6 +456,32 @@ static func update_player(
 		sprint_threshold *= lerp(1.0, TRANSITION_SPRINT_MULT, effective_plan.transition_urgency)
 	player.sprint_requested = player.global_position.distance_to(player.ai_smoothed_target) > sprint_threshold
 
+	# v0.8.8: you sprint to a 50/50 ball, all the way to it.
+	#
+	# The rule above stops sprinting once you are within sprint_threshold of
+	# your target, which is right for taking up a position -- you do not
+	# arrive at a shape marker at a full sprint. It is wrong for the one
+	# player nominated to WIN THE BALL: it made them jog the final few
+	# metres of every race, and since v0.8.8 requires real contact to take
+	# possession, those final metres now decide who gets it. Against a human
+	# who simply sprints at the ball at all times the AI therefore lost
+	# essentially every loose ball -- measured at 95-97% of all carrier time
+	# to the human, with the AI's challenges landing but never being
+	# converted into possession.
+	#
+	# Only while the ball is not already ours: a contester who has just won
+	# it is a carrier, and carriers choose their own pace.
+	#
+	# Not all the way to contact, though: sprinting while already on top of
+	# a moving ball just makes the player overshoot and correct, and that
+	# reads as oscillation (measured 0.179 direction changes per player per
+	# second against a 0.15 baseline, with the forward line otherwise
+	# healthy). The race is won in the approach, not the last stride.
+	if effective_plan != null and effective_plan.duty_of(player) == TeamPlan.Duty.CONTEST \
+		and not player.has_possession \
+		and player.global_position.distance_to(ball.global_position) > CONTEST_SPRINT_MIN_DISTANCE:
+		player.sprint_requested = true
+
 
 ## The PLAYER LEVEL of the hierarchy: turn one allocated duty into one
 ## position. Every branch derives from the same continuous inputs (the
@@ -515,8 +545,20 @@ static func _duty_target(
 			# Pressure against a carrier comes from getting tight, which the
 			# close-control geometry now allows (see BallContest's
 			# LOOSE_TOUCH_* terms), not from outguessing them.
+			#
+			# v0.8.8: clamped to the pitch. This was the one duty target
+			# still handed back raw, and the ball legitimately goes behind
+			# the goal line (that is what a goal is), so the player chasing
+			# it followed it out of play. Harmless while a contester
+			# approached at a jog and gave up; not harmless now that they
+			# sprint the whole way, which is how a rendered match went from
+			# zero frames behind a goal line to 430. Chase the ball to the
+			# line, not past it.
 			var closeness: float = clampf(1.0 - player.global_position.distance_to(ball_pos) / PRESS_CONTACT_RANGE, 0.0, 1.0)
-			return ball_pos.lerp(opponent_goal_pos, closeness)
+			var chase: Vector3 = ball_pos.lerp(opponent_goal_pos, closeness)
+			var clamped_chase: Vector3 = FormationManager.clamp_to_playable(chase)
+			clamped_chase.y = chase.y
+			return clamped_chase
 
 		TeamPlan.Duty.PRESS_SUPPORT:
 			# Second man: stand between the ball and our goal, cutting the
@@ -704,7 +746,14 @@ static func _lane_aware_target(
 		var to_spot: Vector3 = candidate - carrier_pos
 		to_spot.y = 0.0
 		var dist: float = to_spot.length()
-		if dist < 0.5:
+		# A support position closer to the carrier than the shortest pass the
+		# game will play is not an option at all -- it is a teammate standing
+		# on top of them. Rejecting those outright, rather than merely
+		# scoring them lower through LANE_W_RANGE, is what stops the lane
+		# search answering "where can I be passed to" with somewhere nobody
+		# could pass to: measured, a carrier's teammates were averaging
+		# 1.42-1.48 inside 5m of them against a 1.4 ceiling.
+		if dist < PassEvaluator.MIN_PASS_DISTANCE:
 			continue
 		var dir: Vector3 = to_spot / dist
 
@@ -781,6 +830,21 @@ static func _follow_up_target(player: FootballPlayer, ball: RigidBody3D, plan: T
 
 	# A pass: push on beyond where the ball now is, staying in our own lane
 	# so this is a supporting run rather than a chase after our own pass.
+	#
+	# v0.8.8: TRIED AND REVERTED -- recorded so it is not retried. Measured
+	# duty-by-duty, FOLLOW_UP was the largest single contributor to a
+	# carrier being crowded by their own side (0.46 teammates within 5m per
+	# frame, against 0.36 for MARK and 0.35 for COVER_SPACE), and the width
+	# below is the passer's LIVE z, which right after a short pass is
+	# roughly the receiver's z. Giving it _push_up_target's lane spread --
+	# formation channel, scaled away from the ball's channel, tanh-folded --
+	# looked like the obvious fix and made the metric WORSE, not better:
+	# crowding went to 1.85 teammates within 5m, above the entire 1.42-1.77
+	# range it had been sitting in. Spreading this run laterally moves the
+	# target away from the ball but not the player: the follow-up point is
+	# blended back toward formation shape by the decaying involvement
+	# window, so a target further from the player mostly means they spend
+	# the window travelling near the ball rather than arriving away from it.
 	var spot := Vector3(
 		ball_pos.x + fwd.x * TeamPlan.SUPPORT_SHORT_DISTANCE,
 		player.global_position.y,

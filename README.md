@@ -541,6 +541,211 @@ broken close control did constantly; and one asked the AI to pass while
 facing thirty metres of completely empty grass, with no opponent anywhere in
 the scene.
 
+### Possession validity: awareness is not contact (v0.8.8)
+
+The v0.8.7 playtest reported that the AI could steal, pass and shoot from
+distances it could not physically reach. That turned out to be two separate
+missing checks rather than a wrong number anywhere, and both were found by
+instrumenting a live match rather than by reading constants.
+
+**Passing and shooting asked nothing about possession.** `execute_pass` and
+`execute_shot` took the ball from `ball_in_action_range` -- the ActionArea,
+radius 2.5m -- and struck it. Nothing checked whether the player actually
+had the ball. Any player could play a ball somebody else was dribbling, from
+across a small crowd. Measured over a 40s match: 64 kicks, from up to
+**2.54m**, and **14% of them struck by a player who was not the carrier at
+all**. A kick now requires being the elected carrier: measured after, 0%
+from a non-carrier and no kick anywhere in a live match from beyond
+challenge range.
+
+**Possession was one flag doing two incompatible jobs.** `has_possession`
+answered "is the ball inside my ControlArea", and that radius has to be
+*wide* -- v0.8.7 sized it to contain the dribble leash, so a sprinting
+carrier does not knock the ball out of their own possession radius.
+`PossessionManager` then elected a carrier straight from that flag, so
+standing ~1.7m from a ball someone else was dribbling simply won it, with no
+contact and no challenge: 40% of all possession changes had no challenge
+built at all. The two jobs are now separated -- **acquire tight, retain
+loose**. Gaining the ball needs it genuinely at your feet
+(`POSSESSION_CONTACT_RADIUS`) or a won contest; keeping it still works out to
+the full control radius, so touch dribbling is untouched.
+
+That radius was **sized by sweeping it**, not chosen. At 0.95m nobody could
+collect a loose ball either and the ball ran ownerless for 83% of a match;
+ownership by radius measured 0.95m -> 17%, 1.20m -> 35%, 1.45m -> 32%,
+1.75m -> 46%. 1.20m is about one stride, well inside the 2.4m challenge
+range and well below the 1.61m-mean / 2.74m-max distances the bug was
+handing possession over at.
+
+**Nearly half the outfield defended during its own attack.** Every attacking
+slot count derives from `attack_intent`, which ramps over ~1.2s and only
+commits after a side has held the ball that long -- and with turnovers
+running at ~44/min it essentially never arrived. Measured *while a side had
+the ball*: `COVER_SPACE` 3.0 players and `MARK` 1.6, leaving the carrier
+about 3.6 teammates on any duty that offers a pass. Possession of the ball
+is a fact rather than a slewed opinion, so a side that holds it now floors a
+short outlet, a runner and a wide option regardless of intent. Offensive
+duties went **3.6 -> 6.6** players and the carrier's clear passing options
+**2.2 -> 3.1 per frame**.
+
+The floor keys off the STICKY possession signal, not the instantaneous
+carrier. Keyed on the latter first, it toggled with every bobble and churned
+duties at 0.341 changes per player per second against a 0.30 ceiling --
+which is precisely the oscillation this file warns about, reintroduced one
+layer up. On the sticky signal it measures 0.153.
+
+**You sprint to a 50/50 ball.** `sprint_requested` stops once a player is
+within `sprint_threshold` of their target, which is right for taking up a
+position and wrong for the one player nominated to win the ball: it made
+them jog the final few metres of every race. That was harmless while
+possession transferred at 1.7m by geometry, and became decisive the moment
+contact was required.
+
+**The ball was never heavy -- it was being hit too hard.** "Ball physics
+still feel heavy" sounds like a mass or damping problem, and it was neither:
+the ball's own properties are fine. `PassEvaluator` decides how hard to
+strike *every pass in the game* by inverting a fitted model of how far the
+ball rolls for a given launch speed. That model was fitted in v0.8.3 -- and
+v0.8.7 then changed the ball itself, from radius 0.35 to 0.16, which changes
+both its rolling inertia and how it meets the turf. Nothing re-fitted the
+model, so the equation the game used no longer described the ball the game
+actually had. Re-measured on the real pitch (`tests/diag_roll.gd`) the
+relationship is very cleanly linear, and the old constants were simply
+wrong -- launch 4.0 m/s rolls 5.85m, 6.0 rolls 9.20m, 9.0 rolls 14.27m,
+11.0 rolls 17.67m. `ROLL_PER_SPEED` / `ROLL_OFFSET` are re-fitted to
+1.689 / 0.924, which reproduces every sampled point to within 0.02m.
+
+The second half of it was the *overrun* -- the deliberate margin that lets a
+receiver run onto the ball rather than have it die at their feet. That was a
+MULTIPLIER (x1.35 of the pass length), so the further the ball was played
+the further past the receiver it ran. The thing being modelled is a couple
+of metres of pitch, and it is the same couple of metres whether the pass
+came from 4m or 14m, so it is now an absolute `OVERRUN_DISTANCE`. Together
+the two fixes make pass weight exact across the whole band:
+
+| wanted | before | after |
+|---|---|---|
+| 8m | 11.5m (+3.5) | 9.99m (+2.0) |
+| 12m | 17.0m (+5.0) | 13.99m (+2.0) |
+| 14m | 17.7m (+3.7, clamped at PASS_SPEED_MAX) | 16.00m (+2.0) |
+
+Every pass now overruns by exactly the designed 2.0m instead of by 2-5m
+growing with distance, and a 14m pass no longer clamps against the top of
+the speed band. This is also why the complaint survived v0.8.7's ball
+change: shrinking the ball was correct, and it silently invalidated the
+model that decided what to do with it.
+
+Three ideas were tried and **reverted with their results recorded** in the
+code. Giving `FOLLOW_UP` the lane treatment `_push_up_target` uses: measured
+duty-by-duty it was the largest single contributor to a carrier being
+crowded by their own side (0.46 teammates within 5m per frame against 0.36
+for `MARK`), and its width is the passer's live z, which right after a short
+pass is roughly the receiver's z -- so spreading it laterally looked
+obvious, and made the metric worse (1.85, above the entire 1.42-1.77 range
+it had been in). A longer post-tackle cooldown: challenge build-up collapsed
+from 0.80 to 0.37 while the possession share barely moved. And -- carried
+over from v0.8.7 -- having a presser aim ahead of the ball.
+
+**Measured in a live 45s match after the milestone** (`tests/PlaytestV088`,
+headless and rendered under Xvfb; the same script run against the v0.8.7
+build for comparison):
+
+| | v0.8.7 | v0.8.8 |
+|---|---|---|
+| kicks struck from, mean / furthest | -- | 0.99m / 2.32m (challenge range 2.4m) |
+| kicks by a player who was not the carrier | -- | 0 |
+| AI ball/carrier separation while dribbling | 1.27m | 0.94m |
+| AI passes per minute / shots per 45s | 90.7 / 3 | 50.7 / 14 |
+| turnovers per minute | -- | 8.0 |
+| human under active challenge while carrying | 16% | 52% |
+| mean pass launch speed | 7.4 m/s | 6.8 m/s |
+| human passes reaching the intended teammate | 28% | 28% |
+
+Two of those deserve a note. The pass rate FALLING while shots rise is the
+roll-model fix: play progresses instead of being recycled sideways. And the
+human pass completion is identical in both builds, because that figure is a
+property of the measurement -- the scripted human presses PASS twice a
+second while running at the ball, under challenge half the time -- and not
+of the passing code. It is reported here rather than quietly dropped
+precisely because it looks like a v0.8.8 problem until it is baselined.
+
+Both the regression suite and the playtest measure a kick's distance from
+the frame BEFORE it lands. Read on the frame the kick is detected, the ball
+has already been struck and has travelled -- a shot at ~22 m/s is 0.37m away
+one frame later -- which overstates hardest for the hardest kicks. That
+artifact alone reported 1 of 41 legal kicks as out of range in the suite,
+and a rendered playtest's furthest kick as 2.48m against a 2.4m limit.
+Neither was a real escape.
+
+Known issue, reported rather than tuned away: v0.8.5's assertion that
+reversals are not concentrated right after a phase change (<22%) fails on
+roughly one run in three. Keying the possession floors on a step rather than
+a ramp genuinely broke it -- 25%, 25%, 22% -- and ramping them recovered
+most of that. What is left is a metric whose spread is far wider than the
+difference between builds. Measured over six 60s matches each, plus four
+with v0.8.8's contest sprint disabled to test whether that change was
+responsible:
+
+| build | samples | mean | over 22 |
+|---|---|---|---|
+| v0.8.7 baseline | 22, 18, 14, 13, 17, 21, 14, 22, 19, 17, 17, 19 | 17.75 | 0 of 12 |
+| v0.8.8 | 21, 13, 24, 18, 13, 31 | 20.0 | 2 of 6 |
+| v0.8.8, contest sprint off | 10, 17, 10, 31 | 17.0 | 1 of 4 |
+
+Stated plainly: this is a real residual regression, not noise. The means are
+close, but the baseline never crosses the threshold in twelve runs and
+v0.8.8 crosses it in a third of them.
+
+The contest sprint was the obvious suspect -- the nominated ball-winner
+accelerates hard exactly when possession changes, which is precisely what
+this metric counts -- and it explains only about 3 points. The 31 outlier
+occurs with the sprint disabled too, so removing it neither explains nor
+fixes the excursions. The sprint is kept: it is what makes a player actually
+win a 50/50 ball once contact is required (see below), and giving that up
+would undo the central fix of this milestone to buy an unreliable pass on
+one assertion.
+
+What is left is most likely the same trade the whole milestone makes --
+possession now changes hands on real contact, so the moments when it changes
+are sharper events than they were when the ball simply drifted between
+players. Narrowing it further means changing how many players react to a
+loose ball, which is the AI-behaviour change this cleanup milestone
+deliberately did not make.
+
+Known issue, reported rather than tuned away: v0.8.7's assertion that "a
+useful share of in-range teammates have a clear passing lane (>50%)" now
+fails on most runs, at 39-56%. It is a RATIO, and this milestone grew its
+denominator. Measured over five 35s matches per build:
+
+| | v0.8.7 | v0.8.8 |
+|---|---|---|
+| teammates in passing range, per carrier frame | 3.67 | 5.43 |
+| of those, with a CLEAR lane (absolute) | 2.17 | 2.75 |
+| share with a clear lane (what the test asserts) | 59% | 51% |
+
+The carrier has **27% more clear options than before**, not fewer; there are
+simply 48% more teammates in range to divide them by. Carrier frames per
+match also rose from 442 to 634-1211, because contact-based possession means
+the ball is genuinely held rather than running ownerless. The v0.8.7
+assertion is left exactly as written -- editing a previous milestone's test
+to flatter this one's numbers would be worthless -- and v0.8.8's own suite
+asserts the absolute figure instead, which is the one that answers "do I
+have somebody to pass to".
+
+(v0.8.7's build is nearly deterministic on this metric, 2.17 on every run,
+because a ball that spends most of its time loose produces very similar
+matches. v0.8.8's spread is real football varying between matches.)
+
+Known issue, reported rather than tuned away: against a scripted bot that
+sprints at the ball 100% of the time and never passes, that bot now holds
+88-95% of carrier time. Requiring contact to take the ball inherently
+rewards whoever chases hardest, and only one AI player pursues at a time.
+The assertion was already unreliable before this milestone (it failed at 80%
+in v0.8.6 and ranged 44-96% in v0.8.7); v0.8.8 makes it fail consistently.
+Fixing it properly means changing how many players react to a loose ball,
+which is an AI-behaviour change this cleanup milestone deliberately did not
+make.
+
 ## 11v11 Match & Team Shape (v0.7)
 
 The match is now a full 11v11 on a data-driven 4-3-3: `FormationManager`
@@ -817,7 +1022,20 @@ godot --headless --path . tests/V0_8_2PlaytestFixesTest.tscn
 godot --headless --path . tests/V0_8_2OscillationTest.tscn
 godot --headless --path . tests/V0_8_3AIBehaviorTest.tscn
 godot --headless --path . tests/V0_8_4PlaytestFixesTest.tscn
+godot --headless --path . tests/V0_8_5PossessionPhaseTest.tscn
+godot --headless --path . tests/V0_8_6OffBallTest.tscn
+godot --headless --path . tests/V0_8_7FootballFeelTest.tscn
+godot --headless --path . tests/V0_8_8PossessionValidityTest.tscn
 ```
+
+The `tests/Diag*.tscn` scenes are measurement tools rather than tests: they
+print numbers and assert nothing. `DiagRoll` fits the ball roll model (run
+it after any change to the ball or the turf, and update `PassEvaluator`'s
+constants from its output -- the model going stale after v0.8.7 resized the
+ball is exactly the bug it now exists to catch), `DiagLaneShare` separates
+clear passing lanes from teammates merely in range, and `DiagCarrierPop`
+compares carrier-election definitions. `tests/PlaytestV08*.tscn` are
+rendered/headless play sessions that report measurements, not assertions.
 
 Each prints `[PASS]`/`[FAIL]` per check and exits non-zero on any failure.
 `team_system_test.gd` covers spawning, team assignment, formation

@@ -279,7 +279,20 @@ func _test_kick_instrumentation_records_intent() -> void:
 		kicker.last_kick_power < FootballPlayer.SHOT_SPEED_MIN)
 	var kicks_after_pass: int = kicker.kick_count
 
+	# v0.8.8: give the ball BACK before shooting it.
+	#
+	# Passing and shooting now require possession, so clearing the cooldown
+	# is no longer enough to fire a second kick: the pass above genuinely
+	# sent the ball away, and a player cannot shoot a ball they no longer
+	# have. That is precisely the rule this milestone exists to enforce, so
+	# the scenario is restored properly rather than the assertion relaxed --
+	# re-seat the ball at the kicker's feet and let the normal possession
+	# path pick it up again.
 	kicker._possession_cooldown_timer = 0.0
+	_teleport(ball, kicker.global_position + Vector3(0.5, 0.35, 0))
+	for i in range(10):
+		await get_tree().physics_frame
+	_check("The kicker has the ball back before shooting it", kicker.has_possession)
 	kicker.execute_shot(1.0)
 	_check("A shot is recorded as a shot", kicker.last_kick_kind == FootballPlayer.KickKind.SHOT)
 	_check("A shot records no pass target", kicker.last_kick_target == null)

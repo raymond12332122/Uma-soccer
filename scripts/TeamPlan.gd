@@ -103,6 +103,9 @@ const MAX_SUPPORT_WIDE := 2
 const MAX_SUPPORT_SHORT := 2
 const MAX_MARKERS := 3
 
+## The squad size those ceilings are written for -- see _squad_scaled.
+const NOMINAL_SQUAD := 11
+
 ## v0.8.6. Count the attacking ceilings above: 2+2+2 = six jobs for ten
 ## outfielders, so four to six players per side were ALWAYS leftovers, and
 ## the leftover job resolved to a near-static formation anchor. Measured in
@@ -117,10 +120,39 @@ const MAX_MARKERS := 3
 ## their team is on the ball.
 const MAX_PUSH_UP := 3
 
+## Floors applied while this side actually holds the ball, independent of
+## the slewed attack_intent -- see the allocation. Kept small on purpose:
+## a short outlet, one runner stretching the last line, and one wide option
+## is enough to give a carrier somewhere to play, without the whole side
+## abandoning shape the moment they win possession.
+## One short outlet, not two: at two, the floor both crowded the carrier
+## (1.48 teammates inside 5m, against a test that wants them given space)
+## and used up a player who would otherwise hold the attacking line, which
+## left the forward line hovering either side of its 80% requirement. One
+## guaranteed outlet is all a carrier needs to have somewhere to play.
+const MIN_SUPPORT_SHORT_WHEN_HOLDING := 1
+const MIN_SUPPORT_WIDE_WHEN_HOLDING := 1
+const MIN_RUN_BEHIND_WHEN_HOLDING := 1
+
+## Where on the holding ramp each of those floors arrives. Staggered so
+## settling on the ball does not reassign three players in the same frame --
+## see _holding_ramp and the allocation. At INTENT_SLEW_RATE the three land
+## roughly 0.16s apart.
+const FLOOR_RAMP_BEHIND := 0.25
+const FLOOR_RAMP_SHORT := 0.50
+const FLOOR_RAMP_WIDE := 0.75
+
 ## Ceiling on players simultaneously staying in a move they just played.
 ## Bounded only so a flurry of quick passes cannot hand the entire side a
 ## follow-up job at once; in practice one or two hold it.
-const MAX_FOLLOW_UP := 3
+## v0.8.8: 3 -> 2. The comment above says "in practice one or two hold it",
+## and that was true when it was written; v0.8.8's passing rate (49/min in a
+## rendered match) reaches the cap far more often. Measured as the largest
+## single contributor to teammates crowding their own carrier -- 0.46 of the
+## 1.33 average inside 5m -- because a follow-up player is by definition
+## still near where the ball was played from. Two keeps the give-and-go the
+## duty exists for.
+const MAX_FOLLOW_UP := 2
 
 ## An opponent must be at least this far into our half (measured toward our
 ## own goal from the halfway line) to be worth assigning a dedicated marker.
@@ -174,6 +206,13 @@ const SLOW_BALL_SMOOTH_TIME := 0.9
 
 var carrier: FootballPlayer = null
 var we_have_ball: bool = false
+## Sticky "this is our possession" -- see the assignment in update() and the
+## support floors in the allocation.
+var _settled_possession_ours: bool = false
+## 0..1 ramp toward "we are holding the ball", slewed at INTENT_SLEW_RATE so
+## the possession floors migrate in and out instead of switching on one
+## frame -- see where it is updated.
+var _holding_ramp: float = 0.0
 ## The opponents' deepest outfield player (their last line). RUN_BEHIND
 ## targets are anchored just beyond this rather than at a fixed distance,
 ## so a run in behind is actually in behind something.
@@ -239,6 +278,33 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	# team" used anywhere in slot allocation -- see the comment on the slot
 	# counts below. attack_intent, which is slewed, is the only phase input.
 	we_have_ball = carrier != null and carrier.team_id == team_id
+	# v0.8.8: the STICKY answer to "is this our possession", for the support
+	# floors in the allocation below. It has to be this signal and not
+	# `we_have_ball`: the instantaneous one drops out every time the ball
+	# bobbles loose, so a floor keyed on it toggled the support slots on and
+	# off with it and churned duties -- measured at 0.341 changes per player
+	# per second against a 0.30 ceiling, which is the very oscillation the
+	# comment above warns about, reintroduced one layer up.
+	_settled_possession_ours = possession.last_team_with_possession == team_id
+	# ...and the floors it drives RAMP rather than switch.
+	#
+	# v0.8.8, second correction. Making the signal sticky stopped it
+	# flapping, but it is still a STEP: on the frame possession settles, all
+	# three floors appear at once, several players are reassigned in the
+	# same instant, and each of their targets jumps several metres. That is
+	# a whole-team about-face triggered by a phase change -- precisely what
+	# v0.8.5 exists to prevent, and it measured exactly there: reversals
+	# landing within half a second of a phase change rose to 25%, 25%, 22%
+	# against a 22% ceiling the v0.8.7 build cleared on every run.
+	#
+	# The fix is the one this file already uses everywhere else: slew, do
+	# not switch (see INTENT_SLEW_RATE). The floors are gated on a ramp at
+	# the same rate, and each floor is gated at a DIFFERENT point on it, so
+	# the three slots arrive spread across the ramp instead of together --
+	# the same staggering _slots() gets for free by rounding different
+	# ceilings against a moving weight.
+	_holding_ramp = move_toward(
+		_holding_ramp, 1.0 if _settled_possession_ours else 0.0, INTENT_SLEW_RATE * delta)
 
 	var previous: Dictionary = duties
 	# Keep the previous marking assignments too -- the retention check in
@@ -329,15 +395,84 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	_fill_follow_up(available, ball)
 
 	var attacking_weight: float = clampf((attack_intent + 1.0) * 0.5, 0.0, 1.0)
-	_fill(available, Duty.SUPPORT_SHORT, _slots(MAX_SUPPORT_SHORT, attacking_weight), previous, ball, opponents)
-	_fill(available, Duty.RUN_BEHIND, _slots(MAX_RUN_BEHIND, attacking_weight), previous, ball, opponents)
-	_fill(available, Duty.SUPPORT_WIDE, _slots(MAX_SUPPORT_WIDE, attacking_weight), previous, ball, opponents)
+
+	# v0.8.8: a side that ACTUALLY HAS THE BALL always offers a couple of
+	# outlets, whatever the slewed intent currently believes.
+	#
+	# This is the root cause of "teammates move but I have nobody to pass
+	# to". Every attacking slot count is derived from attack_intent, which
+	# ramps over ~1.2s and only reaches full commitment after a side has
+	# held the ball for that long. With turnovers running at ~44/min the
+	# intent essentially never arrives: measured while a side had the ball,
+	# attacking_weight sat around 0.47, which allocated COVER_SPACE to 3.0
+	# players and MARK to 1.6 -- nearly half the outfield holding defensive
+	# shape during their own attack, leaving the carrier ~3.6 teammates on
+	# any duty that offers a pass at all.
+	#
+	# Possession of the ball is a FACT, not a slewed opinion, so the floor
+	# below keys off it directly. It is deliberately small: the brief warns
+	# against everyone running forward, and this only guarantees a short
+	# outlet and one runner -- the rest of the shape still follows intent.
+	var holding: bool = _settled_possession_ours
+	var short_slots: int = _slots(_squad_scaled(MAX_SUPPORT_SHORT, players.size()), attacking_weight)
+	var wide_slots: int = _slots(_squad_scaled(MAX_SUPPORT_WIDE, players.size()), attacking_weight)
+	var behind_slots: int = _slots(_squad_scaled(MAX_RUN_BEHIND, players.size()), attacking_weight)
+	if holding:
+		# The floor is a guarantee sized for a real side, and it has to
+		# SCALE with the squad rather than be an absolute count.
+		#
+		# `AIController.update_player` builds a TRANSIENT one-player plan
+		# whenever a caller supplies no team plan -- unit tests and the
+		# debug overlay both do -- so this allocation also runs for pools of
+		# one or two. An absolute floor there is not a guarantee, it is
+		# conscription: it put the only available player on a run in behind
+		# no matter who they were, a covering centre-back included.
+		# Measured in v0_7_match_test that turned "a non-challenger defender
+		# falls back into its own shape" into "it advances up the pitch",
+		# and flattened a winger's and a central midfielder's support onto
+		# the same point -- RUN_BEHIND takes its width from the formation
+		# slot the caller supplies, and both were supplied the same one, so
+		# conscripting both into it erased the role difference the shape
+		# system exists to produce.
+		#
+		# Budgeted at a third of the SQUAD (not of the remaining pool, which
+		# varies with how many are already on a contest or a follow-up), a
+		# real eleven still gets all three outlets exactly as before, and a
+		# pool too small to spare anyone gets none.
+		#
+		# Each floor is also gated at a DIFFERENT point on the holding ramp
+		# (see _holding_ramp), so the three of them arrive spread across it
+		# rather than all on the frame possession settles. Depth first,
+		# because it is the scarcest job and the one the fill order below
+		# already prioritises; the wide option last, because it is the one a
+		# side can most afford to be late to.
+		var budget: int = players.size() / 3
+		var b: int = mini(MIN_RUN_BEHIND_WHEN_HOLDING, budget) if _holding_ramp >= FLOOR_RAMP_BEHIND else 0
+		behind_slots = maxi(behind_slots, b)
+		budget -= b
+		var s: int = mini(MIN_SUPPORT_SHORT_WHEN_HOLDING, budget) if _holding_ramp >= FLOOR_RAMP_SHORT else 0
+		short_slots = maxi(short_slots, s)
+		budget -= s
+		if _holding_ramp >= FLOOR_RAMP_WIDE:
+			wide_slots = maxi(wide_slots, mini(MIN_SUPPORT_WIDE_WHEN_HOLDING, budget))
+	# RUN_BEHIND is filled FIRST. Slots are filled in order from a shrinking
+	# pool, so whichever duty goes first gets the pick of the squad -- and
+	# the best candidate for a short outlet and the best candidate for a run
+	# in behind are often the same advanced player. With SUPPORT_SHORT
+	# first, the floors above consumed the forwards into a duty that sits
+	# ~9m off the ball, and the attacking line dropped with them: the share
+	# of frames where the forwards held a clearly advanced line fell to 73%
+	# against an 80% requirement. Depth is the scarcer, more specialised
+	# job, so it picks first; a short outlet can be filled by a midfielder.
+	_fill(available, Duty.RUN_BEHIND, behind_slots, previous, ball, opponents)
+	_fill(available, Duty.SUPPORT_SHORT, short_slots, previous, ball, opponents)
+	_fill(available, Duty.SUPPORT_WIDE, wide_slots, previous, ball, opponents)
 	_assign_markers(available, opponents, previous, previous_marks,
 		_slots(MAX_MARKERS, 1.0 - attacking_weight))
 	# 4b. Off-ball advancement -- see MAX_PUSH_UP. Counted from the same
 	#     slewed intent as every other slot, so it migrates over the ramp
 	#     rather than switching on the frame the phase changes.
-	_fill(available, Duty.PUSH_UP, _slots(MAX_PUSH_UP, attacking_weight), previous, ball, opponents)
+	_fill(available, Duty.PUSH_UP, _slots(_squad_scaled(MAX_PUSH_UP, players.size()), attacking_weight), previous, ball, opponents)
 
 	# 5. Everyone left holds shape. This is a real job, not a leftover --
 	#    see AIController's COVER_SPACE target, which stays ball-relative
@@ -370,6 +505,31 @@ func _fill_follow_up(available: Array, _ball: RigidBody3D) -> void:
 ## both changing at the same instant.
 static func _slots(max_slots: int, weight: float) -> int:
 	return int(round(max_slots * clampf(weight, 0.0, 1.0)))
+
+
+## The slot ceilings above are absolute counts describing a FULL SIDE: "two
+## runners in behind" is a rule about an eleven. This scales them to the
+## squad actually present, so the proportion they express survives a smaller
+## pool.
+##
+## v0.8.8. `AIController.update_player` builds a TRANSIENT plan whenever a
+## caller supplies no team plan -- unit tests and the debug overlay both do
+## -- and that plan contains one or two players. Against a pool of two,
+## "up to two runners in behind" is not a ceiling at all: it conscripts
+## everybody. Measured in v0_7_match_test, that put a covering centre-back
+## on a run in behind (the assertion that a non-challenger defender falls
+## back into its own shape), and flattened a winger's and a central
+## midfielder's support onto the same point, because RUN_BEHIND takes its
+## width from the caller's formation slot and the test deliberately supplies
+## both the same slot to isolate role from position.
+##
+## Floored rather than rounded, so a duty only exists once the squad can
+## genuinely spare somebody for it. A full side is unchanged by design:
+## 11 players returns each ceiling untouched.
+static func _squad_scaled(max_slots: int, squad: int) -> int:
+	if squad >= NOMINAL_SQUAD:
+		return max_slots
+	return int(floor(float(max_slots) * float(squad) / float(NOMINAL_SQUAD)))
 
 
 func _assign(player: FootballPlayer, duty: int) -> void:

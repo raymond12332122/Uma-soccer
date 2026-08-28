@@ -108,11 +108,43 @@ const BLOCKED_LANE_PENALTY_AIMED := 0.18
 ## Ball roll model, fitted to measured data (see the class doc):
 ##   roll_distance ~= ROLL_PER_SPEED * launch_speed - ROLL_OFFSET
 ## Inverted below to solve for the launch speed a given pass needs.
-const ROLL_PER_SPEED := 1.66
-const ROLL_OFFSET := 1.4
+##
+## v0.8.8: RE-FITTED, and this was the root cause of "the ball physics still
+## feel heavy". The ball is not heavy -- it was being struck far too hard on
+## every pass in the game. These constants were fitted in v0.8.3, and v0.8.7
+## then changed the ball itself (radius 0.35 -> 0.16, which changes both its
+## rolling inertia and its contact with the turf). Nothing re-fitted the
+## model afterwards, so the equation the game used to decide pass weight no
+## longer described the ball the game actually had.
+##
+## Re-measured across the pass band on the real pitch (tests/diag_roll.gd).
+## The relationship is very cleanly linear -- this fit reproduces every
+## sampled point to within 0.02m:
+##   launch  4.0 m/s -> 5.85m     launch  9.0 m/s -> 14.27m
+##   launch  6.0 m/s -> 9.20m     launch 11.0 m/s -> 17.67m
+##
+## The old error was one-directional and grew with distance, which is why
+## longer passes read as launches: under the previous constants a wanted 8m
+## pass actually travelled 11.5m and a wanted 12m pass travelled 17.0m --
+## overshooting by 3.5m and 5.0m, on top of the deliberate overrun.
+const ROLL_PER_SPEED := 1.689
+const ROLL_OFFSET := 0.924
 ## Aim the ball to roll somewhat past the receiver so it arrives with pace
 ## still on it rather than dying at their feet.
-const OVERRUN_FACTOR := 1.35
+##
+## v0.8.8: this is now an ABSOLUTE distance, not a multiplier, and that is
+## the second half of "long passes launch". The thing being modelled here --
+## letting the receiver run onto the ball rather than having it stop dead --
+## is a couple of metres of pitch, and it is the same couple of metres
+## whether the pass came from 4m or 14m. As a fraction it was neither: with
+## the roll model corrected, a 4m pass still overran by 1.4m but a 12m pass
+## overran by 4.2m, so the further the ball was played the more it ran away
+## from the man it was played to. Measured against the re-fitted model, an
+## absolute overrun drops a 12m pass from 10.14 to 8.83 m/s and leaves a 4m
+## pass essentially untouched -- long balls settle, short ones do not
+## deaden. It also brings MAX_PASS_DISTANCE back inside the speed band: a
+## 14m pass no longer clamps at PASS_SPEED_MAX.
+const OVERRUN_DISTANCE := 2.0
 ## Ceiling on how far a moving receiver may be led, as a fraction of the
 ## pass distance -- see _lead_point.
 const MAX_LEAD_FRACTION := 0.35
@@ -238,7 +270,7 @@ static func best_option(
 ## Launch speed needed for the ball to reach `distance` with pace still on
 ## it. Inverse of the measured roll model.
 static func speed_for_distance(distance: float) -> float:
-	var wanted_roll: float = distance * OVERRUN_FACTOR
+	var wanted_roll: float = distance + OVERRUN_DISTANCE
 	var speed: float = (wanted_roll + ROLL_OFFSET) / ROLL_PER_SPEED
 	return clampf(speed, PASS_SPEED_MIN, PASS_SPEED_MAX)
 

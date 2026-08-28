@@ -78,6 +78,14 @@ const CHALLENGE_DECAY_RATE := 1.0
 ## dribble spring is gated on this same cooldown, so for this window the
 ## ball is genuinely free rather than being pulled straight back to the
 ## previous carrier's feet.
+## v0.8.8: 0.9 was tried here and REVERTED, so the negative result is
+## recorded rather than the idea being silently re-attempted. The reasoning
+## was that a tackled player recovering the ball within a quarter-second
+## makes the tackle pointless. Raising it did not help and cost something
+## real: a ball-chasing bot's possession share barely moved (97% -> 95%)
+## while challenge build-up collapsed (peaks 0.80 -> 0.37-0.41), because
+## during the longer window nobody is contesting at all. The recovery window
+## is not what decides that duel.
 const TACKLE_DISPOSSESS_COOLDOWN := 0.45
 
 ## Speed the ball is knocked away at when a tackle lands. Small on purpose
