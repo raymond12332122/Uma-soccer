@@ -213,7 +213,24 @@ func _test_ai_passes_when_out_of_range_with_open_teammate() -> void:
 	add_child(mate)
 	carrier.apply_player_data(carrier_pair[1])
 	mate.apply_player_data(mate_pair[1])
-	carrier.set_match_context([carrier, mate], [])
+
+	# v0.8.7: there is now an opponent in front of the carrier. Previously
+	# this scene had NO opponents at all, which meant _forward_space scored
+	# maximal and CARRY_SPACE_BONUS pushed the pass threshold to ~1.00 -- the
+	# AI was being asked to pass while facing thirty metres of empty grass,
+	# which is not what "prefers a useful pass over blindly dribbling" means
+	# and is not what a footballer does. The assertion only ever passed
+	# because its old detector counted the carrier LOSING the ball as a pass,
+	# and pre-v0.8.7 close control lost it constantly.
+	#
+	# The opponent is placed ahead of the carrier's run but well off the line
+	# to the teammate (3m clear of a 1.5m LANE_BLOCK_RADIUS), so the pass is
+	# genuinely the better option and the lane to it is genuinely open.
+	var opp_pair := _make_player("pass_opp", 1, Vector3(-11.0, 1, -3.0))
+	var opp: FootballPlayer = opp_pair[0]
+	add_child(opp)
+	opp.apply_player_data(opp_pair[1])
+	carrier.set_match_context([carrier, mate], [opp])
 
 	var pm := PossessionManager.new()
 	add_child(pm)
@@ -228,15 +245,25 @@ func _test_ai_passes_when_out_of_range_with_open_teammate() -> void:
 
 	var opponent_goal := Vector3(26, 1, 0)
 	var own_goal := Vector3(-26, 1, 0)
+	# v0.8.7: detect an actual PASS rather than inferring one from "the
+	# carrier no longer has the ball and the ball is moving". That proxy was
+	# satisfied by the carrier simply LOSING the ball, which the pre-v0.8.7
+	# close control did constantly -- the ball was jammed against the
+	# carrier's capsule and squirted away on its own (measured then:
+	# possession survived 31 of 120 frames at a walking pace). So the
+	# assertion could pass without a pass ever being played. Now that a
+	# carrier keeps the ball, the only honest signal is the kick itself.
 	var passed := false
+	var kicks_before: int = carrier.kick_count
 	for i in range(240):
-		AIController.update_player(carrier, ball, pm, [carrier, mate], [], own_goal, opponent_goal, opponent_goal, null, null, 1.0 / 60.0)
+		AIController.update_player(carrier, ball, pm, [carrier, mate], [opp], own_goal, opponent_goal, opponent_goal, null, null, 1.0 / 60.0)
 		await get_tree().physics_frame
-		if not carrier.has_possession and ball.linear_velocity.length() > 0.3:
+		if carrier.kick_count > kicks_before and carrier.last_kick_kind == FootballPlayer.KickKind.PASS:
 			passed = true
 			break
 	_check("An AI player far from goal with an open teammate ahead eventually passes rather than holding the ball forever", passed)
 
+	opp.queue_free()
 	carrier.queue_free()
 	mate.queue_free()
 	ball.queue_free()
@@ -290,7 +317,20 @@ func _test_ai_dribbles_when_no_good_option() -> void:
 		var speed: float = ball.linear_velocity.length()
 		max_frame_delta = maxf(max_frame_delta, speed - prev_speed)
 		prev_speed = speed
-	_check("With no shot and no pass option, the AI never kicks the ball away (largest single-tick speed jump %.2f, well under any kick impulse)" % max_frame_delta, max_frame_delta < 2.0)
+	# v0.8.7: the threshold is now anchored to the constant that actually
+	# separates the two behaviours instead of a bare 2.0. Close control is no
+	# longer a continuous steering force whose per-tick effect is tiny by
+	# construction -- it is a series of discrete TOUCHES, each a real
+	# impulse -- so "a single tick changed the ball's speed" stopped being
+	# evidence of a kick on its own. What still distinguishes them is size:
+	# a touch is capped (FootballPlayer.TOUCH_MAX_DELTA_V) strictly below the
+	# slowest pass the game can play, so a jump at or above PASS_SPEED_MIN is
+	# a kick and anything under it is a dribble. That is the property this
+	# assertion was always reaching for.
+	_check("With no shot and no pass option, the AI never kicks the ball away (largest single-tick speed jump %.2f, under the %.1f m/s that would make it a pass)"
+		% [max_frame_delta, PassEvaluator.PASS_SPEED_MIN], max_frame_delta < PassEvaluator.PASS_SPEED_MIN)
+	_check("...and a dribble touch is bounded below the weakest pass by construction",
+		FootballPlayer.TOUCH_MAX_DELTA_V < PassEvaluator.PASS_SPEED_MIN)
 
 	carrier.queue_free()
 	ball.queue_free()

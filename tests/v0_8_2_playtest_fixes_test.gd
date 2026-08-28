@@ -70,7 +70,16 @@ func _test_close_control_then_loosens_while_sprinting() -> void:
 	# 0.8299m > 0.8298m, with both figures pinned at the distance where the
 	# two collision shapes touch), so it was not measuring the leash at all.
 	# Same assertion, sampled where the quantity it names actually exists.
-	player.move_input = Vector2(0, 1)
+	#
+	# v0.8.7: sprint along the LONG axis (+x). Sprinting in +z ran the player
+	# into the touchline collider at z~11 after about 90 frames: they stopped
+	# dead, and the ball -- correctly, now that it is knocked ahead rather
+	# than dragged along -- rolled on past them. The 120-frame sample was
+	# therefore taken with the player pinned against a wall, measuring a ball
+	# overrunning a STATIONARY player rather than the sprint leash this
+	# assertion is named for. Traced mid-run on the long axis, the ball
+	# tracks the sprinter at ~0.5m with possession held the whole way.
+	player.move_input = Vector2(1, 0)
 	player.sprint_requested = true
 	for i in range(120):
 		await get_tree().physics_frame
@@ -202,12 +211,22 @@ func _test_transition_defense_after_turnover() -> void:
 	_check("Home has the ball first", pm.last_team_with_possession == 0)
 
 	# Turnover: the ball moves to the away player instead, and stays there.
-	# Held past PossessionManager.TEAM_POSSESSION_CONFIRM_TIME -- as of the
-	# v0.8.2 oscillation hotfix a turnover must be sustained to count, so
-	# that a glancing touch can't swing the whole team's shape (the ball is
-	# re-pinned each frame here because a single teleport would drift out
-	# of the away player's control radius before the confirm time elapses).
-	for i in range(30):
+	# The turnover must be SUSTAINED to count (v0.8.2 oscillation hotfix), so
+	# that a glancing touch can't swing the whole team's shape; the ball is
+	# re-pinned each frame because a single teleport would drift out of the
+	# away player's control radius before the confirm time elapses.
+	#
+	# v0.8.7: held long enough for a CONTESTED confirm rather than a settled
+	# one. The two players end up within CONTEST_RANGE of the same ball here,
+	# so the v0.8.5 possession model requires CONFIRM_TIME_CONTESTED (0.85s)
+	# rather than CONFIRM_TIME_SETTLED (0.30s) -- 30 frames was half of what
+	# this scenario actually needs. (The comment here also named
+	# TEAM_POSSESSION_CONFIRM_TIME, a constant that stopped existing when the
+	# 5-state model landed.) Traced directly: the away player is elected
+	# carrier from frame 6 and possessing_team reads 1 throughout; only the
+	# sticky team signal was still waiting.
+	var confirm_frames: int = int(ceil(PossessionManager.CONFIRM_TIME_CONTESTED * 60.0)) + 20
+	for i in range(confirm_frames):
 		PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), away_p.global_position + Vector3(0.4, 0.3, 0)))
 		PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
 		await get_tree().physics_frame

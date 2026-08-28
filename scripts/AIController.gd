@@ -111,6 +111,34 @@ const MIN_SHAPE_STATE_DWELL := 0.7
 ## (the two intents agree once the ball is genuinely underfoot) without
 ## eating the challenge itself.
 const PRESS_CONTACT_RANGE := 0.8
+# ---- Lane-aware off-ball positioning (see _lane_aware_target) ----
+## Points sampled in a ring around the duty's own target. Kept small: this
+## runs per supporting player per frame and the ring only has to find a
+## nearby opening, not survey the pitch.
+const LANE_SAMPLE_COUNT := 8
+const LANE_SAMPLE_RADIUS := 3.2
+## Second, wider ring -- see _lane_aware_target for why one ring cannot
+## clear a screening opponent.
+const LANE_SAMPLE_RADIUS_WIDE := 6.0
+## Weights. Shape is deliberately comparable to the lane term so a player
+## adjusts a couple of metres to show for the ball rather than deserting
+## their tactical job to hunt space.
+const LANE_W_CLEAR := 1.0
+const LANE_W_OPEN := 0.55
+const LANE_W_RANGE := 0.45
+const LANE_W_PROGRESS := 0.30
+const LANE_W_SHAPE := 0.75
+const LANE_W_CROWD := 0.60
+## Teammates nearer than this to a candidate count as crowding it.
+const LANE_CROWD_RADIUS := 5.0
+## How far back down the pitch a lane adjustment may take a player from the
+## position their duty chose. Small: coming a little short to show for the
+## ball is football, dropping out of the attacking line is not.
+const LANE_MAX_RETREAT := 1.5
+## Preference for the candidate nearest where the player is already going.
+## Comparable to the lane term itself, so a genuinely better opening still
+## wins -- this only settles ties and stops frame-to-frame flip-flopping.
+const LANE_W_STICKY := 0.85
 ## Sprint threshold multiplier during a transition -- react with urgency
 ## to a turnover in either direction rather than casually strolling back.
 const TRANSITION_SPRINT_MULT := 0.5
@@ -469,6 +497,24 @@ static func _duty_target(
 			# entirely different from the carrier's "take it forward". The
 			# two intents are blended continuously by closeness so they
 			# agree at contact and there is nothing to flip between.
+			#
+			# v0.8.7: DELIBERATELY still aims at the ball itself, not at an
+			# interception point ahead of it. Leading the ball was tried here
+			# and measurably made the game worse, so the negative result is
+			# recorded rather than the idea silently re-attempted:
+			#
+			# A dribbled ball carries the carrier's own velocity, so leading
+			# it by up to half a second put the target 3-4m ahead of the
+			# ball -- past the carrier entirely. Defenders ran around their
+			# man instead of engaging him, and because a dribbler changes
+			# direction constantly the prediction was wrong as often as it
+			# was right. Measured over three matches: turnovers collapsed
+			# from 54/min to 12/min and a human carrier's possession share
+			# went from 44% to 96%.
+			#
+			# Pressure against a carrier comes from getting tight, which the
+			# close-control geometry now allows (see BallContest's
+			# LOOSE_TOUCH_* terms), not from outguessing them.
 			var closeness: float = clampf(1.0 - player.global_position.distance_to(ball_pos) / PRESS_CONTACT_RANGE, 0.0, 1.0)
 			return ball_pos.lerp(opponent_goal_pos, closeness)
 
@@ -501,7 +547,8 @@ static func _duty_target(
 			var dir: Vector3 = _safe_normalize(_safe_normalize(from_ball) - fwd * SUPPORT_SHORT_BACK_BIAS)
 			var spot: Vector3 = ball_pos + dir * TeamPlan.SUPPORT_SHORT_DISTANCE
 			spot.y = shape.y
-			return shape.lerp(spot, 0.7)
+			return _lane_aware_target(player, shape.lerp(spot, 0.7), plan,
+				player.opponents, player.teammates, opponent_goal_pos)
 
 		TeamPlan.Duty.SUPPORT_WIDE:
 			# Stretch the pitch. Width comes from the player's own formation
@@ -519,7 +566,8 @@ static func _duty_target(
 				ball_pos.x + fwd.x * 3.0,
 				shape.y,
 				side * FormationManager.FIELD_HALF_WIDTH * SUPPORT_WIDE_TOUCHLINE)
-			return shape.lerp(spot, 0.65)
+			return _lane_aware_target(player, shape.lerp(spot, 0.65), plan,
+				player.opponents, player.teammates, opponent_goal_pos)
 
 		TeamPlan.Duty.RUN_BEHIND:
 			# Get beyond their last line, but never further ahead of the
@@ -531,6 +579,15 @@ static func _duty_target(
 			# Never run past the goal line itself.
 			var limit: float = opponent_goal_pos.x - fwd.x * 2.0
 			x = minf(x, limit) if fwd.x > 0.0 else maxf(x, limit)
+			# Deliberately NOT lane-refined. A run in behind is about DEPTH:
+			# the whole job is to get beyond the opponent's last line and
+			# stretch it. Searching a ring around that point for a cleaner
+			# passing angle trades the one thing the duty exists to produce
+			# for a marginal lane, and measured as a paired A/B it did
+			# exactly that -- with every support duty refined, the share of
+			# frames where the forwards held a clearly advanced line fell
+			# from 90% to 71%, while the lane gain came almost entirely from
+			# the other three duties.
 			return Vector3(x, shape.y, shape.z)
 
 		TeamPlan.Duty.FOLLOW_UP:
@@ -545,7 +602,9 @@ static func _duty_target(
 			return shape.lerp(follow_up, clampf(player.post_action_involvement(), 0.0, 1.0))
 
 		TeamPlan.Duty.PUSH_UP:
-			return _push_up_target(player, shape, ball_pos, plan, opponent_goal_pos)
+			return _lane_aware_target(player,
+				_push_up_target(player, shape, ball_pos, plan, opponent_goal_pos), plan,
+				player.opponents, player.teammates, opponent_goal_pos)
 
 		TeamPlan.Duty.MARK:
 			var opponent: FootballPlayer = plan.mark_target_of(player)
@@ -558,6 +617,147 @@ static func _duty_target(
 			return shape.lerp(spot, 0.7)
 
 	return _cover_space_target(shape, ball_pos, own_goal_pos, plan, category)
+
+
+## v0.8.7: turn a support duty's GEOMETRIC target into a target the carrier
+## could actually pass to.
+##
+## This is the root cause of the report that teammates move constantly but
+## never offer a real option: not one support duty had any concept of a
+## passing lane. SUPPORT_SHORT, SUPPORT_WIDE, PUSH_UP and RUN_BEHIND each
+## derived a point from formation slot, ball position and the forward axis,
+## and then went and stood on it -- whether or not an opponent happened to
+## be planted between that point and the ball. Measured over a live match,
+## 47% of teammates who were inside passing range of the carrier had a
+## blocked lane, so roughly half the "options" on screen were not options.
+##
+## The fix keeps the duty geometry as the intent and searches a small ring
+## around it for the nearest spot that is genuinely available, scoring:
+##   - is the lane from the carrier clear
+##   - how much space the spot has
+##   - whether it sits in a sensible passing range
+##   - whether it progresses play
+##   - how far it drags the player off their tactical shape
+##   - how close it is to another teammate (do not bunch)
+## Shape is weighted heavily enough that a player nudges a couple of metres
+## to open a lane rather than abandoning their job to chase space.
+## Test hook: lets a diagnostic run the same match with the refinement off,
+## so its effect can be measured as a paired A/B rather than inferred from
+## one run of a noisy live-match statistic. Always true in normal play.
+static var lane_refinement_enabled := true
+
+
+static func _lane_aware_target(
+	player: FootballPlayer,
+	base_target: Vector3,
+	plan: TeamPlan,
+	opponents: Array,
+	teammates: Array,
+	opponent_goal_pos: Vector3
+) -> Vector3:
+	var carrier: FootballPlayer = plan.carrier
+	if not lane_refinement_enabled:
+		return FormationManager.clamp_to_playable(base_target)
+	if carrier == null or not is_instance_valid(carrier) or carrier == player:
+		# Still clamped: with nobody on the ball there is no lane to judge,
+		# but a duty can hand us a point outside the pitch and returning it
+		# raw would send a supporting player behind the goal.
+		return FormationManager.clamp_to_playable(base_target)
+	var carrier_pos: Vector3 = carrier.global_position
+
+	# The duty's own target is always a candidate, but it is clamped first:
+	# a duty may hand us a point off the pitch, and returning it unchanged
+	# would let a supporting player run behind the goal.
+	var anchor: Vector3 = FormationManager.clamp_to_playable(base_target)
+	anchor.y = base_target.y
+	var best: Vector3 = anchor
+	var best_score: float = -INF
+	var fwd: Vector3 = plan.forward_axis()
+
+	# Two rings. One ring is not enough to get out from behind a screen:
+	# stepping 3.2m aside from a 9m target only swings the lane about 19
+	# degrees, and an opponent halfway along it stays within the 1.5m that
+	# counts as blocking. The wider ring is what actually finds daylight;
+	# the shape penalty below still prefers the nearer one when both work.
+	var total: int = LANE_SAMPLE_COUNT * 2
+	for i in range(total + 1):
+		var candidate: Vector3 = anchor
+		if i > 0:
+			var idx: int = i - 1
+			var radius: float = LANE_SAMPLE_RADIUS if idx < LANE_SAMPLE_COUNT else LANE_SAMPLE_RADIUS_WIDE
+			var angle: float = TAU * float(idx % LANE_SAMPLE_COUNT) / float(LANE_SAMPLE_COUNT)
+			candidate = anchor + Vector3(cos(angle), 0.0, sin(angle)) * radius
+			candidate = FormationManager.clamp_to_playable(candidate)
+		candidate.y = base_target.y
+		if FormationManager.is_behind_goal_line(candidate):
+			continue
+		# Never RETREAT to find a lane. Coming short or moving across to
+		# show for the ball is fine; dropping in behind the position the
+		# duty assigned is not, and for a striker on a run in behind it
+		# undoes the whole job. The wide ring in particular could pull a
+		# forward six metres back down the pitch, which measurably cost the
+		# attacking line: forwards held a clearly advanced line on 75% of
+		# attacking frames against a required 80%.
+		if fwd.dot(candidate - anchor) < -LANE_MAX_RETREAT:
+			continue
+
+		var to_spot: Vector3 = candidate - carrier_pos
+		to_spot.y = 0.0
+		var dist: float = to_spot.length()
+		if dist < 0.5:
+			continue
+		var dir: Vector3 = to_spot / dist
+
+		var score := 0.0
+		# A clear lane is the whole point of the exercise.
+		if not PassEvaluator._lane_blocked(carrier_pos, dir, dist, opponents):
+			score += LANE_W_CLEAR
+		# Space of our own, so the pass can actually be received.
+		score += LANE_W_OPEN * PassEvaluator._openness(candidate, opponents)
+		# Inside a range a pass can be played over at all.
+		if dist >= PassEvaluator.MIN_PASS_DISTANCE and dist <= PassEvaluator.MAX_PASS_DISTANCE:
+			score += LANE_W_RANGE
+		# Prefer options that move the ball forward.
+		score += LANE_W_PROGRESS * clampf(fwd.dot(dir), 0.0, 1.0)
+		# Stay recognisably in the job the duty gave us.
+		score -= LANE_W_SHAPE * (candidate.distance_to(anchor) / maxf(LANE_SAMPLE_RADIUS_WIDE, 0.01))
+		# Do not pile into a teammate's space.
+		# Crowding counts both where teammates ARE and where they are
+		# HEADING. Scoring only live positions let two players independently
+		# pick the same opening and converge on it -- v0.8.6 spent real
+		# effort giving advancing players distinct lanes and this quietly
+		# undid it (measured: two advancing players 0.01m apart in target).
+		# Their existing ai_target is already spread by that v0.8.6 logic,
+		# so respecting it keeps the guarantee instead of re-deriving it.
+		var crowding := 0.0
+		for mate in teammates:
+			if mate == player or mate == null or not is_instance_valid(mate) or mate.is_goalkeeper:
+				continue
+			var d: float = candidate.distance_to(mate.global_position)
+			if d < LANE_CROWD_RADIUS:
+				crowding += (LANE_CROWD_RADIUS - d) / LANE_CROWD_RADIUS
+			if mate.ai_target != Vector3.ZERO:
+				var dt: float = candidate.distance_to(mate.ai_target)
+				if dt < LANE_CROWD_RADIUS:
+					crowding += (LANE_CROWD_RADIUS - dt) / LANE_CROWD_RADIUS
+		score -= LANE_W_CROWD * crowding
+		# Stickiness. Choosing by argmax over a ring of candidates is a
+		# discrete decision, so a small change in the situation can flip the
+		# winner to a point several metres away and yank the player's target
+		# with it -- which is a movement reversal, the exact failure v0.8.5
+		# spent a milestone eliminating (measured: reversals landing just
+		# after a phase change rose to 26% against a 22% ceiling). Favouring
+		# the candidate nearest where this player is already heading makes
+		# the choice hold unless something meaningfully better appears.
+		if player.ai_target != Vector3.ZERO:
+			var drift: float = candidate.distance_to(player.ai_target) / LANE_SAMPLE_RADIUS_WIDE
+			score += LANE_W_STICKY * (1.0 - clampf(drift, 0.0, 1.0))
+
+		if score > best_score:
+			best_score = score
+			best = candidate
+
+	return best
 
 
 ## Where a player who has just played the ball should be while the move

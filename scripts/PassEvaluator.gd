@@ -113,6 +113,9 @@ const ROLL_OFFSET := 1.4
 ## Aim the ball to roll somewhat past the receiver so it arrives with pace
 ## still on it rather than dying at their feet.
 const OVERRUN_FACTOR := 1.35
+## Ceiling on how far a moving receiver may be led, as a fraction of the
+## pass distance -- see _lead_point.
+const MAX_LEAD_FRACTION := 0.35
 
 ## Launch-speed band for passes. Held strictly below FootballPlayer's shot
 ## band so a pass and a shot are never the same event with different
@@ -208,7 +211,25 @@ static func best_option(
 			opt.score = score
 			opt.distance = dist
 			opt.aim_point = _lead_point(passer.global_position, mate, dist)
-			opt.speed = speed_for_distance(passer.global_position.distance_to(opt.aim_point))
+			# v0.8.7: weight is solved from the distance to the RECEIVER, not
+			# to the lead point. This is the root cause of "the PASS button
+			# behaves like a small/weak kick", and it was a feedback loop
+			# running the wrong way:
+			#
+			#   receiver runs toward the passer
+			#     -> the lead point lands well SHORT of them
+			#     -> the pass is solved for that shorter distance, so it is
+			#        struck softer
+			#     -> a softer pass has a longer flight time
+			#     -> which leads it even further short.
+			#
+			# Measured on six identical 9m passes (diag_v087): the solved
+			# distance collapsed to 4.3m and the ball was struck at 4.3 m/s,
+			# rolling 5.7m -- dying over three metres short of a teammate the
+			# player had aimed directly at. Leading the AIM is right; leading
+			# the WEIGHT is not, because the ball still has to cover the real
+			# ground between the two players.
+			opt.speed = speed_for_distance(dist)
 			best = opt
 
 	return best
@@ -230,6 +251,13 @@ static func _lead_point(from: Vector3, mate: FootballPlayer, distance: float) ->
 	# its launch speed; 0.7 matches the measured profile closely enough.
 	var flight_time: float = distance / maxf(launch * 0.7, 0.01)
 	var lead: Vector3 = Vector3(mate.velocity.x, 0.0, mate.velocity.z) * clampf(flight_time, 0.0, 1.2)
+	# v0.8.7: and the lead itself is bounded to a fraction of the pass. At up
+	# to 1.2s of flight, a receiver running at 5 m/s was being led by 6m on a
+	# 9m pass -- the aim point ended up nearer the passer than the receiver
+	# was, or (running the other way) half again beyond them. A lead is a
+	# refinement of where to put the ball, so it is capped relative to the
+	# pass it is refining rather than allowed to dominate it.
+	lead = lead.limit_length(distance * MAX_LEAD_FRACTION)
 	var point: Vector3 = mate.global_position + lead
 	point.y = from.y
 	return point

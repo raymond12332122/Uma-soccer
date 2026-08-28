@@ -85,7 +85,16 @@ const INTENT_SLEW_RATE := 1.6
 ## per second before this milestone, 0.307 after adding the new duties, and
 ## back to within the pre-existing rate at 6.0. Same tie-break rule, sized
 ## for the larger duty set.
-const DUTY_RETENTION_BONUS := 6.0
+##
+## v0.8.7: raised again, 6.0 -> 7.5, for the same reason and by the same
+## measurement. Duty suitability is scored largely on where players ARE, and
+## lane-aware support positioning now moves them a few metres to open a
+## passing lane -- which feeds straight back into those distances and puts
+## more near-ties in front of this tie-break. Measured over a settled
+## passage: 0.348 duty changes per player per second against a 0.30 ceiling,
+## and back under it at 7.5. The rule is unchanged; it is sized for how much
+## its inputs now move.
+const DUTY_RETENTION_BONUS := 7.5
 
 ## Slot ceilings. These numbers ARE the "not every player should contest /
 ## not every player should make the same run" rule, expressed structurally.

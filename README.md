@@ -456,6 +456,91 @@ Players now shove the ball they run into, the damper is relative to the
 player, and no player can climb the ball. Neither collision shape changed
 size.
 
+### Touch-based close control, passing lanes, real pass weight (v0.8.7)
+
+v0.8.6 fixed what the AI *decides*. The v0.8.7 report was about how the
+football itself *feels*: the ball read as heavy and welded to the dribbler,
+the PASS button behaved like a weak kick, and teammates moved constantly
+without ever offering a pass. Each turned out to be a specific, measurable
+defect rather than a matter of tuning.
+
+**The dribble leash was shorter than the player's own body.** This is the
+whole "PUSH BALL -> CHASE BALL -> PUSH BALL" complaint, and it is geometry.
+A player capsule has radius **0.40** and the ball had radius **0.35**, so
+the closest their centres can ever be is **0.75m** -- but `dribble_distance`
+asked for the ball to sit **0.62m** ahead, a point *inside the player's own
+capsule*. The ball therefore never sat in front of the dribbler at all; it
+was permanently jammed against them and shoved along. Measured (120-frame
+runs, everyone else parked): sprinting, the ball sat at 0.86m -- i.e. at the
+contact floor -- and the carrier could only reach **1.5 m/s**, because they
+were pushing the ball with their body; at a walking pace the ball was
+knocked away instead and possession survived **31 of 120 frames**. There was
+no regime in which a player moved at pace *and* kept the ball. The ball is
+now **0.16m** radius (it was also ~3x oversized on screen: 0.70m across
+against a 1.6m player), and both leashes sit clearly outside the resulting
+0.56m contact floor.
+
+**The close-control sensor was narrower than the leash**, so a carrier
+knocked the ball out of their own possession radius. `apply_player_data()`
+overwrote whatever `FootballPlayer.tscn` said with a hardcoded 0.95-1.35m,
+making the scene value dead configuration; the sensor is now derived from
+the leash it has to contain.
+
+**Close control is now touches, not a spring.** The old model applied a
+force toward a point ahead of the player *every frame, along every axis* --
+permanent attachment by construction, with no independent ball motion left
+to feel. A dribble is now discrete touches that knock the ball ahead, plus a
+sideways-only shepherd; between touches the ball simply rolls. A ball that
+falls behind is recovered by touching *more often*, never harder, so a touch
+stays bounded below the weakest pass and can never read as a kick. A change
+of direction re-touches early, which is what makes a fake work: measured,
+the ball leaves a 90-degree turn **100 degrees** off its old heading with
+possession held through it.
+
+**Pass weight was solved from the lead point instead of the receiver.** A
+feedback loop running the wrong way: a receiver moving *toward* the passer
+collapsed the solved distance, so the ball was struck softer, so it flew
+longer, so it was led even shorter. Measured on six identical 9m passes, the
+solved distance fell to **4.3m** and the ball was struck at 4.3 m/s, rolling
+5.7m -- dying three metres short of a teammate the player had aimed directly
+at. That is the "PASS behaves like a small kick" report. Weight now comes
+from the true distance and the lead is bounded to a fraction of the pass;
+the same six passes are now struck at a consistent **8.1-8.3 m/s** and all
+reach.
+
+**No support duty had any concept of a passing lane.** `SUPPORT_SHORT`,
+`SUPPORT_WIDE`, `PUSH_UP` and `RUN_BEHIND` each derived a point from
+formation slot, ball position and forward axis, then stood on it whether or
+not an opponent was planted between that point and the ball. Measured over a
+live match, **47%** of teammates inside passing range were screened -- about
+half the "options" on screen were not options. Support duties now search a
+small ring around the duty's own target for a spot that is genuinely
+available, weighing lane, space, range, progression, spacing and how far it
+drags the player off shape.
+
+Measured after (35s AI-vs-AI): teammates with a clear lane **53% -> 65%**;
+midfielders more than 20m from the ball still adjusting **12-30% -> 85%**;
+four-or-more teammates bunched within 6m of the ball on **2%** of carrier
+frames; turnovers **48/min -> 56/min**; and the human-monopoly assertion
+that had been failing since v0.8.6 (80%) now passes at **44-74%**, with
+opponent challenges peaking at the full 0.80 needed for a tackle.
+
+One idea was tried and **reverted, with its result recorded in the code** so
+it is not silently re-attempted: having a pressing defender aim at an
+interception point ahead of the ball. Against a *dribbled* ball that lead
+lands past the carrier, so defenders ran around their man instead of
+engaging -- turnovers collapsed **54/min -> 12/min** and a human's
+possession share went 44% -> 96%. Pressure comes from getting tight, not
+from outguessing the carrier.
+
+Three older assertions were repaired rather than relaxed, because each was
+passing for a reason that had stopped being true: one measured the sprint
+leash while the player was pinned against a touchline collider; one inferred
+"the AI passed" from the carrier merely *losing* the ball, which the old
+broken close control did constantly; and one asked the AI to pass while
+facing thirty metres of completely empty grass, with no opponent anywhere in
+the scene.
+
 ## 11v11 Match & Team Shape (v0.7)
 
 The match is now a full 11v11 on a data-driven 4-3-3: `FormationManager`

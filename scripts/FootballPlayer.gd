@@ -96,14 +96,121 @@ var current_stamina: float = 100.0
 # A longer leash also makes the ball marginally EASIER to take (BallContest
 # scores a challenger on their distance to the BALL, not to the carrier),
 # which is the right direction and does not regress stealing.
-@export var dribble_distance: float = 0.62
-@export var dribble_distance_sprint: float = 1.05
+#
+# v0.8.7: THE LEASH WAS SHORTER THAN THE PLAYER'S OWN BODY. This is the
+# root cause of "dribbling feels like PUSH BALL -> CHASE BALL -> PUSH BALL"
+# and of the ball feeling heavy and stuck, and it is geometry, not tuning:
+#
+#   player capsule radius 0.40 + old ball radius 0.35 = 0.75m
+#
+# is the closest the two bodies' CENTRES can ever be. The walking leash
+# asked for 0.62m and the sprint leash for 1.05m, so at walking pace the
+# spring was pulling the ball to a point 0.13m INSIDE the player's own
+# collision capsule -- a place it is physically impossible for the ball to
+# occupy. The ball therefore never sat "in front of" the dribbler at all;
+# it was permanently jammed against the capsule and shoved along by it,
+# which is precisely why it read as an object welded to the player, and why
+# the player is a physical obstacle to their own ball.
+#
+# Measured before the fix (diag_v087, 120-frame runs, everyone else parked):
+#   sprinting: ball 0.86m away (i.e. AT the 0.75 contact floor), and the
+#              carrier could only reach 1.5 m/s -- they were shoving the
+#              ball with their body the whole way.
+#   walking:   the ball is knocked away instead and possession survives
+#              only 31 of 120 frames while the player runs on at 5.6 m/s.
+# There was no regime in which a human moved at pace AND kept the ball.
+#
+# The ball is now 0.16m radius (see Ball.tscn -- it was also ~3x oversized
+# visually: 0.70m across against a 1.6m player), putting the contact floor
+# at 0.56m, and BOTH leashes now sit clearly outside it. The ball has real
+# separation from the body at last, which is what makes it a thing you
+# touch rather than a thing you carry.
+@export var dribble_distance: float = 0.85
+@export var dribble_distance_sprint: float = 1.35
 var dribble_accel: float = 13.0
 @export var dribble_damping_accel: float = 6.0
 @export var dribble_force_accel_clamp: float = 18.0
 var control_loss_angle_threshold: float = 1.2
 @export var control_loss_speed_threshold: float = 2.5
 @export var control_loss_duration: float = 0.35
+
+# ---- v0.8.7: touch-based close control ----
+# The brief asks for "actual touch-based close control, NOT permanent ball
+# attachment", and for a change of direction to be something the ball
+# follows through a touch rather than something it is dragged through.
+#
+# The old model applied a spring force toward a point ahead of the player
+# EVERY FRAME, along every axis. That is permanent attachment by
+# definition: the ball had no independent motion left to feel, because any
+# deviation was corrected within a frame or two by a force stiff enough to
+# saturate its own clamp.
+#
+# The model here splits the two things a dribbler actually does:
+#
+#   1. TOUCHES  -- discrete impulses that knock the ball ahead. This is the
+#      only thing that drives the ball ALONG its direction of travel. Between
+#      touches the ball simply rolls, decelerating under its own friction and
+#      damping, and the player runs after it. That gap is the dribble.
+#   2. SHEPHERDING -- a gentle force applied ONLY perpendicular to the
+#      direction of travel, so the ball stays in the player's corridor
+#      instead of drifting off sideways. It cannot pull the ball forward or
+#      hold it back, so it can never re-create the welded feel.
+#
+# A direction change re-touches the ball early (subject to a shorter
+# minimum interval), which is what makes a simple fake work: run left, flick
+# the stick right, and the next touch sends the ball right.
+## Shortest gap between touches at a walk, and at a sprint. Touching more
+## often at pace is what keeps a fast dribble from running away.
+const TOUCH_INTERVAL_WALK := 0.42
+const TOUCH_INTERVAL_SPRINT := 0.26
+## A direction change may re-touch sooner than that -- otherwise a fake is
+## only as responsive as whatever remains of the current interval.
+const TOUCH_INTERVAL_TURN := 0.12
+## Re-touch once the ball has come closer than this fraction of the leash.
+const TOUCH_TRIGGER_RATIO := 0.72
+## How much the desired direction must differ from where the ball is
+## actually travelling before it counts as a turn (radians, ~30 degrees).
+const TOUCH_TURN_ANGLE := 0.52
+## The ball leaves a touch slightly faster than the player so that, after
+## friction has eaten into it over the interval, it is still ahead of them.
+const TOUCH_SPEED_MATCH := 1.14
+## Floor so a stationary player can still stroke the ball around.
+const TOUCH_MIN_SPEED := 1.1
+## How much faster than the player a touch may send the ball. Small on
+## purpose: this is the speed at which the ball pulls AHEAD, and the player
+## has to be able to run onto it again.
+const TOUCH_MAX_CLOSING := 1.8
+## How far the ball's speed may fall below the player's before the next
+## touch is treated as urgent -- see the `trailing` case.
+const TOUCH_TRAIL_SPEED_GAP := 1.5
+## Hard ceiling on how much velocity ONE touch may add. A touch is a
+## controlled contact, never a pass -- this is what keeps close control
+## clearly distinct from PASS_SPEED_MIN (4.0).
+const TOUCH_MAX_DELTA_V := 3.4
+## Allowance for a touch that CHANGES DIRECTION -- see the turn handling in
+## _update_possession. Still comfortably under PASS_SPEED_MIN (4.0) in
+## terms of the speed it can leave on the ball travelling forward, because
+## most of it is spent cancelling the old direction.
+const TOUCH_MAX_DELTA_V_TURN := 7.5
+## Sideways-only shepherding gains. Deliberately far softer than the old
+## spring (16-30 accel) because it is no longer holding the ball ahead --
+## that job belongs to the touches.
+const SHEPHERD_ACCEL := 7.0
+const SHEPHERD_DAMPING := 3.2
+## Ceiling on the shepherding force, well under a touch.
+const SHEPHERD_ACCEL_CLAMP := 9.0
+## Damping applied to a ball at the feet of a carrier who is not currently
+## going anywhere. Damping-only by design: it can slow the ball but never
+## move it, so a resting ball beside a standing player stays put.
+const SETTLE_DAMPING := 6.0
+const SETTLE_ACCEL_CLAMP := 10.0
+## How much wider than the sprint leash the close-control sensor must be.
+## A carrier has to be able to knock the ball its full dribble distance
+## ahead and still be holding it -- see apply_player_data().
+## Kept as tight as the leash allows: this radius is also what decides who
+## counts as the carrier, so an over-large bubble makes possession sticky
+## for whoever is merely nearest the ball rather than genuinely on it.
+const CONTROL_RADIUS_LEASH_MARGIN := 1.15
 ## Fraction of normal dribble steering that survives a heavy touch. Not
 ## zero -- see _update_possession.
 const CONTROL_LOSS_STEER_SCALE := 0.3
@@ -292,6 +399,12 @@ var post_action_kind: int = KickKind.NONE
 var possession_time: float = 0.0
 
 var _control_lost_timer: float = 0.0
+## Time until this player may touch the ball again -- see the touch model
+## constants above. Public read-only for tests/diagnostics.
+var _touch_timer: float = 0.0
+## Set for one frame whenever a touch actually lands, so tests and the
+## animation layer can see individual touches rather than a continuous pull.
+var touched_ball_this_frame: bool = false
 var _possession_cooldown_timer: float = 0.0
 var _possession_grace_timer: float = 0.0
 
@@ -379,7 +492,23 @@ func apply_player_data(data: PlayerData) -> void:
 		var shape_node: CollisionShape3D = control_area.get_node("CollisionShape3D")
 		if shape_node and shape_node.shape:
 			var shape: SphereShape3D = shape_node.shape.duplicate()
-			shape.radius = lerp(0.95, 1.35, data.defensive_ability / 100.0)
+			# v0.8.7: this line overwrites whatever FootballPlayer.tscn says,
+			# for every player spawned with player_data -- i.e. everyone in a
+			# real match -- so the scene's ControlArea radius is dead config
+			# and editing it does nothing. That cost real debugging time, so
+			# the coupling is now explicit: the close-control sensor is
+			# derived from the dribble leash it has to contain.
+			#
+			# It must sit clearly OUTSIDE dribble_distance_sprint. The old
+			# band (0.95-1.35) was below it, so a carrier running at pace
+			# knocked the ball straight out of their own possession sensor
+			# and was dispossessed by their own touch -- measured: 0 of 120
+			# frames in possession at a walking 5.6 m/s, because a
+			# speed_ratio of 0.66 already puts the leash at 1.42m.
+			# Better defenders still get the slightly wider bubble the
+			# original lerp was expressing.
+			var floor_radius: float = dribble_distance_sprint * CONTROL_RADIUS_LEASH_MARGIN
+			shape.radius = floor_radius + lerp(0.0, 0.35, data.defensive_ability / 100.0)
 			shape_node.shape = shape
 
 
@@ -657,7 +786,7 @@ func _physics_process(delta: float) -> void:
 		global_position.y = pre_move_y
 		velocity.y = 0.0
 
-	_update_possession(sprinting, stamina_ratio)
+	_update_possession(sprinting, stamina_ratio, delta)
 	_process_pass_input()
 	_process_shoot_input(delta)
 	_update_animation_state()
@@ -788,7 +917,7 @@ func _get_aim_direction() -> Vector3:
 # player with a spring/damper force. The ball stays a fully simulated
 # RigidBody3D at all times -- this only adds a force on top of normal
 # physics, so collisions, bounces, and knock-aways still behave naturally.
-func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
+func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: float = 0.0) -> void:
 	# A deliberate kick always ends possession instantly (the cooldown is
 	# set by _apply_kick_impulse) -- the grace below is only for a ball
 	# jittering at the edge of the control radius, never for one the
@@ -859,11 +988,9 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	if possession_manager and possession_manager.current_carrier != null and possession_manager.current_carrier != self:
 		return
 
-	# Close control also degrades gradually with fatigue (weaker steering
-	# force back to the target dribble point) -- at full stamina this is
-	# identical to the pre-fatigue behavior.
-	var accel_coeff: float = dribble_accel * lerp(0.75, 1.0, stamina_ratio) * control_quality
-	var damping_coeff: float = dribble_damping_accel * control_quality
+	# v0.8.7: accel_coeff/damping_coeff are gone with the spring they drove.
+	# Fatigue still degrades close control, now through the touch itself and
+	# the shepherd force below rather than through a spring stiffness.
 	# v0.8.6: the old `if sprinting: accel_coeff *= 0.6` produced the exact
 	# opposite of the looser control it was meant to model. The ball has real
 	# drag (linear_damp plus rolling friction, ~3 m/s^2 at a sprint), so the
@@ -884,47 +1011,200 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0) -> void:
 	# "sprinting should loosen control" per the brief -- driven off actual
 	# current speed (not just the sprinting flag) so the transition itself
 	# feels smooth rather than an instant step.
-	var speed_ratio: float = clampf(velocity.length() / maxf(sprint_speed, 0.01), 0.0, 1.0)
+	# v0.8.7: measured from BASE speed up to sprint speed, not from a
+	# standstill. Against a standstill, simply running at normal pace
+	# (base_speed 5.6 against sprint_speed 8.5) already scored 0.66 and drew
+	# the leash out to 1.42m, so "walking" close control was in practice
+	# almost fully loosened and the ball sat further away at a jog than at a
+	# sprint (measured 2.20m vs 1.06m -- backwards).
+	var pace_span: float = maxf(sprint_speed - base_speed, 0.01)
+	var speed_ratio: float = clampf((velocity.length() - base_speed) / pace_span, 0.0, 1.0)
 	var current_dribble_distance: float = lerp(dribble_distance, dribble_distance_sprint, speed_ratio)
 
+	# v0.8.7: TOUCHES, not a spring. See the touch-model constants above for
+	# why the old every-frame spring was permanent attachment by
+	# construction. `delta` is now threaded in so touches can be spaced in
+	# real time rather than applied on every physics tick.
+	#
+	# Direction of the dribble: where the player is actually going if they
+	# are going anywhere, else where they face. Using the live movement
+	# direction is what lets a change of direction redirect the next touch
+	# (the "fake" in the brief) without waiting for the facing angle -- a
+	# deliberately rate-limited value -- to catch up to the stick.
 	var facing_dir := Vector3(sin(_facing_angle), 0.0, cos(_facing_angle))
-	var target_pos: Vector3 = global_position + facing_dir * current_dribble_distance
+	var dribble_dir: Vector3 = facing_dir
+	if move_input.length() > 0.15:
+		dribble_dir = Vector3(move_input.x, 0.0, move_input.y).normalized()
 
-	var to_target: Vector3 = target_pos - ball_in_control_range.global_position
-	to_target.y = 0.0
-
-	var ball_vel: Vector3 = ball_in_control_range.linear_velocity
+	var ball_body: RigidBody3D = ball_in_control_range
+	var ball_vel: Vector3 = ball_body.linear_velocity
 	var horizontal_vel := Vector3(ball_vel.x, 0.0, ball_vel.z)
+	var to_ball: Vector3 = ball_body.global_position - global_position
+	to_ball.y = 0.0
 
-	# v0.8.6: the damper now opposes the ball's velocity RELATIVE TO THE
-	# PLAYER rather than its absolute velocity. This is the fix for close
-	# control feeling rigid, and it is a correctness fix rather than a
-	# tuning one.
+	# Decompose the ball's offset into "along the dribble" and "off to the
+	# side". The two halves are driven by completely different mechanisms:
+	# touches drive the first, shepherding only ever corrects the second.
+	var ahead: float = to_ball.dot(dribble_dir)
+	var lateral: Vector3 = to_ball - dribble_dir * ahead
+
+	_touch_timer = maxf(0.0, _touch_timer - delta)
+
+	# A turn is measured against where the ball is actually TRAVELLING, not
+	# where it sits: a ball rolling left while the player now wants to go
+	# right needs a fresh touch even though it may still be dead ahead.
+	var turning := false
+	if horizontal_vel.length() > 0.6:
+		turning = horizontal_vel.normalized().angle_to(dribble_dir) > TOUCH_TURN_ANGLE
+
+	# Touch again once the ball has drawn back inside the leash, or as soon
+	# as the dribble turns. Suppressed entirely while a heavy touch is being
+	# served out, so a bad touch still genuinely costs control.
+	# The ball has fallen behind, or is travelling well slower than the
+	# player: both mean the carrier is running away from their own ball and
+	# needs to get it back into their stride NOW rather than at the next
+	# scheduled touch.
 	#
-	# Damping the absolute velocity means that whenever the player moves at
-	# all, the damper fights the very motion the spring is trying to produce.
-	# At a sprint the two are not close: carrying the ball at 8.5 m/s
-	# demanded roughly 30 m/s^2 of damper force against a total force budget
-	# (dribble_force_accel_clamp) of 18, so the net force on the ball was
-	# BACKWARDS for the whole run. The ball could never be pushed out in
-	# front -- it was run over and shoved along by the player's capsule,
-	# which is exactly why it read as an object welded to the player, and why
-	# dribble_distance_sprint had no observable effect whatsoever (measured:
-	# the ball sat at 0.83m at a sprint against a 1.45m target -- that 0.83
-	# is simply the two collision shapes touching).
+	# Without this the model could not accelerate a ball from rest. A player
+	# starting a sprint reaches 8.5 m/s in about half a second, while one
+	# touch adds at most TOUCH_MAX_DELTA_V and the next is 16-25 frames
+	# away, so the ball simply never caught up: measured in the isolated
+	# close-control scene, the player hit 8.2 m/s with the ball still
+	# dawdling at 1.5-4 m/s until it dropped out of the control radius
+	# entirely and finished 8.5m behind.
+	var ball_speed: float = horizontal_vel.length()
+	var player_speed: float = Vector2(velocity.x, velocity.z).length()
+	var trailing: bool = ahead < 0.0 or ball_speed < player_speed - TOUCH_TRAIL_SPEED_GAP
+
+	var wants_touch: bool = ahead < current_dribble_distance * TOUCH_TRIGGER_RATIO or turning or trailing
+	var interval: float = lerp(TOUCH_INTERVAL_WALK, TOUCH_INTERVAL_SPRINT, speed_ratio)
+	if turning or trailing:
+		interval = minf(interval, TOUCH_INTERVAL_TURN)
+		# Shorten the timer ALREADY RUNNING, not just the next one. A touch
+		# taken while everything was fine sets a full-length interval, and
+		# the situation can turn urgent a frame later; without this the
+		# player had to wait out the old interval before reacting, which is
+		# why a ball falling behind during a sprint only got four touches in
+		# two seconds and was never recovered.
+		_touch_timer = minf(_touch_timer, TOUCH_INTERVAL_TURN)
+
+	# A player who is not trying to go anywhere is not knocking the ball out
+	# in front of themselves -- they are keeping it at their feet, which the
+	# lateral shepherding below already does. Without this a stationary
+	# player stood beside a resting ball still "dribbled" it away, which a
+	# regression test correctly caught as a phantom shot.
 	#
-	# Relative damping still kills the oscillation the damper exists for (a
-	# ball hunting around its target point), but a ball already travelling
-	# with the player is left alone -- so it can sit genuinely further ahead
-	# at speed, trail on a turn, and be run onto. The ball remains a fully
-	# simulated body that is only ever nudged; nothing here attaches it.
-	var player_horizontal_vel := Vector3(velocity.x, 0.0, velocity.z)
-	var relative_vel: Vector3 = horizontal_vel - player_horizontal_vel
+	# Note this is deliberately NOT a test for the ball being in front. When
+	# a player turns, the ball is briefly behind the new direction by
+	# definition, and refusing to touch it there means a sideways dribble
+	# never picks the ball up again -- measured, it simply abandoned it.
+	# Touching a ball that is behind you is fine; what is not fine is
+	# sizing that touch off a gap larger than the leash itself, which is
+	# what produced the phantom shot's full-power knock. The gap is clamped
+	# at the touch site instead.
+	# INTENT, not momentum. A player is dribbling when they are trying to go
+	# somewhere; a player coasting to a stop is not, and must not keep
+	# knocking the ball on.
+	#
+	# Accepting residual speed here (`or player_speed > 0.5`) was wrong twice
+	# over. It counted a player still settling onto the ground under gravity
+	# as dribbling, so a resting ball crept away at 1.3 m/s. Worse, it kept
+	# the catch-up touch alive through a player's whole deceleration: with
+	# the stick released, `trailing` stayed true because the ball was slower
+	# than the still-moving player, so touch after touch pushed the ball on
+	# while the player slowed. Measured, a carrier who stopped ended up with
+	# the ball 3.45m away at 4 m/s -- outside their own control radius, so
+	# the next PASS found no ball at all and silently did nothing.
+	var has_dribble_intent: bool = move_input.length() > 0.15
 
-	var accel_total: Vector3 = to_target * accel_coeff - relative_vel * damping_coeff
-	accel_total = accel_total.limit_length(dribble_force_accel_clamp)
+	touched_ball_this_frame = false
+	if wants_touch and has_dribble_intent and _touch_timer <= 0.0:
+		# Strength of the touch is set by the CORRECTION it has to make: how
+		# much further ahead the ball ought to be, spread over the interval
+		# until the next touch. The ball therefore travels with the player
+		# and closes the gap, instead of being launched.
+		#
+		# A flat multiple of the player's speed (the first attempt here, at
+		# 1.14x) does not work: it makes the touch stronger exactly as the
+		# player gets faster, so with a short walking leash the ball simply
+		# outran the carrier -- measured, the ball reached 7.5m ahead and
+		# possession survived 26 of 120 frames at a walk.
+		# Clamped to the leash: a ball behind the player (negative `ahead`)
+		# would otherwise ask for a correction bigger than the whole dribble
+		# distance and come out at the full delta cap -- a kick, not a touch.
+		var gap: float = clampf(current_dribble_distance - ahead, 0.0, current_dribble_distance)
+		# Capped by TOUCH_MAX_CLOSING, not by the delta-v ceiling. Those are
+		# different quantities and conflating them broke close control at
+		# pace: `closing` is how much FASTER THAN THE PLAYER the ball is
+		# sent, so allowing it the full 3.4 m/s meant a sprinting carrier
+		# knocked the ball 3.4 m/s beyond a speed they could not exceed --
+		# it simply ran away from them. Measured in the isolated
+		# close-control scene, the ball finished 8.5m clear of a sprinting
+		# dribbler. The delta-v ceiling still bounds the impulse itself.
+		var closing: float = clampf(gap / maxf(interval, 0.05), 0.0, TOUCH_MAX_CLOSING)
+		var touch_speed: float = maxf(player_speed + closing, TOUCH_MIN_SPEED)
+		touch_speed *= lerp(0.85, 1.0, stamina_ratio)
+		# A heavy touch weakens the next contact rather than cancelling it.
+		# Suppressing touches outright for control_loss_duration meant a
+		# sharp turn at pace left the ball running on untouched until it was
+		# outside the control radius: the carrier lost it on nearly every
+		# turn (measured, possession held on 30 of 90 frames) and the ball
+		# never followed the new direction at all. The old spring model kept
+		# pulling at CONTROL_LOSS_STEER_SCALE through exactly this window;
+		# the touch keeps the same idea.
+		touch_speed *= control_quality
+		var desired_vel: Vector3 = dribble_dir * touch_speed
+		var delta_v: Vector3 = desired_vel - horizontal_vel
+		# Cutting the ball across your body is a firmer contact than knocking
+		# it along, and it has to be: redirecting a ball already rolling at
+		# 7 m/s costs far more delta-v than nudging one that is drifting.
+		# Capped at the ordinary touch strength, a 90-degree turn simply left
+		# the ball running on in the old direction and out of control --
+		# measured, the dribbler kept it on 2 of 60 frames through a turn.
+		# Only a TURN gets the larger allowance: it has to cancel the ball's
+		# existing momentum before it can redirect it, which no ordinary
+		# touch does. A trailing ball is caught up by touching more OFTEN
+		# (see the interval above), never harder -- letting it use the turn
+		# allowance put a single touch at 4.0 m/s, which is exactly
+		# PassEvaluator.PASS_SPEED_MIN, i.e. a touch indistinguishable from
+		# a pass.
+		delta_v = delta_v.limit_length(TOUCH_MAX_DELTA_V_TURN if turning else TOUCH_MAX_DELTA_V)
+		ball_body.apply_central_impulse(delta_v * ball_body.mass)
+		_touch_timer = interval
+		touched_ball_this_frame = true
 
-	ball_in_control_range.apply_central_force(accel_total * ball_in_control_range.mass)
+	# Shepherding: sideways ONLY. This keeps the ball in the player's
+	# corridor rather than letting it drift off the dribble line, but it
+	# applies no force along the direction of travel, so it can never hold
+	# the ball at a fixed distance the way the old spring did. Between
+	# touches the ball is genuinely rolling free and decelerating under its
+	# own friction, which is the gap that makes a dribble readable.
+	# A player who is not going anywhere does not herd the ball anywhere
+	# either -- the directional shepherding below is gated on intent, because
+	# the sideways force alone accelerated a resting ball to 1.9 m/s whenever
+	# it happened to sit off the player's facing axis (a stationary player
+	# nudging the ball around on their own, caught by a regression test).
+	#
+	# They do still SETTLE it, though. This is damping only: it opposes the
+	# ball's existing motion and can never create any, so a resting ball
+	# stays resting, while a ball rolling at the feet of a carrier who has
+	# just slowed down dies there instead of trundling away from them.
+	# Without it, a carrier who slowed to a stop simply lost the ball --
+	# nothing held it, the ball left the control radius, and because touches
+	# require the ball to be inside that radius it could never be recovered.
+	# Measured in the isolated AI-carrier scene: the carrier held the ball
+	# for 33 of 240 frames and jogged on without it.
+	if not has_dribble_intent:
+		var settle: Vector3 = -horizontal_vel * SETTLE_DAMPING
+		settle = settle.limit_length(SETTLE_ACCEL_CLAMP) * control_quality
+		ball_body.apply_central_force(settle * ball_body.mass)
+		return
+	var lateral_vel: Vector3 = horizontal_vel - dribble_dir * horizontal_vel.dot(dribble_dir)
+	var player_lateral: Vector3 = Vector3(velocity.x, 0.0, velocity.z)
+	player_lateral -= dribble_dir * player_lateral.dot(dribble_dir)
+	var shepherd: Vector3 = -lateral * SHEPHERD_ACCEL - (lateral_vel - player_lateral) * SHEPHERD_DAMPING
+	shepherd = shepherd.limit_length(SHEPHERD_ACCEL_CLAMP) * control_quality * lerp(0.75, 1.0, stamina_ratio)
+	ball_body.apply_central_force(shepherd * ball_body.mass)
 
 
 func _process_pass_input() -> void:
@@ -1166,7 +1446,20 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 	# where it was aimed by up to the player's full speed -- for a pass that
 	# means missing the teammate the evaluator just carefully chose.
 	var launch_speed: float = speed + maxf(0.0, velocity.dot(aim_dir)) * momentum_transfer
-	var delta_v: Vector3 = aim_dir * launch_speed
+	# v0.8.7: REPLACE the ball's horizontal velocity rather than adding to
+	# it, so the ball actually leaves at launch_speed.
+	#
+	# The old impulse was added on top of whatever the ball was already
+	# doing. That was survivable while close control kept the ball pinned
+	# and barely moving, but a touch-dribbled ball now travels with the
+	# carrier, so a pass inherited that pace on top of its own: measured, a
+	# pass left the boot at 13.1 m/s against a shot floor of 12.5, i.e. the
+	# pass/shot bands -- which a test asserts cannot overlap, and which the
+	# brief requires to stay clearly different -- had started to cross.
+	# Momentum from running onto the ball is already accounted for above,
+	# deliberately and only along the aim.
+	var current_horizontal := Vector3(ball.linear_velocity.x, 0.0, ball.linear_velocity.z)
+	var delta_v: Vector3 = aim_dir * launch_speed - current_horizontal
 	# A pass is a GROUND pass -- it stays on the deck, which is both what a
 	# pass looks like and what keeps PassEvaluator's distance solve (fitted
 	# to a rolling ball) applicable to it.

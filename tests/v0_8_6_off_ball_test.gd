@@ -432,13 +432,25 @@ func _test_human_pass_produces_teammate_directed_velocity() -> void:
 	passer.move_input = Vector2(0.7, -0.7)
 	for i in range(40):
 		await get_tree().physics_frame
+	# v0.8.7: come to a COMPLETE stop BEFORE seating the ball. Seating it
+	# while the player was still sliding meant they then coasted into their
+	# own ball and nudged it along, and by the time PASS was pressed the ball
+	# had drifted ~3m -- outside the action radius, so execute_pass found no
+	# ball and silently did nothing, while the drifting ball still happened
+	# to be moving toward the teammate and satisfied the velocity checks.
+	# That is precisely the "did the dribble survive?" confound this block's
+	# own comment says it is trying to avoid.
+	passer.move_input = Vector2.ZERO
+	for i in range(30):
+		await get_tree().physics_frame
 	var feet: Vector3 = passer.global_position + Vector3(0.5, 0.35, -0.5)
 	PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), feet))
 	PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
-	passer.move_input = Vector2.ZERO
-	for i in range(20):
+	for i in range(10):
 		await get_tree().physics_frame
 	_check("The passer has the ball before pressing PASS", passer.has_possession)
+	_check("...and the ball is genuinely within kicking range, not merely in the possession grace",
+		passer.ball_in_action_range != null or passer.ball_in_control_range != null)
 	passer.move_input = Vector2(0.7, -0.7)
 	await get_tree().physics_frame
 

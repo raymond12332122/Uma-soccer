@@ -37,12 +37,28 @@ extends RefCounted
 ## A challenger must be at least this close to the ball to be contesting
 ## it at all. Slightly wider than the control radius, so closing in starts
 ## applying pressure a moment before a tackle becomes possible.
-const CHALLENGE_RANGE := 2.2
-## Closest two players can physically be to each other (both are
-## 0.4m-radius capsules), and therefore roughly the closest a challenger
-## can get to a ball held at the carrier's feet. Proximity is scored
-## against this, not against zero -- see challenge_rate.
-const CONTACT_DISTANCE := 0.9
+##
+## v0.8.7: widened only slightly with the dribble leash. Close control now
+## puts the ball up to 1.7m in FRONT of the carrier on a sprint touch
+## rather than pinned against their capsule, so a defender over the carrier
+## can be further from the ball than they used to be.
+##
+## Deliberately NOT widened further: an earlier 2.9 here made things worse,
+## not better. Proximity is scored as a ramp from this range down to
+## CONTACT_DISTANCE, so stretching the range flattens the ramp and a
+## defender at 1.5m scored 0.30 where they now score 0.50. Measured, that
+## dropped the mean challenge rate against a human carrier rather than
+## raising it.
+const CHALLENGE_RANGE := 2.4
+## Closest a challenger can physically get to the ball: their own capsule
+## radius (0.40) plus the ball's (0.16). Proximity is scored against this,
+## not against zero -- see challenge_rate.
+##
+## v0.8.7: was 0.9, derived from the old 0.35m ball resting against the
+## carrier's capsule. The ball is now 0.16m, so a defender who genuinely
+## gets to it stands at ~0.56m; leaving the floor at 0.9 meant a challenger
+## who was physically ON the ball could never score full proximity.
+const CONTACT_DISTANCE := 0.6
 
 ## Seconds of sustained, full-strength challenge needed to win the ball.
 ## Everything below scales the RATE at which this fills, so a good
@@ -90,6 +106,15 @@ const VULN_SPRINTING := 1.25
 ## A carrier who has just taken a heavy touch (control_lost) has the ball
 ## running away from their feet -- by far the best moment to nick it.
 const VULN_HEAVY_TOUCH := 2.2
+
+## A ball this close to the carrier's feet is under full control and gets
+## no extra exposure; by LOOSE_TOUCH_MAX_GAP it is a ball run out in front,
+## and a defender arriving first should be rewarded. See
+## carrier_vulnerability.
+const LOOSE_TOUCH_MIN_GAP := 0.75
+const LOOSE_TOUCH_MAX_GAP := 1.5
+## Multiplier applied at a fully loose touch.
+const LOOSE_TOUCH_VULN_SCALE := 3.2
 
 
 ## Evaluates every challenge against the current carrier and applies at
@@ -189,6 +214,37 @@ static func challenge_rate(challenger: FootballPlayer, carrier: FootballPlayer, 
 ## own function so a test can assert the stationary-vs-moving relationship
 ## directly rather than inferring it from duel outcomes.
 static func carrier_vulnerability(carrier: FootballPlayer) -> float:
+	var base: float = _pace_vulnerability(carrier)
+	# v0.8.7: how far the ball is from the carrier's own feet now matters,
+	# and it has to. Close control is a series of touches (see
+	# FootballPlayer's touch model), so between touches the ball genuinely
+	# runs 1-2m ahead -- and a ball that far from a player is one a defender
+	# can nip in front of. Without this term the new dribbling was close to
+	# unstealable in a live match: the carrier simply moved faster than
+	# before, so the pace terms above scored them as protected, while the
+	# ball they were actually leaving out in front counted for nothing
+	# (measured: human held 94% of carrier time, challenges peaked at 0.11
+	# of the 0.80 needed).
+	#
+	# This is also what keeps a heavy first touch punishable, and it scales
+	# smoothly rather than switching, so ordinary tight dribbling is
+	# unaffected.
+	var ball: RigidBody3D = carrier.ball_in_control_range
+	if ball == null or not is_instance_valid(ball):
+		return base
+	var gap: float = Vector2(
+		ball.global_position.x - carrier.global_position.x,
+		ball.global_position.z - carrier.global_position.z).length()
+	var loose: float = clampf(
+		(gap - LOOSE_TOUCH_MIN_GAP) / maxf(LOOSE_TOUCH_MAX_GAP - LOOSE_TOUCH_MIN_GAP, 0.01), 0.0, 1.0)
+	return base * lerp(1.0, LOOSE_TOUCH_VULN_SCALE, loose)
+
+
+## Vulnerability from the carrier's pace alone -- the v0.8.6 behaviour,
+## preserved exactly so the "stationary is most exposed, controlled pace is
+## safest, sprinting is exposed again" ordering the brief relies on is
+## untouched.
+static func _pace_vulnerability(carrier: FootballPlayer) -> float:
 	if carrier.is_heavy_touch():
 		return VULN_HEAVY_TOUCH
 	var speed: float = Vector2(carrier.velocity.x, carrier.velocity.z).length()
