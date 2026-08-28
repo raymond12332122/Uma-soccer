@@ -73,6 +73,36 @@ const CHALLENGE_TIME_REQUIRED := 0.8
 ## holding a nearly-complete tackle indefinitely.
 const CHALLENGE_DECAY_RATE := 1.0
 
+## ---- Being beaten by a change of direction (v0.9.0) ----
+##
+## A challenge could only ever be OUTRUN or run down; nothing the carrier
+## did with the ball could beat it. The brief asks for the opposite -- a
+## challenge with a meaningful chance of failure, and a carrier who can beat
+## a defender "through direction change, acceleration, timing, space", so
+## that a simple fake works:
+##
+##   dribble right -> defender commits -> cut left -> defender must react
+##
+## The pieces were already there. A carrier who cuts the ball across their
+## body takes a TURN touch (FootballPlayer.time_since_turn_touch), and a
+## committed defender is one carrying real speed. If the ball goes one way
+## while the defender's momentum carries them the other, they have been
+## beaten, and their challenge should collapse rather than continue
+## accruing as though nothing happened.
+##
+## How recently the carrier must have cut the ball for this to apply.
+const BEATEN_BY_TURN_WINDOW := 0.45
+## Below this speed a defender is not committed to anything and cannot be
+## wrong-footed -- they simply adjust.
+const BEATEN_MIN_CHALLENGER_SPEED := 3.0
+## How badly their momentum must now point away from the ball. Above zero
+## would punish a defender still closing; this only fires once they are
+## genuinely travelling the wrong way.
+const BEATEN_MAX_CLOSING_DOT := 0.15
+## What is left of the challenge after being beaten. Not zero: a beaten
+## defender is behind the play, not removed from it, and can recover.
+const BEATEN_PROGRESS_SCALE := 0.25
+
 ## How long the loser cannot re-establish control after being tackled.
 ## This is the part that actually breaks the sticky-ball problem: the
 ## dribble spring is gated on this same cooldown, so for this window the
@@ -151,6 +181,12 @@ static func resolve(carrier: FootballPlayer, players: Array, ball: RigidBody3D, 
 			continue
 
 		p.challenge_progress += rate * delta
+
+		# v0.9.0: ...unless the carrier has just gone the other way. See
+		# BEATEN_BY_TURN_WINDOW.
+		if _beaten_by_turn(p, carrier, ball):
+			p.challenge_progress *= BEATEN_PROGRESS_SCALE
+
 		if p.challenge_progress > best_progress:
 			best_progress = p.challenge_progress
 			winner = p
@@ -293,7 +329,28 @@ static func _apply_tackle(carrier: FootballPlayer, winner: FootballPlayer, ball:
 	# loose for a moment.
 	carrier.notify_dispossessed(TACKLE_DISPOSSESS_COOLDOWN)
 	winner.challenge_progress = 0.0
-	winner.notify_possession_won_from_opponent()
+	# v0.9.0: the CONTEST variant. A tackler is the one player who has
+	# genuinely earned the right to collect a ball from outside contact
+	# range, because the knock above is what put it there.
+	winner.notify_contest_won()
+
+
+## Has `challenger` just been wrong-footed by the carrier cutting away?
+##
+## Three conditions, all observable and none random: the carrier cut the
+## ball across their body a moment ago, the challenger is carrying real
+## speed, and that speed now points away from where the ball actually is.
+static func _beaten_by_turn(challenger: FootballPlayer, carrier: FootballPlayer, ball: RigidBody3D) -> bool:
+	if carrier.time_since_turn_touch > BEATEN_BY_TURN_WINDOW:
+		return false
+	var vel := Vector3(challenger.velocity.x, 0.0, challenger.velocity.z)
+	if vel.length() < BEATEN_MIN_CHALLENGER_SPEED:
+		return false
+	var to_ball: Vector3 = ball.global_position - challenger.global_position
+	to_ball.y = 0.0
+	if to_ball.length() < 0.01:
+		return false
+	return vel.normalized().dot(to_ball.normalized()) < BEATEN_MAX_CLOSING_DOT
 
 
 static func _safe_dir(v: Vector3) -> Vector3:

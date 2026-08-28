@@ -55,12 +55,16 @@ func _ready() -> void:
 			PassEvaluator.ROLL_PER_SPEED, PassEvaluator.ROLL_OFFSET])
 
 	# What the CURRENT model promises versus what the ball actually does.
-	print("DIAG-ROLL: error of the model in code, per wanted pass distance:")
+	print("DIAG-ROLL: pass model in code -- does the ball ARRIVE with pace?")
 	for dist in [4.0, 6.0, 8.0, 10.0, 12.0, 14.0]:
 		var speed: float = PassEvaluator.speed_for_distance(dist)
-		var actual: float = await _roll_for(speed)
-		print("DIAG-ROLL:   wanted %5.1fm -> struck at %5.2f m/s -> travelled %6.2fm (%+.2fm)" % [
-			dist, speed, actual, actual - dist])
+		var arrival: float = await _speed_at(speed, dist)
+		print("DIAG-ROLL:   %5.1fm pass -> struck at %5.2f m/s -> arrives at %5.2f m/s" % [
+			dist, speed, arrival])
+	print("DIAG-ROLL: pass band %.1f-%.1f m/s, shot floor %.1f m/s -- separated: %s" % [
+		PassEvaluator.PASS_SPEED_MIN, PassEvaluator.PASS_SPEED_MAX,
+		FootballPlayer.SHOT_SPEED_MIN,
+		"yes" if PassEvaluator.PASS_SPEED_MAX < FootballPlayer.SHOT_SPEED_MIN else "NO"])
 
 	get_tree().quit()
 
@@ -87,3 +91,30 @@ func _roll_for(speed: float) -> float:
 	ball.queue_free()
 	await get_tree().process_frame
 	return travelled
+
+
+## Speed the ball still has after travelling `dist` from a `speed` launch.
+func _speed_at(speed: float, dist: float) -> float:
+	var ball: RigidBody3D = BallScene.instantiate()
+	add_child(ball)
+	ball.global_position = Vector3(-20.0, 0.35, 0.0)
+	ball.linear_velocity = Vector3.ZERO
+	ball.angular_velocity = Vector3.ZERO
+	for i in range(30):
+		await get_tree().physics_frame
+	var start: Vector3 = ball.global_position
+	ball.linear_velocity = Vector3(speed, FootballPlayer.PASS_LIFT, 0.0)
+	var arrival := 0.0
+	for i in range(MAX_FRAMES):
+		await get_tree().physics_frame
+		var travelled: float = Vector2(ball.global_position.x - start.x,
+			ball.global_position.z - start.z).length()
+		var v: float = Vector2(ball.linear_velocity.x, ball.linear_velocity.z).length()
+		if travelled >= dist:
+			arrival = v
+			break
+		if v < REST_SPEED:
+			break
+	ball.queue_free()
+	await get_tree().process_frame
+	return arrival

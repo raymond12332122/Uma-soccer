@@ -223,10 +223,31 @@ func _test_possession_grace_absorbs_control_radius_chatter() -> void:
 
 	# Ball briefly leaves the control radius, as it does constantly while
 	# contesting -- possession must not drop out from under the AI.
-	_teleport(ball, player.global_position + Vector3(4.0, 0.3, 0))
+	#
+	# v0.9.0: this used to teleport the ball FOUR METRES away and assert
+	# possession survived. That is not the "one-frame excursion outside the
+	# control radius" the check is named for -- the control radius is
+	# ~1.55-1.90m -- and asserting it enshrined the exact defect this
+	# milestone fixes. Measured in a live match, the ball reached 3.56m from
+	# a player who still counted as having it, which is what makes a
+	# turnover look absurd from the outside and is precisely the human
+	# playtest's "AI steals from unrealistic distances". Retention is now
+	# capped at FootballPlayer.RETAIN_MAX_DISTANCE (2.20m).
+	#
+	# The excursion below is now a genuine boundary one, which is what the
+	# grace exists to absorb and what the comment above always described.
+	_teleport(ball, player.global_position + Vector3(1.75, 0.3, 0))
 	await get_tree().physics_frame
 	await get_tree().physics_frame
 	_check("A one-frame excursion outside the control radius does not drop possession", player.has_possession)
+
+	# ...and the other half of that rule, new in v0.9.0: a ball that is
+	# genuinely GONE stops being yours, grace or no grace.
+	_teleport(ball, player.global_position + Vector3(4.0, 0.3, 0))
+	await get_tree().physics_frame
+	await get_tree().physics_frame
+	_check("A ball four metres away is no longer this player's possession",
+		not player.has_possession)
 
 	# Left alone for real, possession genuinely ends.
 	for i in range(30):

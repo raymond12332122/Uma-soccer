@@ -1358,6 +1358,25 @@ static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goa
 		var step: float = clampf(GK_DANGER_DISTANCE - dist_to_ball_x, 0.0, GK_FORWARD_RANGE)
 		target.x = own_goal_pos.x + center_dir_x * step
 
+	# v0.9.0: clamped like every other movement target in the game.
+	#
+	# own_goal_pos sits at FormationManager.GOAL_LINE_X (29.0), and the
+	# playable area ends at PLAYABLE_HALF_LENGTH (28.0) -- so the keeper's
+	# DEFAULT target was, by construction, a metre behind their own goal
+	# line, and they registered as out of play whenever they actually
+	# reached it. update_player runs every outfield target through this
+	# clamp; update_goalkeeper was the single path that never did.
+	#
+	# This is why v0_8_8's "no player is ever behind a goal line" check
+	# failed intermittently (roughly one run in seven, 96-123 player-frames)
+	# rather than never or always: it depended on whether the keeper was
+	# settled on their line when the sample was taken. It predates v0.9.0 --
+	# nothing in this milestone touches keeper positioning -- and was found
+	# by chasing that intermittent. A keeper now stands ON the byline, which
+	# is where a keeper stands.
+	target = FormationManager.clamp_to_playable(target)
+	target.y = own_goal_pos.y
+
 	_move_toward(player, target, GK_ARRIVE_RADIUS)
 	player.sprint_requested = dist_to_ball_x < GK_DANGER_DISTANCE
 

@@ -8,6 +8,41 @@ extends CharacterBody3D
 ## AIController for everyone else) writes into the intent fields below
 ## each physics frame, and this script simulates the result.
 
+## ---- Ball-contact events (v0.9.0) ----
+##
+## Every deliberate contact this player makes with the ball is announced
+## here, with enough context to drive an animation from it later.
+##
+## The dependency runs ONE WAY on purpose: the physics emits, and anything
+## that cares subscribes. Nothing in the simulation reads this signal or
+## waits for a listener, so close control works identically with no
+## animation system attached -- which is the milestone's requirement that
+## the physics stand on its own. When the animation pack does arrive it can
+## either listen here (ball drives the animation) or, for a foot-planted
+## contact, call the same _apply_* entry points from an animation key frame
+## (animation drives the ball) without either side being rewritten.
+##
+## `info` is a Dictionary so listeners can ignore fields they do not use and
+## new fields can be added without breaking them:
+##   kind            -- TouchKind, what sort of contact this was
+##   point           -- world position of the contact (ball side, at foot
+##                      height), the anchor an IK/foot-plant would target
+##   direction       -- unit Vector3 the ball was sent in
+##   strength        -- delta-v applied to the ball, m/s
+##   distance        -- how far ahead the touch is intended to put the ball
+##   player_velocity -- carrier's velocity at contact, for stride matching
+##   foot            -- "left"/"right", chosen from which side the ball sat
+signal ball_touched(info: Dictionary)
+
+## What kind of contact a `ball_touched` event describes.
+enum TouchKind {
+	DRIBBLE,    ## ordinary knock-on in the direction of travel
+	TURN,       ## first contact of a direction change; kills old momentum
+	STOP,       ## foot on the ball to settle it while slowing to a halt
+	PASS,       ## deliberate pass
+	SHOT,       ## deliberate shot
+}
+
 # ---- Identity / team ----
 @export var player_data: PlayerData
 @export var team_id: int = 0
@@ -165,7 +200,48 @@ const TOUCH_INTERVAL_WALK := 0.42
 const TOUCH_INTERVAL_SPRINT := 0.26
 ## A direction change may re-touch sooner than that -- otherwise a fake is
 ## only as responsive as whatever remains of the current interval.
+## v0.9.0: TRIED 0.20 AND REVERTED. Raising this floor (8 touches/s -> 5)
+## looked like the cure for a turn that reads as pushing, and it costs
+## possession outright: through a 90-degree turn at pace the carrier held
+## the ball for 42 of 120 frames at 0.20 against 120 of 120 at 0.12. A
+## rolling ball needs several capped impulses to redirect, and this is what
+## pays for them. The dragging feel is the lateral shepherd force, not the
+## touch rate -- see SHEPHERD_ACCEL.
 const TOUCH_INTERVAL_TURN := 0.12
+
+## v0.9.0: the turn interval applies to the FIRST touch of a turn, not to
+## every touch for as long as the turn lasts.
+##
+## `turning` compares the dribble direction against the direction the ball
+## is actually rolling, and one touch does not fully redirect a rolling
+## ball -- so through a sustained turn the condition stayed true, re-armed
+## the 0.12s floor on every touch, and the dribble collapsed into a push.
+## Measured in the isolated close-control scene: a 90-degree turn produced
+## 8.0 touches per second against 2.7 running straight, with the gap pinned
+## at the floor for the whole manoeuvre. That is the "dragging" the human
+## playtest reported -- it appears exactly when the player is steering,
+## which is when they are paying attention.
+##
+## After this many seconds of continuously turning, touch spacing returns to
+## the ordinary pace-based interval: a turn gets its sharp first contact and
+## then settles into a normal rhythm on the new line.
+const TURN_BURST_DURATION := 0.22
+
+## ---- Stopping with the ball (v0.9.0) ----
+## A carrier who releases the stick still has to DO something about a ball
+## that is rolling away -- see the `stopping` block in _update_possession.
+## Below this ball speed there is nothing to kill; the settle damper handles
+## the rest.
+const STOP_TOUCH_MIN_BALL_SPEED := 0.9
+## Only a player who has actually slowed down is "stopping". Above this they
+## are still running, and the ordinary dribble touch applies.
+const STOP_TOUCH_MAX_PLAYER_SPEED := 2.2
+## How quickly the ball is brought back toward the feet. Deliberately gentle
+## -- this is a foot placed on the ball, not a backwards pass.
+const STOP_TOUCH_RETURN_SPEED := 1.6
+## Spacing for stopping touches; a little slower than a dribble touch,
+## because settling a ball is one deliberate contact rather than a rhythm.
+const STOP_TOUCH_INTERVAL := 0.30
 ## Re-touch once the ball has come closer than this fraction of the leash.
 const TOUCH_TRIGGER_RATIO := 0.72
 ## How much the desired direction must differ from where the ball is
@@ -199,6 +275,7 @@ const SHEPHERD_ACCEL := 7.0
 const SHEPHERD_DAMPING := 3.2
 ## Ceiling on the shepherding force, well under a touch.
 const SHEPHERD_ACCEL_CLAMP := 9.0
+
 ## Damping applied to a ball at the feet of a carrier who is not currently
 ## going anywhere. Damping-only by design: it can slow the ball but never
 ## move it, so a resting ball beside a standing player stays put.
@@ -253,6 +330,28 @@ const POSSESSION_CONTACT_RADIUS := 1.20
 ## so they need a moment to actually collect it -- without this the tackle
 ## lands and then nobody can pick the ball up.
 const CONTEST_WIN_GRACE := 0.6
+
+## v0.9.0: how far a contest winner may reach, during that grace, to collect
+## the ball they just won. The grace STRETCHES the contact radius to this;
+## it no longer removes the requirement altogether. TACKLE_KNOCK_SPEED puts
+## the ball roughly a stride away, so a stride is what this needs to be --
+## enough to pick up what you poked, never enough to take a ball that is not
+## there.
+const CONTEST_WIN_REACH := 1.70
+
+## v0.9.0: a hard ceiling on RETAIN-LOOSE. Keeping the ball works out to the
+## control radius plus POSSESSION_GRACE, and that combination had no upper
+## bound at all: measured in a live match, the ball reached a mean of 1.42m
+## and a worst of 3.56m from a player who still counted as having it. A ball
+## three and a half metres away is not "his" by any reading, and a carrier
+## elected on that basis is what makes a turnover look absurd from the
+## outside -- both to the player being robbed and to the one watching an
+## opponent apparently take the ball from range.
+##
+## Sized above the control radius (~1.55-1.90m) so ordinary touch dribbling
+## and the existing grace are untouched; it only cuts off the tail where
+## possession had become fiction.
+const RETAIN_MAX_DISTANCE := 2.20
 
 # ---- Pass / Shoot ----
 # v0.8.3: these are LAUNCH SPEEDS in m/s, not impulse magnitudes. The old
@@ -332,6 +431,11 @@ const PASS_SEARCH_MIN_ALIGNMENT_OMNI := -1.0
 
 var ball_in_action_range: RigidBody3D = null
 var ball_in_control_range: RigidBody3D = null
+## Last ball either sensor reported. Kept so a distance check still works
+## when the ball has rolled outside BOTH areas -- the runaway case
+## RETAIN_MAX_DISTANCE exists to cut off -- and so a stale reference on the
+## frame the ball is repositioned does not read as "no ball".
+var _known_ball: RigidBody3D = null
 
 var has_possession: bool = false
 var _facing_angle: float = 0.0
@@ -350,6 +454,8 @@ var last_kick_dir: Vector3 = Vector3.ZERO
 ## For a pass: the teammate it was actually aimed at (null if none was
 ## found and it was a blind clearance). For a shot: always null.
 var last_kick_target: FootballPlayer = null
+## Which kind of pass the last one was -- see PassEvaluator.PassKind.
+var last_pass_kind: int = PassEvaluator.PassKind.NORMAL
 ## Monotonic per-player kick counter -- lets a test detect "a kick happened
 ## this frame" without polling ball velocity.
 var kick_count: int = 0
@@ -430,6 +536,13 @@ var _touch_timer: float = 0.0
 ## Time left in which this player may take possession from outside the
 ## contact radius because they just won a challenge -- see CONTEST_WIN_GRACE.
 var _contest_win_timer: float = 0.0
+## How long the dribble has been turning without settling -- see
+## TURN_BURST_DURATION.
+var _turn_hold_timer: float = 0.0
+## Seconds since this player last cut the ball across their body (a TURN
+## touch). BallContest reads it to decide whether a committed challenger has
+## just been beaten -- see BEATEN_BY_TURN_WINDOW there.
+var time_since_turn_touch: float = 999.0
 ## Set for one frame whenever a touch actually lands, so tests and the
 ## animation layer can see individual touches rather than a continuous pull.
 var touched_ball_this_frame: bool = false
@@ -593,13 +706,22 @@ func set_controlled_visual(is_controlled: bool) -> void:
 ## Called by PossessionManager when this player wins the ball away from an
 ## opponent (as opposed to picking up a loose ball) -- a reasonable, cheap
 ## proxy for "successfully tackled" without a dedicated tackle mechanic.
+## v0.9.0: this is the REACTION only. It no longer opens the contact-gate
+## exemption -- see notify_contest_won() for the narrow case that does.
+##
+## That exemption exists for one specific situation: a tackler collecting
+## the ball they just poked away. But PossessionManager calls THIS on every
+## opponent carrier change, including a player who merely got to a ball the
+## other side had already lost, so granting it here handed a 0.6s window
+## with the contact requirement switched OFF to essentially everyone who
+## ever became carrier. Measured over a live match, 42% of all acquisitions
+## then happened beyond POSSESSION_CONTACT_RADIUS, worst 1.97m -- the full
+## control radius. v0.8.8's headline gate was inoperative almost half the
+## time, which is the "AI steals from unrealistic distances" the human
+## playtest kept reporting while the automated suite stayed green: that
+## suite measured contact acquisitions and kick distances, both correctly
+## gated, and never measured the acquisition frame itself.
 func notify_possession_won_from_opponent() -> void:
-	# v0.8.8: winning a challenge is the OTHER legitimate way to take the
-	# ball, alongside simply being on it. BallContest knocks the ball toward
-	# the winner rather than into their feet, so without this grace the
-	# tackler is outside POSSESSION_CONTACT_RADIUS at the moment they win
-	# and could not collect what they just won.
-	_contest_win_timer = CONTEST_WIN_GRACE
 	if animation_controller == null:
 		return
 	# A notably competitive/aggressive character reacts more visibly to
@@ -608,6 +730,20 @@ func notify_possession_won_from_opponent() -> void:
 		animation_controller.play_action("excited_reaction")
 	else:
 		animation_controller.play_action("tackle")
+
+
+## Won an actual CHALLENGE -- BallContest resolved a tackle in this player's
+## favour. This is the one case that may collect the ball from outside
+## contact range, because _apply_tackle knocks the ball TOWARD the winner
+## rather than into their feet, so they are legitimately a stride from it on
+## the frame they win it.
+##
+## Still bounded: the exemption stretches the contact radius to
+## CONTEST_WIN_REACH, it does not remove it. A tackler may collect a ball
+## they knocked a stride away; nobody may collect one that is not there.
+func notify_contest_won() -> void:
+	_contest_win_timer = CONTEST_WIN_GRACE
+	notify_possession_won_from_opponent()
 
 
 ## Called by MatchManager on every player of the scoring team after a goal.
@@ -845,6 +981,7 @@ func _physics_process(delta: float) -> void:
 		_control_lost_timer = maxf(0.0, _control_lost_timer - delta)
 	if _contest_win_timer > 0.0:
 		_contest_win_timer = maxf(0.0, _contest_win_timer - delta)
+	time_since_turn_touch += delta
 	if _possession_cooldown_timer > 0.0:
 		_possession_cooldown_timer = maxf(0.0, _possession_cooldown_timer - delta)
 	if _possession_grace_timer > 0.0:
@@ -953,6 +1090,57 @@ func _get_aim_direction() -> Vector3:
 # player with a spring/damper force. The ball stays a fully simulated
 # RigidBody3D at all times -- this only adds a force on top of normal
 # physics, so collisions, bounces, and knock-aways still behave naturally.
+## Announce a ball contact -- see the `ball_touched` signal.
+##
+## Deliberately cheap and side-effect free: it builds one Dictionary and
+## emits. With no listener connected this is a few microseconds and changes
+## nothing about the simulation, which is what lets the physics ship before
+## the animation system exists.
+func _emit_touch(kind: int, direction: Vector3, strength: float, ball: RigidBody3D) -> void:
+	if ball == null:
+		return
+	# Which foot the contact reads as: the ball's side relative to the way
+	# the player is facing. An animation layer needs this to pick a clip;
+	# nothing in the physics uses it.
+	var facing := Vector3(sin(_facing_angle), 0.0, cos(_facing_angle))
+	var side: Vector3 = ball.global_position - global_position
+	var right := Vector3(facing.z, 0.0, -facing.x)
+	ball_touched.emit({
+		"kind": kind,
+		"point": ball.global_position,
+		"direction": direction,
+		"strength": strength,
+		"distance": Vector2(side.x, side.z).length(),
+		"player_velocity": velocity,
+		"foot": "right" if right.dot(side) >= 0.0 else "left",
+	})
+
+
+## Is the ball within `limit` metres, measured on the ground plane?
+##
+## Used while the ball is OUTSIDE the close-control sensor, so it cannot read
+## ball_in_control_range. The ActionArea reference (2.5m) still resolves in
+## that band; a ball beyond even that is unambiguously gone, and answering
+## false is correct.
+func _ball_within(limit: float) -> bool:
+	var b: RigidBody3D = ball_in_control_range
+	if b == null:
+		b = ball_in_action_range
+	if b == null:
+		b = _known_ball
+	if b == null or not is_instance_valid(b):
+		# "I cannot tell" is not "it is far away". Answering false here drops
+		# possession on any frame the ball is repositioned, because Area3D
+		# references only refresh on the next physics step -- that regressed
+		# v0_8_2's explicit assertion that a one-frame excursion outside the
+		# control radius does NOT drop possession (the very case the grace
+		# exists for), and took v0_8_3's whole kick-instrumentation block
+		# with it.
+		return true
+	return Vector2(b.global_position.x - global_position.x,
+		b.global_position.z - global_position.z).length() <= limit
+
+
 func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: float = 0.0) -> void:
 	# A deliberate kick always ends possession instantly (the cooldown is
 	# set by _apply_kick_impulse) -- the grace below is only for a ball
@@ -976,7 +1164,11 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 		# Everything downstream of has_possession (PossessionManager's
 		# carrier election, the contested-ball steering gate, the AI
 		# state machine) gets a steadier signal as a result.
-		if has_possession and _possession_grace_timer > 0.0:
+		# v0.9.0: the grace is a smoother, not a tether. It exists so the
+		# flag does not chatter while the ball sits on the sensor boundary,
+		# and it must not keep saying "his" about a ball that has genuinely
+		# gone -- see RETAIN_MAX_DISTANCE for the measured tail it cuts off.
+		if has_possession and _possession_grace_timer > 0.0 and _ball_within(RETAIN_MAX_DISTANCE):
 			return
 		# Possession genuinely ends here (grace expired, and this wasn't a
 		# deliberate kick -- that path returned above on the cooldown), so
@@ -1011,7 +1203,13 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 	var ball_gap: float = Vector2(
 		ball_in_control_range.global_position.x - global_position.x,
 		ball_in_control_range.global_position.z - global_position.z).length()
-	if not has_possession and ball_gap > possession_contact_radius and _contest_win_timer <= 0.0:
+	# v0.9.0: the contest exemption STRETCHES this radius, it does not remove
+	# it -- see CONTEST_WIN_REACH. Granting an unbounded exemption is what
+	# let 42% of acquisitions land outside the gate.
+	var acquire_radius: float = possession_contact_radius
+	if _contest_win_timer > 0.0:
+		acquire_radius = maxf(acquire_radius, CONTEST_WIN_REACH)
+	if not has_possession and ball_gap > acquire_radius:
 		# Near the ball, but not on it. Keep steering nothing and let the
 		# approach continue; this is the frame the old code handed the ball
 		# over on.
@@ -1122,6 +1320,14 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 	if horizontal_vel.length() > 0.6:
 		turning = horizontal_vel.normalized().angle_to(dribble_dir) > TOUCH_TURN_ANGLE
 
+	# v0.9.0: how long this turn has been going on. One touch cannot fully
+	# redirect a rolling ball, so `turning` stays true through a sustained
+	# turn -- see TURN_BURST_DURATION for what that did to touch spacing.
+	# Only the opening of a turn gets the sharp re-touch; after that the
+	# dribble settles into its ordinary rhythm on the new line.
+	# The urgency window is armed further down, once `trailing` is known too
+	# -- both conditions feed it. See TURN_BURST_DURATION.
+
 	# Touch again once the ball has drawn back inside the leash, or as soon
 	# as the dribble turns. Suppressed entirely while a heavy touch is being
 	# served out, so a bad touch still genuinely costs control.
@@ -1143,7 +1349,30 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 
 	var wants_touch: bool = ahead < current_dribble_distance * TOUCH_TRIGGER_RATIO or turning or trailing
 	var interval: float = lerp(TOUCH_INTERVAL_WALK, TOUCH_INTERVAL_SPRINT, speed_ratio)
-	if turning or trailing:
+	# v0.9.0: `turn_burst`, not `turning` -- only the OPENING of a turn earns
+	# the short interval. See TURN_BURST_DURATION.
+	# v0.9.0: urgency earns a FAST REACTION, not a permanently high touch
+	# rate. `turning` and `trailing` both stay true for as long as a turn
+	# lasts -- a redirected ball really is slower than the player, which is
+	# what `trailing` tests -- so gating only one of them changed nothing:
+	# measured, a 90-degree turn still produced 8.0 touches per second with
+	# the interval pinned at its floor for the whole manoeuvre, exactly as
+	# before the first attempt at this fix. Both conditions now share one
+	# window: the opening of an urgent state gets the short interval, and
+	# then the dribble settles back into its ordinary pace-based rhythm.
+	# TRIED AND REVERTED: sharing this window with `trailing` as well. It cut
+	# the turn to 2 touches, and cost possession outright -- the carrier held
+	# the ball for 35 of 120 frames and then lost it for good, because
+	# `trailing` is not a cosmetic urgency signal but the mechanism that
+	# catches a ball which is genuinely escaping. Time-limiting that means
+	# never recovering it. Only `turning` is windowed; `trailing` runs until
+	# it is resolved, and the touch RATE is bounded by the floor instead.
+	if turning:
+		_turn_hold_timer += delta
+	else:
+		_turn_hold_timer = 0.0
+	var turn_burst: bool = turning and _turn_hold_timer <= TURN_BURST_DURATION
+	if turn_burst or trailing:
 		interval = minf(interval, TOUCH_INTERVAL_TURN)
 		# Shorten the timer ALREADY RUNNING, not just the next one. A touch
 		# taken while everything was fine sets a full-length interval, and
@@ -1152,6 +1381,10 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 		# why a ball falling behind during a sprint only got four touches in
 		# two seconds and was never recovered.
 		_touch_timer = minf(_touch_timer, TOUCH_INTERVAL_TURN)
+	# The larger redirect allowance likewise belongs to the opening contact:
+	# that is the touch which has to kill the ball's old momentum. Later
+	# touches on the new line are ordinary ones.
+	var turn_touch: bool = turn_burst
 
 	# A player who is not trying to go anywhere is not knocking the ball out
 	# in front of themselves -- they are keeping it at their feet, which the
@@ -1182,7 +1415,41 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 	# the next PASS found no ball at all and silently did nothing.
 	var has_dribble_intent: bool = move_input.length() > 0.15
 
+	# v0.9.0: STOPPING is a football action, and it needs its own touch.
+	#
+	# The comment above is right that a coasting player must not keep
+	# knocking the ball ON -- that is what put the ball 3.45m ahead. But
+	# doing nothing at all is not the alternative a real player has: they
+	# put a foot on it. Measured in the isolated close-control scene, a
+	# carrier releasing the stick took ZERO further touches and the ball
+	# rolled out to 1.64m -- from a walking leash of 0.85m -- still moving
+	# faster than the player the whole way. "Stop with the ball" was in the
+	# brief's list of things the player should be able to do, and it was the
+	# one manoeuvre that simply lost possession.
+	#
+	# So a player who has stopped, with the ball running away from them,
+	# gets a KILLING touch: it damps the ball rather than driving it, aimed
+	# back toward their own feet. Distinct from the settle force below,
+	# which is a continuous damper -- this is a discrete contact, spaced by
+	# the same timer, and it emits a touch event like any other.
+	var stopping: bool = not has_dribble_intent and ball_speed > STOP_TOUCH_MIN_BALL_SPEED \
+		and ahead > 0.0 and player_speed < STOP_TOUCH_MAX_PLAYER_SPEED
+
 	touched_ball_this_frame = false
+	if stopping and _touch_timer <= 0.0:
+		# Toward the player's feet, at a speed that brings the ball back
+		# rather than stopping it dead where it is -- a ball killed in place
+		# is one that stays a metre away.
+		var back := Vector3(-to_ball.x, 0.0, -to_ball.z)
+		var back_dir: Vector3 = back.normalized() if back.length() > 0.01 else Vector3.ZERO
+		var want: Vector3 = back_dir * minf(STOP_TOUCH_RETURN_SPEED, ahead / STOP_TOUCH_INTERVAL)
+		var stop_dv: Vector3 = want - horizontal_vel
+		stop_dv = stop_dv.limit_length(TOUCH_MAX_DELTA_V)
+		ball_body.apply_central_impulse(stop_dv * ball_body.mass)
+		_touch_timer = STOP_TOUCH_INTERVAL
+		touched_ball_this_frame = true
+		_emit_touch(TouchKind.STOP, back_dir, stop_dv.length(), ball_body)
+
 	if wants_touch and has_dribble_intent and _touch_timer <= 0.0:
 		# Strength of the touch is set by the CORRECTION it has to make: how
 		# much further ahead the ball ought to be, spread over the interval
@@ -1233,10 +1500,14 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 		# allowance put a single touch at 4.0 m/s, which is exactly
 		# PassEvaluator.PASS_SPEED_MIN, i.e. a touch indistinguishable from
 		# a pass.
-		delta_v = delta_v.limit_length(TOUCH_MAX_DELTA_V_TURN if turning else TOUCH_MAX_DELTA_V)
+		delta_v = delta_v.limit_length(TOUCH_MAX_DELTA_V_TURN if turn_touch else TOUCH_MAX_DELTA_V)
 		ball_body.apply_central_impulse(delta_v * ball_body.mass)
 		_touch_timer = interval
 		touched_ball_this_frame = true
+		if turn_touch:
+			time_since_turn_touch = 0.0
+		_emit_touch(TouchKind.TURN if turn_touch else TouchKind.DRIBBLE,
+			dribble_dir, delta_v.length(), ball_body)
 
 	# Shepherding: sideways ONLY. This keeps the ball in the player's
 	# corridor rather than letting it drift off the dribble line, but it
@@ -1267,6 +1538,24 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 	var lateral_vel: Vector3 = horizontal_vel - dribble_dir * horizontal_vel.dot(dribble_dir)
 	var player_lateral: Vector3 = Vector3(velocity.x, 0.0, velocity.z)
 	player_lateral -= dribble_dir * player_lateral.dot(dribble_dir)
+	# v0.9.0: TRIED A DEADBAND HERE AND REVERTED IT.
+	#
+	# The hypothesis was that this sideways spring-damper is what makes the
+	# ball feel attached: it runs every frame with no deadband, and measured
+	# over 180 frames of running the ball's lateral deviation from the
+	# dribble line was min 0.00, mean 0.00, max 0.00. Zero to two decimals
+	# looks exactly like a ball on rails.
+	#
+	# It is not. That zero is an artifact of the measurement: the isolated
+	# scene runs a dead-straight line, the touch is applied exactly along
+	# the dribble direction, and the ball starts on that line -- so nothing
+	# ever pushes it off, with or without this force. Softening the gains
+	# (7.0/3.2 -> 3.4/1.6) and adding a 0.35m corridor changed the straight
+	# line not at all, and cost possession where the force is actually
+	# load-bearing: through a 90-degree turn the carrier went from 120 of
+	# 120 frames on the ball to 43, and stopping with the ball stopped
+	# working altogether. Holding the ball through a direction change is
+	# this force's real job.
 	var shepherd: Vector3 = -lateral * SHEPHERD_ACCEL - (lateral_vel - player_lateral) * SHEPHERD_DAMPING
 	shepherd = shepherd.limit_length(SHEPHERD_ACCEL_CLAMP) * control_quality * lerp(0.75, 1.0, stamina_ratio)
 	ball_body.apply_central_force(shepherd * ball_body.mass)
@@ -1427,6 +1716,12 @@ func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis
 	if aimed:
 		dir = aim.slerp(dir, PASS_ASSIST_BLEND_AIMED).normalized()
 	last_kick_target = option.target
+	# v0.9.0: remember WHICH KIND of pass this was -- see
+	# PassEvaluator.PassKind. Nothing in the simulation branches on it; it
+	# exists so tests and diagnostics can tell a ball played into space from
+	# one played to feet, and so a future animation or commentary layer has
+	# the distinction available without re-deriving it.
+	last_pass_kind = option.kind
 	_apply_kick_impulse(ball, option.speed * pass_speed_scale, false, dir)
 
 
@@ -1589,6 +1884,12 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 	last_kick_power = launch_speed
 	last_kick_dir = aim_dir
 	kick_count += 1
+	# A pass and a shot are ball contacts like any other -- see the
+	# `ball_touched` signal. Emitted through the same channel as a dribble
+	# touch so an animation layer has ONE place to hook, rather than one
+	# hook for close control and another for kicking.
+	_emit_touch(TouchKind.SHOT if is_shot else TouchKind.PASS,
+		aim_dir, delta_v.length(), ball)
 	post_action_kind = last_kick_kind
 	post_action_timer = POST_ACTION_WINDOW
 
@@ -1607,6 +1908,7 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 func _on_action_area_entered(body: Node3D) -> void:
 	if body is RigidBody3D and body.is_in_group("ball"):
 		ball_in_action_range = body
+		_known_ball = body
 
 
 func _on_action_area_exited(body: Node3D) -> void:
@@ -1617,6 +1919,7 @@ func _on_action_area_exited(body: Node3D) -> void:
 func _on_control_area_entered(body: Node3D) -> void:
 	if body is RigidBody3D and body.is_in_group("ball"):
 		ball_in_control_range = body
+		_known_ball = body
 
 
 ## Only drops the ball reference -- whether that actually ends possession

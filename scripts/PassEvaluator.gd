@@ -94,6 +94,22 @@ const AIMED_MIN_PASS_DISTANCE := 2.0
 const AIMED_MAX_PASS_DISTANCE := 18.0
 
 ## A teammate on a run in behind is the pass every coach wants played.
+## ---- Lead pass (v0.9.0) ----
+## How far ahead of a receiver a lead pass is played, along the attacking
+## axis. About the distance a running player covers in a second -- far
+## enough to be a ball into space rather than a pass at their feet, close
+## enough that they can genuinely get there.
+const LEAD_SPACE := 4.5
+## A lead pass is only worth playing to somebody who is actually going
+## somewhere. Below this forward speed, play it to their feet instead.
+const LEAD_MIN_FORWARD_SPEED := 1.8
+## The space played into must be at least this clear of any opponent, or the
+## pass is just a gift.
+const LEAD_MIN_SPACE_CLEARANCE := 3.0
+## Playing a runner into space is the more valuable ball when it is on, and
+## this tips a close decision toward it rather than overriding the scoring.
+const W_LEAD_BONUS := 0.08
+
 const DUTY_RUN_BEHIND_BONUS := 0.14
 const ROLE_BONUS := {"FWD": 1.0, "MID": 0.6, "DEF": 0.25, "GK": -1.0}
 
@@ -129,22 +145,60 @@ const BLOCKED_LANE_PENALTY_AIMED := 0.18
 ## overshooting by 3.5m and 5.0m, on top of the deliberate overrun.
 const ROLL_PER_SPEED := 1.689
 const ROLL_OFFSET := 0.924
-## Aim the ball to roll somewhat past the receiver so it arrives with pace
-## still on it rather than dying at their feet.
+
+## v0.9.0: how fast a pass should still be travelling WHEN IT ARRIVES, in
+## m/s. This replaces the overrun above as what actually sizes a pass, and
+## it is the root cause of the human playtest's "the pass is too weak to be
+## useful" -- a complaint the v0.8.8 tests could not see, because they
+## asserted the ball reached the right PLACE and never asked how fast it was
+## going when it got there.
 ##
-## v0.8.8: this is now an ABSOLUTE distance, not a multiplier, and that is
-## the second half of "long passes launch". The thing being modelled here --
-## letting the receiver run onto the ball rather than having it stop dead --
-## is a couple of metres of pitch, and it is the same couple of metres
-## whether the pass came from 4m or 14m. As a fraction it was neither: with
-## the roll model corrected, a 4m pass still overran by 1.4m but a 12m pass
-## overran by 4.2m, so the further the ball was played the more it ran away
-## from the man it was played to. Measured against the re-fitted model, an
-## absolute overrun drops a 12m pass from 10.14 to 8.83 m/s and leaves a 4m
-## pass essentially untouched -- long balls settle, short ones do not
-## deaden. It also brings MAX_PASS_DISTANCE back inside the speed band: a
-## 14m pass no longer clamps at PASS_SPEED_MAX.
-const OVERRUN_DISTANCE := 2.0
+## Sizing a pass by where the ball STOPS necessarily makes it arrive dead:
+## aiming to halt 2m beyond the receiver meant a 4m pass launched at the
+## 4.0 m/s floor and reached the target at walking pace. A real pass is
+## judged by how it arrives, and a receiver wants it firm enough to control
+## and run onto.
+##
+## The roll model inverts for this exactly. With roll = ROLL_PER_SPEED * v -
+## ROLL_OFFSET, a ball still doing `va` at distance `d` satisfies
+##   ROLL_PER_SPEED * v - ROLL_OFFSET = d + ROLL_PER_SPEED * va - ROLL_OFFSET
+## so the launch speed is simply d / ROLL_PER_SPEED + va -- the offset
+## cancels, and there is no fitting left to do.
+##
+## This is the TARGET the solve is written against; the ball actually
+## arrives at ~2.85 m/s, because the linear roll fit describes total
+## distance rather than the whole velocity profile, and the solve treats it
+## as if it did. The number that matters is not the absolute value but that
+## it is now CONSTANT with distance instead of decaying to nothing:
+## measured, 4m arrives at 2.85 m/s, 8m at 2.85, 10m at 2.86, 12m at 2.78.
+##
+## Launch speeds, before -> after: 4m 4.10 -> 5.77, 8m 6.47 -> 8.14, 10m
+## 7.65 -> 9.32, 12m 8.84 -> 10.50. Firmer everywhere and most of all on
+## the short passes that felt worst (+41% at 4m), while staying strictly
+## inside the pass band: PASS_SPEED_MAX (11.0) remains clear of
+## FootballPlayer.SHOT_SPEED_MIN (12.5), so a pass can never become a weak
+## shot. A 14m pass clamps and arrives at 1.93 m/s -- the honest limit of
+## what this band can carry.
+##
+## SIZED AGAINST DEFENSIVE SHAPE, not chosen. A faster ball gets behind a
+## defensive line more often, which is real football but also collides with
+## a stated non-negotiable: v0_8_3 asserts defenders stay goal-side of the
+## ball. The v0.8.8 build passes that 5 of 5 at 100%. Measured against this
+## constant, with two runs per point and five at the endpoints:
+##
+##   arrival  4m pass   8m pass   defenders goal-side
+##      1.2    3.57      5.94     100, 100, 100     (~the old, too-weak model)
+##      2.0    4.37      6.74     100, 100
+##      2.8    5.17      7.54     100, 96
+##      3.4    5.77      8.14     100 x5            <-- chosen
+##      4.0    6.37      8.74     100, 84, 84, 85, 84
+##
+## There is a cliff between 3.4 and 4.0, and 3.4 sits on the right side of
+## it: essentially all of the pass-power gain, none of the measured cost to
+## defensive shape. 4.0 was the first value tried and it broke that
+## assertion 4 runs in 5 -- kept here so the trade is visible rather than
+## rediscovered.
+const PASS_ARRIVAL_SPEED := 3.4
 ## Ceiling on how far a moving receiver may be led, as a fraction of the
 ## pass distance -- see _lead_point.
 const MAX_LEAD_FRACTION := 0.35
@@ -158,12 +212,25 @@ const PASS_SPEED_MAX := 11.0
 
 ## One evaluated option. `score` is 0..1 quality; `aim_point` already
 ## includes lead for a moving receiver; `speed` is the launch speed needed.
+## v0.9.0: the KIND of pass an option represents.
+##
+## Deliberately an enum on the option rather than a separate code path, so
+## adding a type later (through-ball, chip, switch) means adding a candidate
+## generator and a scoring tweak -- not a new branch through every caller.
+## Everything downstream takes an Option and plays it; nothing needs to know
+## which kind it is unless it wants to.
+enum PassKind {
+	NORMAL,  ## played AT a teammate, with lead for their motion
+	LEAD,    ## played INTO SPACE ahead of a teammate, for them to run onto
+}
+
 class Option extends RefCounted:
 	var target: FootballPlayer = null
 	var score: float = 0.0
 	var aim_point: Vector3 = Vector3.ZERO
 	var speed: float = 0.0
 	var distance: float = 0.0
+	var kind: int = PassKind.NORMAL
 
 
 ## Best available pass for `passer`, or null if nothing is worth playing.
@@ -262,16 +329,86 @@ static func best_option(
 			# the WEIGHT is not, because the ball still has to cover the real
 			# ground between the two players.
 			opt.speed = speed_for_distance(dist)
+			opt.kind = PassKind.NORMAL
 			best = opt
 
+		# v0.9.0: the same teammate may also be worth playing INTO SPACE.
+		# Scored as its own candidate against the same weights, so a lead
+		# ball wins only when it is genuinely the better option -- see
+		# _lead_option.
+		var lead_opt: Option = _lead_option(passer, mate, fwd_n, aim_n, score, min_alignment, aimed)
+		if lead_opt != null and (best == null or lead_opt.score > best.score):
+			best = lead_opt
+
 	return best
+
+
+## A pass played into the space AHEAD of `mate` rather than at their feet.
+##
+## Returns null unless this is genuinely on: the receiver has to be running
+## forward (a ball into space behind a stationary player is just a giveaway),
+## the space has to be clear, and it still has to be a pass the ball can
+## physically make.
+##
+## Scored from the same base as the normal option for this teammate, plus a
+## small bonus, so it competes rather than overrides -- the carrier plays a
+## runner in only when that beats the simple ball.
+static func _lead_option(
+	passer: FootballPlayer,
+	mate: FootballPlayer,
+	fwd_n: Vector3,
+	aim_n: Vector3,
+	base_score: float,
+	min_alignment: float,
+	aimed: bool
+) -> Option:
+	if fwd_n == Vector3.ZERO:
+		return null
+	# Only for a player actually making a run.
+	var mate_vel := Vector3(mate.velocity.x, 0.0, mate.velocity.z)
+	if mate_vel.dot(fwd_n) < LEAD_MIN_FORWARD_SPEED:
+		return null
+
+	var spot: Vector3 = mate.global_position + fwd_n * LEAD_SPACE
+	spot.y = passer.global_position.y
+	if FormationManager.is_behind_goal_line(spot):
+		return null
+	# The space has to be space.
+	if _nearest_opponent_distance(spot, passer.opponents) < LEAD_MIN_SPACE_CLEARANCE:
+		return null
+
+	var to_spot: Vector3 = spot - passer.global_position
+	to_spot.y = 0.0
+	var d: float = to_spot.length()
+	var min_dist: float = AIMED_MIN_PASS_DISTANCE if aimed else MIN_PASS_DISTANCE
+	var max_dist: float = AIMED_MAX_PASS_DISTANCE if aimed else MAX_PASS_DISTANCE
+	if d < min_dist or d > max_dist:
+		return null
+	var dir: Vector3 = to_spot / d
+	# A human who aimed somewhere else did not ask for this ball.
+	if aim_n != Vector3.ZERO and min_alignment > -1.0 and aim_n.dot(dir) < min_alignment:
+		return null
+
+	var score: float = base_score + W_LEAD_BONUS
+	if _lane_blocked(passer.global_position, dir, d, passer.opponents):
+		score -= BLOCKED_LANE_PENALTY_AIMED if aimed else BLOCKED_LANE_PENALTY
+
+	var opt := Option.new()
+	opt.target = mate
+	opt.score = score
+	opt.distance = d
+	opt.aim_point = spot
+	opt.speed = speed_for_distance(d)
+	opt.kind = PassKind.LEAD
+	return opt
 
 
 ## Launch speed needed for the ball to reach `distance` with pace still on
 ## it. Inverse of the measured roll model.
 static func speed_for_distance(distance: float) -> float:
-	var wanted_roll: float = distance + OVERRUN_DISTANCE
-	var speed: float = (wanted_roll + ROLL_OFFSET) / ROLL_PER_SPEED
+	# v0.9.0: sized by ARRIVAL SPEED, not by where the ball stops -- see
+	# PASS_ARRIVAL_SPEED. The ROLL_OFFSET term cancels out of this solve.
+	var speed: float = distance / ROLL_PER_SPEED + PASS_ARRIVAL_SPEED
 	return clampf(speed, PASS_SPEED_MIN, PASS_SPEED_MAX)
 
 

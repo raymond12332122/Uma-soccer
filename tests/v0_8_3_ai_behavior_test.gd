@@ -288,9 +288,23 @@ func _test_kick_instrumentation_records_intent() -> void:
 	# the scenario is restored properly rather than the assertion relaxed --
 	# re-seat the ball at the kicker's feet and let the normal possession
 	# path pick it up again.
+	#
+	# v0.9.0: STOP the kicker first. They were still carrying move_input
+	# from the aiming step above and running at 12.3 m/s -- above their own
+	# sprint speed -- so re-seating a MOTIONLESS ball at their feet and
+	# waiting meant sprinting away from it: measured, the gap grew 0.44m ->
+	# 2.07m in seven frames and possession lapsed just before the touch
+	# timer (0.12s) came round. The scenario was a knife-edge, and firmer
+	# passes in v0.9.0 tipped it. This block exists to check SHOT
+	# instrumentation, not close control at 12 m/s, so the player is brought
+	# to a halt before the ball is handed back.
+	kicker.move_input = Vector2.ZERO
+	kicker.sprint_requested = false
+	for i in range(20):
+		await get_tree().physics_frame
 	kicker._possession_cooldown_timer = 0.0
 	_teleport(ball, kicker.global_position + Vector3(0.5, 0.35, 0))
-	for i in range(10):
+	for i in range(15):
 		await get_tree().physics_frame
 	_check("The kicker has the ball back before shooting it", kicker.has_possession)
 	kicker.execute_shot(1.0)

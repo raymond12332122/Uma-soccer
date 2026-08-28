@@ -541,6 +541,169 @@ broken close control did constantly; and one asked the AI to pass while
 facing thirty metres of completely empty grass, with no opponent anywhere in
 the scene.
 
+### Football foundation: touches, reach, and pass weight (v0.9.0)
+
+A human played v0.8.8 and reported three things the automated suite could
+not see. All three were real, and in each case the tests were measuring the
+wrong quantity rather than lying.
+
+**"AI still steals from unrealistic distances."** v0.8.8's suite asserted
+that acquisitions happen inside `POSSESSION_CONTACT_RADIUS` and that kicks
+come from inside challenge range, and both were true. Neither measured the
+frame `has_possession` actually flips. Measured there, **42% of all
+acquisitions were outside the 1.20m gate, out to 1.97m** -- because the gate
+had an escape hatch:
+
+```gdscript
+if not has_possession and ball_gap > possession_contact_radius and _contest_win_timer <= 0.0:
+    return
+```
+
+`_contest_win_timer` was set by `notify_possession_won_from_opponent()`,
+which exists for a tackler collecting the ball they just poked away. But
+`PossessionManager` calls that on EVERY opponent carrier change, so every
+player who ever became carrier got 0.6s with the contact requirement
+switched off entirely. The notification is now split: a plain possession-won
+event is a REACTION (it plays an animation), and `notify_contest_won()` --
+called only by `BallContest` on a real tackle -- is the one that grants the
+exemption. The exemption also STRETCHES the radius to `CONTEST_WIN_REACH`
+(1.70m) rather than removing it.
+
+Retention had the same shape of bug with no bound at all: `POSSESSION_GRACE`
+plus the control radius let **the ball reach 3.56m from a player who still
+counted as having it**. That is what makes a turnover look absurd from the
+outside, and it is now capped by `RETAIN_MAX_DISTANCE` (2.20m).
+
+| measured over a live match | v0.8.8 | v0.9.0 |
+|---|---|---|
+| worst distance at which the ball was GAINED | 1.97m | 1.26m |
+| worst distance at which it was still "his" | 3.56m | 2.21m |
+| acquisitions per minute | 69 | 26 |
+
+**"The pass is too weak to be useful."** The v0.8.8 tests checked that a
+pass reached the right PLACE and never asked how fast it was going when it
+got there. `speed_for_distance` sized every pass so the ball would *stop*
+2m past the receiver -- which necessarily makes it arrive dead. A 4m pass
+launched at the 4.0 m/s floor.
+
+Passes are now sized by ARRIVAL SPEED, which the roll model inverts exactly:
+with `roll = ROLL_PER_SPEED * v - ROLL_OFFSET`, a ball still doing `va` at
+distance `d` needs `v = d / ROLL_PER_SPEED + va`, and the offset cancels.
+
+| pass | launched at (v0.8.8 -> v0.9.0) | arrives at |
+|---|---|---|
+| 4m | 4.10 -> **5.77** m/s | 2.42 m/s |
+| 8m | 6.47 -> **8.14** m/s | 2.42 m/s |
+| 12m | 8.84 -> **10.50** m/s | 2.42 m/s |
+
+Arrival pace is now constant with distance instead of decaying to nothing,
+and the band still stops short of `SHOT_SPEED_MIN` (12.5), so a pass can
+never become a weak shot.
+
+**The pass weight was sized against DEFENSIVE SHAPE, not chosen.** The first
+value tried made a 4m pass 6.37 m/s, and it broke a non-negotiable: v0_8_3
+asserts defenders stay goal-side of the ball, the v0.8.8 build passes that
+5 of 5 at 100%, and at that weight it fell to 84-85% on four runs in five.
+A faster ball gets in behind a defensive line -- that is real football, and
+it is also the thing the preserve list forbids regressing. Measuring the
+trade rather than picking a side found a cliff:
+
+| arrival | 4m pass | defenders goal-side |
+|---|---|---|
+| 1.2 (~the old model) | 3.57 m/s | 100, 100, 100 |
+| 2.8 | 5.17 m/s | 100, 96 |
+| **3.4 (chosen)** | **5.77 m/s** | **100 x5** |
+| 4.0 | 6.37 m/s | 100, 84, 84, 85, 84 |
+
+3.4 keeps essentially all of the pass-power gain (+41% on the short passes
+that felt worst) at no measured cost to defensive shape. The full curve is
+recorded at `PASS_ARRIVAL_SPEED` so the cliff is not rediscovered.
+
+**"Dribbling feels like dragging the ball."** Only partly answered, and the
+honest record of that is below.
+
+**Stopping with the ball** was the one clearly-broken manoeuvre. A carrier
+who released the stick took ZERO further touches -- the ball simply rolled
+away from them, out to 1.64m from a walking leash of 0.85m, still moving
+faster than the player the whole way. There is now a distinct STOP touch
+that puts a foot on the ball: measured, separation on stopping went **1.64m
+-> 0.76m**.
+
+**Ball-contact events.** Every deliberate contact -- dribble, turn, stop,
+pass, shot -- now emits `ball_touched` carrying the contact point,
+direction, strength, distance, the carrier's velocity and which foot it
+reads as. The dependency runs one way on purpose: the physics emits and
+nothing in the simulation listens, so close control behaves identically with
+no animation system attached. When the animation pack arrives it can either
+subscribe (ball drives animation) or call the same entry points from a key
+frame (animation drives ball) without either side being rewritten.
+
+**A challenge can now be beaten.** Previously a challenge could only be
+outrun; nothing the carrier did with the ball could defeat it, so a fake
+meant nothing. A defender who is committed (carrying real speed) and
+wrong-footed (momentum now pointing away from the ball) immediately after
+the carrier cuts across their body loses three quarters of their challenge
+progress. Deliberately still deterministic -- this file's whole design
+rejects a dice roll, and a failure the player *caused* is worth more than
+one they cannot see or influence.
+
+**Four experiments were tried and reverted**, results recorded at their
+sites so they are not retried blind:
+
+- Raising the urgent touch-interval floor 0.12s -> 0.20s to stop a turn
+  reading as a push: the carrier went from 120 of 120 frames on the ball
+  through a 90-degree turn to 42. A rolling ball needs those contacts.
+- Sharing the urgency window between `turning` and `trailing`: cut the turn
+  to 2 touches and lost possession outright. `trailing` is the mechanism
+  that recovers an escaping ball, not a cosmetic signal.
+- A deadband on the lateral shepherd force, on the theory that it pins the
+  ball to the dribble line: measured lateral deviation was 0.00m over 180
+  frames, which looks conclusive and is an artifact -- a dead-straight test
+  run has nothing to push the ball off the line. Softening it changed the
+  straight line not at all and broke turning and stopping.
+- (v0.8.8, still recorded) bounding `_kickable_ball`'s action-range
+  fallback.
+
+**A latent boundary defect that v0.9.0 exposed.** v0_8_8's "no player is
+ever behind a goal line" check began failing intermittently -- 96 and 123
+player-frames on two of fifteen runs, clean on the other thirteen. Chasing
+it down: `update_goalkeeper` was the ONE positioning path in the game that
+never clamped its target. `own_goal_pos` sits at `GOAL_LINE_X` (29.0) and
+the playable area ends at `PLAYABLE_HALF_LENGTH` (28.0), so a keeper's
+default standing position was, by construction, a metre behind their own
+goal line; they registered as out of play whenever they actually settled
+there. Every outfield target has always gone through `clamp_to_playable` at
+the end of `update_player`; this one did not.
+
+Both halves of that are worth stating. The DEFECT is old and readable in
+the code, and nothing in v0.9.0 touches keeper positioning. The
+MANIFESTATION is new: the v0.8.8 build is clean on 17 runs against 2
+failures in 15 here, which is too large a gap to be chance, and the likely
+reason is that stickier possession and more compact play leave a keeper
+sitting at that default target more of the time. "Pre-existing, not mine"
+would have been the convenient half of the truth; a latent bug this
+milestone started triggering is the whole of it.
+
+**A metric that stopped meaning anything.** The playtest reports what share
+of frames a midfielder more than 20m from the ball is moving -- v0.8.6's
+answer to "midfielders go inert when play is elsewhere". Across three
+v0.9.0 runs of identical code it returned 0%, 87% and 100%, which is the
+signature of a sample rather than a behaviour: the sample was **one frame**.
+Tighter possession keeps play compact enough that a midfielder is hardly
+ever 20m from the ball any more, so the condition almost never triggers.
+The figure is left in the playtest with its sample size printed beside it,
+and no claim about midfield activity is made on the strength of it.
+
+**Known issue, reported not tuned.** The dragging feel is NOT root-caused.
+Isolated, the straight-line touch cycle is healthy -- 2.7 touches/s at a
+jog, separation swinging 0.53m -> 1.25m between contacts, which is a real
+touch rhythm rather than a push. The 6.9 touches/s figure quoted from the
+v0.8.8 playtest is a live-match average across AI carriers under constant
+pressure and turning, not a measurement of the human's dribble. Three
+hypotheses were tested and all three were wrong. What remains is either
+something the isolated scene cannot reproduce, or a matter of feel that
+needs a human at the controls to judge.
+
 ### Possession validity: awareness is not contact (v0.8.8)
 
 The v0.8.7 playtest reported that the AI could steal, pass and shoot from
