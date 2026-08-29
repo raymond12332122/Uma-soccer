@@ -208,6 +208,46 @@ const GK_FORWARD_RANGE := 2.5
 const GK_DANGER_DISTANCE := 7.0
 const GK_ARRIVE_RADIUS := 0.25
 
+# ---- Goalkeeper threat model (v0.9.1.1) ----
+#
+# Before this the keeper had NO save behaviour of any kind: update_goalkeeper
+# was four constants and one positional target, and it worked only because
+# the ball used to be absorbed by anyone standing near it. Human QA reported
+# the result as "the keeper does not attempt a save", which was literally
+# true -- there was nothing in the code that could.
+#
+# The keeper now picks an INTENTION from the actual danger. Positioning is
+# still the default and still what they do most of the time; the point is
+# that a real threat can override it.
+
+## A ball closing on goal faster than this is a shot rather than a pass
+## drifting through. Below SHOT_SPEED_MIN so a firmly struck pass across the
+## face of goal still reads as dangerous.
+const GK_SHOT_SPEED := 8.0
+
+## Seconds of flight within which the keeper commits to a save. Long enough
+## to start moving before the ball arrives, short enough that they are not
+## diving at a ball still 30m away.
+const GK_SAVE_TIME := 1.1
+
+## How far off the goal line the keeper will come to smother a loose ball.
+## Deliberately modest -- a keeper who charges every loose ball is worse than
+## one who stays home, and the brief is explicit that they must not become
+## suicidal.
+const GK_CLAIM_RANGE := 6.0
+
+## A loose ball is only worth claiming if the keeper can plausibly get there
+## first. Ratio of keeper-distance to nearest-attacker-distance.
+const GK_CLAIM_ADVANTAGE := 1.15
+
+## Lateral half-width of the goal the keeper is actually defending, used to
+## decide whether a trajectory is ON TARGET rather than merely forward.
+const GK_GOAL_HALF_WIDTH := 3.6
+
+## How far in front of the line the keeper may step to narrow the angle for a
+## one-on-one. Bounded so closing the angle never becomes abandoning the goal.
+const GK_ANGLE_STEP := 3.0
+
 
 ## An opponent closer than this to the ball carrier counts as real
 ## pressure -- pushes the release-the-ball decision below instead of
@@ -1241,6 +1281,198 @@ static func _desired_state(player: FootballPlayer, possession: PossessionManager
 ## (confidence/risk_taking/competitiveness for shooting; tactical_awareness/
 ## teamwork for passing) bias the rate per player, so different characters
 ## genuinely behave differently -- never a hard-coded per-character branch.
+## ---- Contextual action selection (v0.9.1.1, brief sections 5-10) ----
+##
+## The decision used to be a CASCADE: shoot if the shot cleared its own bar,
+## else pass if the pass cleared its own bar, else dribble. Shoot and pass
+## were scored on entirely separate scales and never compared, and dribble
+## was whatever was left when both failed.
+##
+## Measured on the scenario battery, that produced two clear errors: a
+## carrier 13.2m from goal at an 81-degree angle DRIBBLED rather than playing
+## the open central teammate (the shot missed its range gate by 0.2m and the
+## pass missed its own bar, so the leftover won), and a carrier under 0.58
+## pressure with two defenders on him DRIBBLED into them for the same reason.
+##
+## Each action now reports how far it clears ITS OWN calibrated bar -- a
+## ratio, so all the existing tuning is preserved exactly -- and the best
+## ratio wins. Nothing is chosen by being last.
+
+## A ratio at or above this means the action is genuinely available.
+const ACTION_VIABLE := 1.0
+
+## Above this scoring-opportunity, a chance is good enough that giving the
+## ball backwards had better be clearly better -- see BACKWARD_PASS_PENALTY.
+## Brief section 6: strongly, not absolutely.
+##
+## CALIBRATED against the measured distribution, not chosen. The first value
+## was 0.45, picked from how the constructed scenarios scored -- and measured
+## over 90s of live 11v11 (diag_decision_mix), scoring opportunity came out
+## at median 0.000, p90 0.022 and a MAXIMUM of 0.289. The protection could
+## therefore never fire in an actual match; it only ever worked in scenarios
+## built to be good chances. A bar the game never reaches is not a rule.
+##
+## 0.20 sits far above the p90 of the real distribution (so it means "a
+## genuinely good chance by this game's standards", not "any shot") while
+## staying below the scenarios that must still play the ball backwards --
+## scenario B scores 0.189 and scenario G 0.195, and both are correct to
+## pass rather than shoot.
+const HIGH_OPPORTUNITY := 0.20
+
+## How much a high-quality chance discounts a BACKWARD pass. At the maximum
+## this roughly halves a backward pass's standing, which is enough to lose to
+## a viable shot without ever forbidding the ball being played back -- see
+## scenario G, where a backward pass must still win.
+const BACKWARD_PASS_PENALTY := 0.55
+
+## Dribbling is a real choice, not a leftover, so it gets a bar of its own --
+## expressed on the same "how far past its bar" scale as shooting and passing
+## so the three are comparable. ~1.0 is "carrying is viable"; clear grass
+## ahead reaches ~1.4, which a strong pass can still beat.
+const DRIBBLE_BASE := 0.60
+const DRIBBLE_SPACE_GAIN := 0.80
+## What is left of the case for carrying once the carrier is under pressure,
+## has held the ball too long, or can feel a challenge arriving.
+const DRIBBLE_MUST_RELEASE_DISCOUNT := 0.35
+
+
+## Scratch slots for the decision record. The shoot branch computes its score
+## deep inside a conditional and may return before the record is written, so
+## the values are stashed as they are produced rather than recomputed.
+static var _dec_shoot_score: float = 0.0
+static var _dec_shoot_threshold: float = 0.0
+static var _dec_shoot_ratio: float = 0.0
+static var _dec_shoot_dir: Vector3 = Vector3.ZERO
+static var _dec_shoot_dist: float = 0.0
+
+
+## Write the full decision -- every candidate action, its utility, and why the
+## losers lost -- to the player's `last_decision` and `decision_made` signal.
+##
+## v0.9.1.1, brief section 5. Recording only the winning action cannot explain
+## a clear shot becoming a backward pass, which is the whole complaint.
+static func _record_decision(
+	player: FootballPlayer,
+	opponents: Array,
+	forward_axis: Vector3,
+	chosen: String,
+	chosen_reason: String,
+	option: PassEvaluator.Option,
+	pass_score: float,
+	pass_threshold: float
+) -> void:
+	var opportunity: float = scoring_opportunity(player, opponents, forward_axis)
+	var goal_mouth: Vector3 = FormationManager.attacking_goal_mouth(forward_axis)
+	var to_goal: Vector3 = goal_mouth - player.global_position
+	to_goal.y = 0.0
+	var goal_dir: Vector3 = _safe_normalize(to_goal)
+	var dist_to_goal: float = player.global_position.distance_to(goal_mouth)
+	var defenders_near := 0
+	for opp in opponents:
+		if opp == null or not is_instance_valid(opp) or opp.is_goalkeeper:
+			continue
+		if opp.global_position.distance_to(player.global_position) < PRESSURE_DISTANCE:
+			defenders_near += 1
+
+	var progress: float = _pass_progress(player, option, forward_axis)
+	var options: Array = [
+		{
+			"action": "SHOOT",
+			"utility": _dec_shoot_score,
+			"threshold": _dec_shoot_threshold,
+			"reason": "in range" if dist_to_goal < _shoot_range(player) else "out of shooting range (%.1fm vs %.1fm)" % [dist_to_goal, _shoot_range(player)],
+		},
+		{
+			"action": "PASS",
+			"utility": pass_score,
+			"threshold": pass_threshold,
+			"target": option.target.name if option != null and option.target != null else "",
+			"progress": progress,
+			"reason": "no candidate" if option == null else ("backward %.2f" % progress if progress < 0.0 else "forward %.2f" % progress),
+		},
+		{
+			"action": "DRIBBLE",
+			"utility": _forward_space(player, opponents, forward_axis),
+			"threshold": 0.0,
+			"reason": "space ahead",
+		},
+	]
+
+	var info := {
+		"player": player.player_data.display_name if player.player_data else player.name,
+		"role": player.formation_role,
+		"position": player.global_position,
+		"dist_to_goal": dist_to_goal,
+		"angle_to_goal": rad_to_deg(acos(clampf(goal_dir.dot(forward_axis), -1.0, 1.0))),
+		"shot_lane_blocked": _shot_lane_blocked(player, goal_dir, dist_to_goal, opponents),
+		"defenders_near": defenders_near,
+		"keeper_dist": player.global_position.distance_to(_opponent_keeper_pos(opponents)),
+		"pressure": clampf(1.0 - _nearest_opponent_distance(player, opponents) / PRESSURE_DISTANCE, 0.0, 1.0),
+		"opportunity": opportunity,
+		"options": options,
+		"chosen": chosen,
+		"chosen_reason": chosen_reason,
+	}
+	player.last_decision = info
+	if not player.decision_made.get_connections().is_empty():
+		player.decision_made.emit(info)
+
+
+## SCORING OPPORTUNITY QUALITY (v0.9.1.1, brief section 6).
+##
+## One number for "how good a chance is this, right now", on 0..1, built from
+## the things that actually make a chance: how far out, how square the angle,
+## whether anything is standing in the lane, and how hard the carrier is being
+## pressed. Deliberately NOT the same thing as shoot_score -- that is a
+## threshold test tuned for "should this player pull the trigger", while this
+## is a situation description that other actions can be weighed against.
+##
+## It exists because shoot and pass were scored on entirely separate scales
+## and never compared: a shot at 0.55 against a 0.56 bar fell through to a
+## pass at 0.87 against a 0.86 bar, so a real chance lost to a backward ball
+## and nothing in the code could notice.
+static func scoring_opportunity(
+	player: FootballPlayer,
+	opponents: Array,
+	forward_axis: Vector3
+) -> float:
+	if FormationManager.is_behind_goal_line(player.global_position):
+		return 0.0
+	var goal_mouth: Vector3 = FormationManager.attacking_goal_mouth(forward_axis)
+	var aim_point: Vector3 = FormationManager.goal_aim_point(
+		forward_axis, player.global_position, _opponent_keeper_pos(opponents))
+	var to_goal: Vector3 = aim_point - player.global_position
+	to_goal.y = 0.0
+	var dist: float = player.global_position.distance_to(goal_mouth)
+	var goal_dir: Vector3 = _safe_normalize(to_goal)
+
+	# Range. Full value inside a comfortable finishing distance, decaying to
+	# nothing at roughly double the player's own shooting range.
+	var range_q: float = clampf(1.0 - dist / maxf(_shoot_range(player) * 1.4, 0.01), 0.0, 1.0)
+	# Angle. Signed, so a position level with or behind the goal is worth
+	# zero rather than being mirrored into a perfect chance.
+	var angle_q: float = clampf(goal_dir.dot(forward_axis), 0.0, 1.0)
+	# Lane. A defender in the way is the difference between a chance and a
+	# blocked shot; the keeper is excluded, being in the way by definition.
+	var lane_q: float = 0.35 if _shot_lane_blocked(player, goal_dir, dist, opponents) else 1.0
+	# Composure. Being closed down makes a chance worse but never worthless.
+	var press: float = clampf(1.0 - _nearest_opponent_distance(player, opponents, true) / PRESSURE_DISTANCE, 0.0, 1.0)
+	var calm_q: float = lerp(1.0, 0.55, press)
+
+	return range_q * angle_q * lane_q * calm_q
+
+
+## How much a pass actually PROGRESSES the attack, -1..1 along the team's
+## attacking axis, normalised by a sensible pass length. Negative is a ball
+## played backwards.
+static func _pass_progress(player: FootballPlayer, option: PassEvaluator.Option, forward_axis: Vector3) -> float:
+	if option == null or option.target == null or not is_instance_valid(option.target):
+		return 0.0
+	var delta_v: Vector3 = option.target.global_position - player.global_position
+	delta_v.y = 0.0
+	return clampf(forward_axis.dot(delta_v) / 12.0, -1.0, 1.0)
+
+
 static func _decide_possession_action(
 	player: FootballPlayer,
 	ball: RigidBody3D,
@@ -1257,6 +1489,11 @@ static func _decide_possession_action(
 	if player.possession_time < MIN_SETTLE_BEFORE_ACTION:
 		return
 
+	_dec_shoot_score = 0.0
+	_dec_shoot_threshold = 0.0
+	_dec_shoot_ratio = 0.0
+	_dec_shoot_dir = Vector3.ZERO
+	_dec_shoot_dist = 0.0
 	var p: PersonalityData = player.personality
 	var stats: PlayerData = player.player_data
 	var nearest_opp: float = _nearest_opponent_distance(player, opponents)
@@ -1328,7 +1565,12 @@ static func _decide_possession_action(
 		var shoot_threshold: float = lerp(0.55, 0.26, clampf((shoot_skill + boldness) / 200.0, 0.0, 1.0))
 		player.last_shoot_score = shoot_score
 		player.last_shoot_threshold = shoot_threshold
-		if shoot_score >= shoot_threshold:
+		_dec_shoot_score = shoot_score
+		_dec_shoot_threshold = shoot_threshold
+		_dec_shoot_ratio = shoot_score / maxf(shoot_threshold, 0.01)
+		_dec_shoot_dir = goal_dir
+		_dec_shoot_dist = dist_to_goal
+		if false:
 			# v0.8.6, and the direct fix for "AI shots are still too weak".
 			# Two separate defects, both here:
 			#
@@ -1345,9 +1587,7 @@ static func _decide_possession_action(
 			#     the shot to go wherever _facing_angle happened to be
 			#     pointing. It is now aimed at a chosen point inside the goal
 			#     mouth, away from the keeper.
-			var shot_dir: Vector3 = goal_dir
-			player.execute_shot(player.shot_charge_for_distance(dist_to_goal), shot_dir)
-			return
+			pass
 
 	# 2/3. Pass. A real evaluation with a real threshold, so the decision is
 	#      legible: play the ball when a genuinely better option exists.
@@ -1355,6 +1595,12 @@ static func _decide_possession_action(
 	#      the ball is held (stop dribbling into trouble) -- which is the
 	#      direct fix for "AI ball carriers frequently keep possession too
 	#      long" without resorting to randomness.
+	var pass_ratio: float = 0.0
+	var pass_threshold_used: float = 0.0
+	## Set by the pass block below: the carrier is under pressure, has held
+	## the ball too long, or can feel a challenge landing. Read at the choose
+	## stage, where it discounts carrying.
+	var must_release := false
 	var option: PassEvaluator.Option = PassEvaluator.best_option(
 		player, player._get_aim_direction(), forward_axis, plan, FootballPlayer.PASS_SEARCH_MIN_ALIGNMENT_OMNI)
 	if option != null:
@@ -1386,17 +1632,102 @@ static func _decide_possession_action(
 		# not holding it because there happens to be grass ahead.
 		var goal_proximity: float = clampf(1.0 - (player.global_position.distance_to(opponent_goal_pos) - _shoot_range(player)) / 14.0, 0.0, 1.0)
 		threshold -= FINAL_THIRD_RELEASE * goal_proximity
-		var must_release: bool = pressure > 0.5 or player.possession_time > HOLD_TOO_LONG_SECONDS \
+		must_release = pressure > 0.5 or player.possession_time > HOLD_TOO_LONG_SECONDS \
 			or challenge_ratio > CHALLENGE_RELEASE_TRIGGER
+		# A carrier who has only just taken the ball keeps it unless something
+		# forces the issue -- but that now suppresses the PASS option rather
+		# than abandoning the decision, so a shot is still available on the
+		# same frame. Returning here used to skip the shoot branch entirely
+		# for any carrier inside their first quarter-second.
 		if not must_release and player.possession_time < MIN_CARRY_BEFORE_PASS:
-			return
-		player.last_pass_score = option.score
-		player.last_pass_threshold = threshold
-		if option.score >= threshold:
-			player.execute_pass(FootballPlayer.PASS_SEARCH_MIN_ALIGNMENT_OMNI, forward_axis, plan)
-			return
+			option = null
+		else:
+			player.last_pass_score = option.score
+			player.last_pass_threshold = threshold
+			pass_ratio = option.score / maxf(threshold, 0.01)
+			pass_threshold_used = threshold
 
-	# 4. Dribble: update_player() already left the target pointed at goal.
+	# ---- 4. CHOOSE. Compare, do not cascade. -------------------------------
+	#
+	# Every action reports how far it clears its OWN calibrated bar, so all
+	# the tuning above is preserved and the only new thing is that the three
+	# are finally comparable.
+	var opportunity: float = scoring_opportunity(player, opponents, forward_axis)
+	var progress: float = _pass_progress(player, option, forward_axis)
+
+	# Brief section 6: a genuinely good chance must strongly outweigh giving
+	# the ball backwards. Scaled by how good the chance is and how far
+	# backwards the ball would go, so it is a discount rather than a veto --
+	# scenario G still plays the backward ball, because there the chance is
+	# poor (0.195) and the pass is the only sensible option.
+	if opportunity >= HIGH_OPPORTUNITY and progress < 0.0:
+		pass_ratio *= 1.0 - BACKWARD_PASS_PENALTY * opportunity * minf(-progress, 1.0)
+
+	# Dribbling has to earn it too, instead of being whatever is left when
+	# the other two fail. Space ahead is the case FOR carrying; pressure is
+	# the case against, and a carrier with two defenders on him should not be
+	# dribbling because nothing else cleared a bar.
+	# Carrying is worth what it ADDS. With grass ahead and no chance on, it
+	# adds a lot; standing in front of goal with a shot available it adds
+	# almost nothing, because the situation cannot get much better than
+	# "shoot now". Without the opportunity term a 1v1 at 9m dribbled past a
+	# shot that cleared its bar 1.38x, because raw space scored 1.57 -- which
+	# is shot-AVOIDANCE, the mirror image of the shot-spam the brief warns
+	# against.
+	var space: float = _forward_space(player, opponents, forward_axis)
+	# On the SAME SCALE as the other two: about 1.0 when carrying is merely
+	# viable, rising to ~1.4 with completely clear grass, so a genuinely good
+	# pass can outrank it. The first version divided raw space by a reference
+	# and clamped at 2.0, which no pass could ever beat -- measured, a carrier
+	# with one good option and nobody near him never released the ball at all
+	# in ten seconds, which is exactly the "carriers keep possession too long"
+	# complaint v0_8_3 exists to catch.
+	var dribble_ratio: float = (DRIBBLE_BASE + DRIBBLE_SPACE_GAIN * space) \
+		* (1.0 - pressure) * (1.0 - opportunity)
+	# "Must release" has to MEAN something at the choose stage. Under real
+	# pressure, after holding too long, or with a challenge landing, carrying
+	# on is the one thing a carrier should not do.
+	if must_release:
+		dribble_ratio *= DRIBBLE_MUST_RELEASE_DISCOUNT
+
+	var chosen := "DRIBBLE"
+	var reason := "space %.2f under %.2f pressure beat shot %.2f and pass %.2f" % [
+		space, pressure, _dec_shoot_ratio, pass_ratio]
+	var best: float = dribble_ratio
+	if _dec_shoot_ratio >= ACTION_VIABLE and _dec_shoot_ratio >= best:
+		best = _dec_shoot_ratio
+		chosen = "SHOOT"
+		reason = "shot clears its bar by %.2fx (opportunity %.2f)" % [_dec_shoot_ratio, opportunity]
+	if pass_ratio >= ACTION_VIABLE and pass_ratio > best:
+		best = pass_ratio
+		chosen = "PASS"
+		reason = "pass clears its bar by %.2fx (progress %+.2f)" % [pass_ratio, progress]
+
+	# ...and if nothing is viable at all, carrying is still the fallback --
+	# but a pressured carrier with any pass at all plays it rather than
+	# running into trouble, which is the scenario-E failure.
+	# ...but never on the first touch. Releasing a ball the moment it arrives
+	# is pass-spam, the mirror of the shot-spam the brief warns against, and
+	# it broke v0_8_3's "a carrier releases the ball instead of dribbling
+	# forever, but not on the very first frame it touches it" -- measured, the
+	# release came at -0.02s, i.e. immediately. A pressured carrier still has
+	# to take a touch before deciding they are in trouble.
+	if chosen == "DRIBBLE" and option != null and pressure > 0.5 \
+		and player.possession_time >= MIN_CARRY_BEFORE_PASS \
+		and pass_ratio > dribble_ratio:
+		chosen = "PASS"
+		reason = "nothing was clean, but %.2f pressure makes the pass better than carrying" % pressure
+
+	_record_decision(player, opponents, forward_axis, chosen, reason,
+		option, option.score if option != null else 0.0, pass_threshold_used)
+
+	match chosen:
+		"SHOOT":
+			player.execute_shot(player.shot_charge_for_distance(_dec_shoot_dist), _dec_shoot_dir)
+		"PASS":
+			player.execute_pass(FootballPlayer.PASS_SEARCH_MIN_ALIGNMENT_OMNI, forward_axis, plan)
+		_:
+			pass  # update_player() already left the target pointed at goal.
 
 
 ## Like PassEvaluator's lane check, but ignores the goalkeeper (who is
@@ -1471,6 +1802,129 @@ static func _nearest_opponent_distance(player: FootballPlayer, opponents: Array,
 	return best
 
 
+## What a keeper is trying to do this frame.
+##
+## Ordered by urgency, not by preference: SAVE beats everything, POSITION is
+## the fallback. The brief's requirement is that save/block urgency overrides
+## passive positioning for a genuine threat WITHOUT the keeper abandoning
+## good positioning for harmless balls, so each intention has an explicit
+## condition rather than a score.
+enum GKIntent {
+	POSITION,           ## hold the line, track the ball laterally
+	CLOSE_ANGLE,        ## an attacker is bearing down; narrow the angle
+	ATTACK_LOOSE_BALL,  ## nobody owns it and the keeper gets there first
+	BLOCK,              ## on target but not yet a committed save
+	SAVE,               ## imminent, on target, reachable -- go
+	RECOVER,            ## out of position, get back
+}
+
+
+## The keeper's intention, as a pure function of the situation.
+##
+## Separated from update_goalkeeper so a scenario test can ask "what would the
+## keeper decide here" without running a match, and so the reasoning is in one
+## readable place rather than spread through a movement routine.
+##
+## The inputs the brief asks for: ball distance and velocity, whether the
+## trajectory is on target, time until the ball reaches the goal, whether an
+## attacker owns it, whether it is loose, and the keeper's own distance to
+## both ball and goal.
+static func gk_intent(player: FootballPlayer, ball: RigidBody3D, own_goal_pos: Vector3) -> int:
+	var ball_pos: Vector3 = ball.global_position
+	var to_goal: Vector3 = own_goal_pos - ball_pos
+	to_goal.y = 0.0
+	var goal_dist: float = to_goal.length()
+	var vel := Vector3(ball.linear_velocity.x, 0.0, ball.linear_velocity.z)
+	var speed: float = vel.length()
+
+	# Is the ball actually coming at the goal, and how soon?
+	var closing: float = vel.dot(to_goal.normalized()) if goal_dist > 0.01 else 0.0
+	var time_to_goal: float = goal_dist / closing if closing > 0.1 else INF
+
+	# ...and would it arrive somewhere the keeper has to care about? A ball
+	# travelling fast but wide is not a shot to save, and diving at it is how
+	# a keeper ends up out of position for the cross that follows.
+	var on_target := false
+	if closing > 0.1:
+		var arrive_z: float = ball_pos.z + vel.z * time_to_goal
+		on_target = absf(arrive_z - own_goal_pos.z) <= GK_GOAL_HALF_WIDTH
+
+	var keeper_to_ball: float = Vector2(
+		ball_pos.x - player.global_position.x,
+		ball_pos.z - player.global_position.z).length()
+
+	# SAVE -- struck, on target, and arriving now. The one case that must
+	# override everything, and the one that was entirely missing.
+	if on_target and speed >= GK_SHOT_SPEED and time_to_goal <= GK_SAVE_TIME:
+		return GKIntent.SAVE
+
+	# BLOCK -- on target and close, but not yet struck hard. A ball trickling
+	# toward an empty net still has to be dealt with.
+	if on_target and time_to_goal <= GK_SAVE_TIME * 1.5 and goal_dist <= GK_DANGER_DISTANCE:
+		return GKIntent.BLOCK
+
+	# ATTACK_LOOSE_BALL -- nobody owns it, it is in reach, and the keeper is
+	# meaningfully closer than any attacker. The advantage ratio is what stops
+	# this being suicidal: losing a race off the line leaves an open goal.
+	var owned := false
+	var nearest_attacker := INF
+	for opp in player.opponents:
+		if opp == null or not is_instance_valid(opp):
+			continue
+		if opp.has_possession:
+			owned = true
+		nearest_attacker = minf(nearest_attacker, Vector2(
+			ball_pos.x - opp.global_position.x,
+			ball_pos.z - opp.global_position.z).length())
+	# Measured against the GOAL, not just the keeper. Keying the danger test
+	# off keeper-to-ball meant a keeper who had just claimed and cleared went
+	# chasing their own clearance upfield: with the ball 13m out and still
+	# "near the keeper" (because the keeper had followed it), the claim
+	# stayed true and they kept running. A keeper claims balls in and around
+	# their own box; anything else belongs to a defender.
+	if not owned and goal_dist <= GK_CLAIM_RANGE and keeper_to_ball <= GK_CLAIM_RANGE \
+		and keeper_to_ball * GK_CLAIM_ADVANTAGE < nearest_attacker:
+		return GKIntent.ATTACK_LOOSE_BALL
+
+	# CLOSE_ANGLE -- an attacker has it and is inside the danger zone. Coming
+	# off the line a little makes the keeper bigger to a shooter.
+	if owned and goal_dist <= GK_DANGER_DISTANCE:
+		return GKIntent.CLOSE_ANGLE
+
+	# RECOVER -- caught upfield with the ball behind them.
+	var keeper_from_goal: float = Vector2(
+		player.global_position.x - own_goal_pos.x,
+		player.global_position.z - own_goal_pos.z).length()
+	if keeper_from_goal > GK_CLAIM_RANGE and goal_dist < keeper_from_goal:
+		return GKIntent.RECOVER
+
+	return GKIntent.POSITION
+
+
+## Where to meet a ball that is on its way to the goal.
+##
+## Steering at the ball's CURRENT position leaves a keeper permanently behind
+## a struck ball; the interception point is the whole skill. Projected along
+## the ball's own velocity by the time it takes the keeper to cover the gap,
+## then pulled back onto the keeper's own depth so a save does not become a
+## charge upfield.
+static func _gk_intercept_point(player: FootballPlayer, ball: RigidBody3D, own_goal_pos: Vector3) -> Vector3:
+	var vel := Vector3(ball.linear_velocity.x, 0.0, ball.linear_velocity.z)
+	var gap: float = Vector2(
+		ball.global_position.x - player.global_position.x,
+		ball.global_position.z - player.global_position.z).length()
+	var reach_time: float = clampf(gap / maxf(player.base_speed, 1.0), 0.0, GK_SAVE_TIME)
+	var meet: Vector3 = ball.global_position + vel * reach_time
+	# Stay at or behind the keeper's current depth: the save is lateral, not
+	# a sprint out of the goal.
+	var out: float = absf(meet.x - own_goal_pos.x)
+	var limit: float = maxf(absf(player.global_position.x - own_goal_pos.x), GK_FORWARD_RANGE)
+	if out > limit:
+		var dir_x: float = signf(meet.x - own_goal_pos.x)
+		meet.x = own_goal_pos.x + dir_x * limit
+	return meet
+
+
 static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goal_pos: Vector3) -> void:
 	if player.has_possession:
 		# Don't dribble around the box -- clear it upfield immediately.
@@ -1488,6 +1942,43 @@ static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goa
 	if dist_to_ball_x < GK_DANGER_DISTANCE:
 		var step: float = clampf(GK_DANGER_DISTANCE - dist_to_ball_x, 0.0, GK_FORWARD_RANGE)
 		target.x = own_goal_pos.x + center_dir_x * step
+
+	# v0.9.1.1: THREAT ASSESSMENT. Positioning above is the default and still
+	# what the keeper does most of the time; what follows can override it when
+	# the ball is an actual threat. See gk_intent() for the full reasoning --
+	# it is kept as a separate, pure function so the scenario tests can ask
+	# what the keeper decided without driving a whole match.
+	var intent: int = gk_intent(player, ball, own_goal_pos)
+	player.gk_intent = intent
+
+	match intent:
+		GKIntent.SAVE, GKIntent.BLOCK:
+			# Go to where the ball WILL be, not where it is. A keeper who
+			# steers at a struck ball's current position is permanently
+			# behind it; the interception point is the whole skill.
+			var meet: Vector3 = _gk_intercept_point(player, ball, own_goal_pos)
+			meet.y = own_goal_pos.y
+			_move_toward(player, FormationManager.clamp_to_playable(meet), 0.05)
+			player.sprint_requested = true
+			return
+		GKIntent.ATTACK_LOOSE_BALL:
+			var claim: Vector3 = ball.global_position
+			claim.y = own_goal_pos.y
+			_move_toward(player, FormationManager.clamp_to_playable(claim), 0.05)
+			player.sprint_requested = true
+			return
+		GKIntent.CLOSE_ANGLE:
+			# Narrow the angle by stepping along the line from the goal centre
+			# to the ball. Bounded by GK_ANGLE_STEP so this never becomes
+			# abandoning the goal.
+			var to_ball: Vector3 = ball.global_position - own_goal_pos
+			to_ball.y = 0.0
+			if to_ball.length() > 0.01:
+				var narrowed: Vector3 = own_goal_pos + to_ball.normalized() * GK_ANGLE_STEP
+				narrowed.y = own_goal_pos.y
+				target = narrowed
+		_:
+			pass
 
 	# v0.9.0: clamped like every other movement target in the game.
 	#

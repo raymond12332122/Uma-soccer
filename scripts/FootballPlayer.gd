@@ -456,6 +456,17 @@ var pass_speed_scale: float = 1.0
 ## Passes stay on the deck -- see _apply_kick_impulse. Just enough to stop
 ## the ball scuffing into the pitch, not enough to make it bounce.
 const PASS_LIFT := 0.05
+
+## Above this speed RELATIVE to a player, a ball is arriving rather than
+## being carried, and it collides with them instead of passing through --
+## see the carrier exception in _update_possession.
+##
+## Sits above the measured arrival speed of a pass (3.3-4.8 m/s at the
+## receiver, see PassEvaluator.PASS_ARRIVAL_SPEED) so a normal pass is still
+## collected cleanly, and far below the shot band (SHOT_SPEED_MIN 12.5) so a
+## struck ball always has to be stopped by a body rather than absorbed by
+## standing near it.
+const CONTROLLED_BALL_SPEED := 6.0
 @export var momentum_transfer: float = 0.25
 
 # ---- Pass assist tunables (see _get_pass_direction / _find_pass_target) ----
@@ -577,6 +588,27 @@ var ai_duty: int = TeamPlan.Duty.COVER_SPACE
 ## ai_target and this is the low-pass-filtered point actually steered
 ## toward -- see AIController.TARGET_SMOOTH_TIME.
 var ai_smoothed_target: Vector3 = Vector3.ZERO
+
+## v0.9.1.1: the goalkeeper's current intention (AIController.GKIntent).
+## Written by update_goalkeeper, read by tests and diagnostics only --
+## nothing in the simulation branches on it.
+var gk_intent: int = 0
+
+## v0.9.1.1: the FULL carrier decision, every time one is made.
+##
+## Diagnostic and test surface only; nothing in the simulation reads it. The
+## brief asks for the utility of every candidate action and the reason the
+## alternatives lost, not just the winner -- a decision log that only records
+## what happened cannot explain why a clear shot became a backward pass.
+##
+## Fields: player, role, position, dist_to_goal, angle_to_goal, shot_lane,
+## defenders_near, keeper_dist, pressure, opportunity, options (an Array of
+## {action, utility, reason}), chosen, chosen_reason.
+signal decision_made(info: Dictionary)
+
+## The last decision record, kept so a scenario test can inspect it without
+## connecting a signal.
+var last_decision: Dictionary = {}
 var _ai_target_initialized: bool = false
 
 ## v0.8.2: set/cleared exclusively by MatchManager during its brief
@@ -1316,6 +1348,29 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 	var acquire_radius: float = possession_contact_radius
 	if _contest_win_timer > 0.0:
 		acquire_radius = maxf(acquire_radius, CONTEST_WIN_REACH)
+	# v0.9.1.1: ...and you cannot simply ABSORB a ball that is travelling too
+	# fast to control.
+	#
+	# This is the root of the goalkeeper regression human QA reported as
+	# "the keeper does not attempt a save". Measured with a ball fired at a
+	# stationary keeper: possession was granted at a gap of 1.05m while the
+	# ball was still doing 9.58 m/s, close control then damped it, and the
+	# keeper "had" a ball that had been struck at them. No save was needed
+	# because none was ever required -- the shot was handed over on contact
+	# with the possession radius.
+	#
+	# Distance decides whether you can REACH the ball; this decides whether
+	# it is controllable when you get there. A faster ball has to be stopped
+	# by a body first (the ball collides with players again as of this
+	# milestone), which is what a block or a parry is, and can be collected
+	# on the rebound once it has slowed.
+	#
+	# Gates ACQUISITION only. Retention is untouched, so a carrier who knocks
+	# the ball ahead of themselves keeps it exactly as before -- their
+	# relative speed is near zero by construction.
+	if not has_possession and _relative_ball_speed(ball_in_control_range) > CONTROLLED_BALL_SPEED:
+		return
+
 	if not has_possession and ball_gap > acquire_radius:
 		# Near the ball, but not on it. Keep steering nothing and let the
 		# approach continue; this is the frame the old code handed the ball
@@ -1327,6 +1382,21 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 		possession_time = 0.0
 		_emit_possession_changed("gained", "collected")
 	has_possession = true
+	# v0.9.1.1: the ball collides with players again, so the CARRIER has to
+	# be excepted or close control fights its own collision -- see
+	# BallController.pass_through_for. Refreshed every frame of possession;
+	# it lapses on its own once the ball is clear.
+	#
+	# ONLY for a ball that is actually under control. The exception exists so
+	# a dribble does not fight its own capsule; granting it to a ball
+	# arriving at shot pace turns a body into a hole -- measured, a keeper
+	# with a ball fired at them acquired possession mid-flight and the ball
+	# then travelled straight through and out the other side. A ball moving
+	# fast RELATIVE TO THE PLAYER has to hit them, which is what a save or a
+	# block is.
+	if ball_in_control_range is BallController \
+		and _relative_ball_speed(ball_in_control_range) < CONTROLLED_BALL_SPEED:
+		ball_in_control_range.pass_through_for(self)
 
 	# v0.8.3: a heavy touch used to cut the steering force to exactly zero
 	# for control_loss_duration, so the ball simply stopped being dribbled
@@ -1895,6 +1965,18 @@ func _fill_actual_speed(ball: RigidBody3D, info: Dictionary) -> void:
 ## changed", for a settle-the-ball or lost-it reaction clip. Every site that
 ## flips has_possession routes through here rather than each growing its own
 ## emit, so the signal cannot drift out of step with the flag.
+## How fast the ball is moving RELATIVE to this player, on the ground plane.
+##
+## The number that decides whether a ball is being carried or is arriving:
+## a carrier sprinting at 7 m/s with the ball running ahead of them at the
+## same pace has a relative speed near zero, while the same 7 m/s ball at a
+## standing keeper is an arriving ball.
+func _relative_ball_speed(ball: RigidBody3D) -> float:
+	return Vector2(
+		ball.linear_velocity.x - velocity.x,
+		ball.linear_velocity.z - velocity.z).length()
+
+
 func _emit_possession_changed(what: String, reason: String = "") -> void:
 	if possession_changed.get_connections().is_empty():
 		return
@@ -2074,6 +2156,12 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 	# pass looks like and what keeps PassEvaluator's distance solve (fitted
 	# to a rolling ball) applicable to it.
 	delta_v.y = kick_lift if is_shot else PASS_LIFT
+
+	# v0.9.1.1: the ball leaves from the player's feet, i.e. from INSIDE
+	# their capsule, and the ball collides with players again. Without this
+	# the shot rebounds off the shooter. See BallController.pass_through_for.
+	if ball is BallController:
+		ball.pass_through_for(self)
 
 	ball.apply_central_impulse(delta_v * ball.mass)
 

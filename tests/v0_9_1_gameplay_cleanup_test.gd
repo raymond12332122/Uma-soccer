@@ -259,8 +259,20 @@ func _test_ball_does_not_fling_players() -> void:
 	await get_tree().physics_frame
 	p.set_match_context([p], [])
 
-	_check("The ball's collision mask does not include the player layer",
-		(ball.collision_mask & 2) == 0)
+	# v0.9.1.1 CORRECTED. This used to assert the ball's mask EXCLUDED the
+	# player layer, which is how v0.9.1 stopped the ball flinging people --
+	# and it is why this suite passed while the ball was passing straight
+	# THROUGH every player on the pitch, goalkeepers included. The assertion
+	# was satisfied by the bug: a player cannot be flung by a ball that never
+	# touches them. Human QA found it; no automated check here could, because
+	# the check itself encoded the mistake.
+	#
+	# The real requirement is one-way, not absent: the ball is stopped by
+	# bodies (so a keeper has something to save with) and never moves them.
+	_check("The ball IS blocked by players, so a body can block or save",
+		(ball.collision_mask & p.collision_layer) != 0)
+	_check("...but a player is never blocked or pushed by the ball",
+		(p.collision_mask & ball.collision_layer) == 0)
 
 	var start: Vector3 = p.global_position
 	# Fire the ball at the player as hard as the game can strike one.
@@ -276,6 +288,11 @@ func _test_ball_does_not_fling_players() -> void:
 
 	_check("A ball struck at %.0f m/s does not launch the player it hits (moved %.2fm)"
 		% [FootballPlayer.SHOT_SPEED_MIN * 2.0, max_shift], max_shift < 0.5)
+	# ...and the check that would have caught the pass-through: the ball has
+	# to still be on the near side of the player it was fired at.
+	var ball_side: float = ball.global_position.z - p.global_position.z
+	_check("...and the ball is STOPPED by them rather than passing through (ended %.2fm on the near side)"
+		% ball_side, ball_side > 0.0)
 
 	_teardown([field, ball, p])
 

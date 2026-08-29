@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://tests/diag_decision_mix.gd" id="1"]
+
+[node name="DiagDecisionMix" type="Node3D"]
+script = ExtResource("1")

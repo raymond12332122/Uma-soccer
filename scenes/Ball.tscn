@@ -18,7 +18,7 @@ bounce = 0.18
 
 [node name="Ball" type="RigidBody3D"]
 collision_layer = 4
-collision_mask = 1
+collision_mask = 3
 continuous_cd = true
 mass = 0.45
 linear_damp = 0.4

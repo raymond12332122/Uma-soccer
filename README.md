@@ -1434,6 +1434,38 @@ solid bodies (50% bar, currently 26-43%) and off-ball run convergence is
 reduced by about half rather than eliminated. Both are in the report with
 their measurements.
 
+## v0.9.1.1 — AI Brain + Goalkeeper Recovery
+
+Full engineering report: [`docs/v0.9.1.1-engineering-report.md`](docs/v0.9.1.1-engineering-report.md).
+
+- **Goalkeeper regression fixed at the root.** v0.9.1 had left the ball's
+  collision mask excluding players and the players' mask excluding the ball,
+  so the ball passed straight THROUGH everyone -- there was nothing for a
+  keeper to block with. Restored as a one-way interaction (the ball is stopped
+  by bodies, never pushes them) with targeted exceptions for the carrier and
+  the kicker.
+- **Possession can no longer be absorbed from a struck ball.** It was being
+  granted at 9.58 m/s, so a shot was handed over on contact with the
+  possession radius and no save was ever required.
+- **Goalkeepers have a threat model** -- POSITION, CLOSE_ANGLE,
+  ATTACK_LOOSE_BALL, BLOCK, SAVE, RECOVER -- driven by ball speed, trajectory,
+  time to goal and who owns the ball. Measured: reacts to a close shot in
+  0.17s, closes to 0.60m, claims uncontested loose balls, ignores harmless
+  ones, never abandons the goal line.
+- **The carrier decision compares actions instead of cascading.** Shoot and
+  pass were previously scored on separate scales and never compared, so a real
+  chance could lose to a worthless backward pass. Every action now reports how
+  far it clears its own calibrated bar, and the best wins -- all existing
+  thresholds preserved.
+- **Scoring-opportunity quality** discounts backward passes in proportion to
+  how good the chance is. Calibrated against the measured live distribution,
+  not guessed: the first threshold could never fire in a real match.
+
+Known and reported: the AI rarely creates good chances (peak opportunity 0.289
+over a match -- pre-existing, out of scope here), kickoff possession is more
+contested than baseline, and the passing-lane share is much improved but still
+oscillating around its bar.
+
 ## Roadmap Ideas (for expanding into a full game)
 
 - Integrate the 5 models that couldn't be downloaded this round (Super
