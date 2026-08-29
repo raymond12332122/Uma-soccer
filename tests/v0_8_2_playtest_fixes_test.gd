@@ -225,11 +225,26 @@ func _test_transition_defense_after_turnover() -> void:
 	# 5-state model landed.) Traced directly: the away player is elected
 	# carrier from frame 6 and possessing_team reads 1 throughout; only the
 	# sticky team signal was still waiting.
+	#
+	# v0.9.1: stop as soon as the turnover lands, rather than always waiting
+	# the full window. Both checks below are about the moment possession
+	# changes -- the second one says "right after losing the ball" in its own
+	# name -- but this loop used to run a fixed 71 frames (1.18s) no matter
+	# when the change actually happened, and then assert the age of a timer
+	# against a 0.80s window. That is a knife-edge, and v0.9.1 tipped it:
+	# enabling player-vs-player collision (see FootballPlayer.tscn's mask)
+	# means the away player is no longer shoved around by the pinned ball, so
+	# the turnover now completes EARLIER in the loop and the timer had aged
+	# to 0.833s by the time it was read -- 33ms past the window, from a fix
+	# that made possession transfer cleaner. The scenario now measures at the
+	# event it names.
 	var confirm_frames: int = int(ceil(PossessionManager.CONFIRM_TIME_CONTESTED * 60.0)) + 20
 	for i in range(confirm_frames):
 		PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), away_p.global_position + Vector3(0.4, 0.3, 0)))
 		PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
 		await get_tree().physics_frame
+		if pm.last_team_with_possession == 1:
+			break
 	_check("Possession genuinely changed to away", pm.last_team_with_possession == 1)
 	_check("time_since_last_team_change resets on a real turnover", pm.time_since_last_team_change < AIController.TRANSITION_WINDOW)
 

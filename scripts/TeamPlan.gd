@@ -50,6 +50,7 @@ enum Duty {
 	COVER_SPACE,    ## holds shape between the ball and our own goal
 	FOLLOW_UP,      ## just played the ball -- stay in the move you started
 	PUSH_UP,        ## off the ball: advance into space, offer a lane
+	RECEIVE,        ## a pass is on its way to me -- go and meet it
 }
 
 ## How fast attack_intent slews between fully-defending and fully-attacking.
@@ -394,6 +395,21 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	# their job IS the move.
 	_fill_follow_up(available, ball)
 
+	# v0.9.1: ...and the OTHER half of a pass, which did not exist.
+	#
+	# FOLLOW_UP gave the passer a job once the ball had left them. Nothing
+	# ever gave the intended RECEIVER one. CONTEST is the only duty in the
+	# game that actively goes to the ball, and it is assigned by proximity
+	# on both sides -- so while a pass was in flight the defending team's
+	# contester ran at it and the man it was played to stood on his support
+	# position waiting. Measured over 90 seconds of AI play: 90 passes, 61
+	# collected by an opponent, FOUR reaching the intended receiver. That is
+	# the "bots pass straight to the enemy" QA reported; the evaluator never
+	# selected an opponent even once (measured: 0), it simply played to a
+	# team-mate who had not been told to come and get it.
+	# Assigned LAST, after every other duty has been allocated -- see the
+	# call at the end of this function. It used to be filled here, and that
+	# was a measured regression rather than a style point.
 	var attacking_weight: float = clampf((attack_intent + 1.0) * 0.5, 0.0, 1.0)
 
 	# v0.8.8: a side that ACTUALLY HAS THE BALL always offers a couple of
@@ -481,11 +497,136 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	for p in available:
 		_assign(p, Duty.COVER_SPACE)
 
+	# 6. ...and only NOW, the man the ball was actually played to.
+	#
+	# v0.9.1. This ran before the allocation above and erased the receiver
+	# from `available`, which meant every pass in flight removed one player
+	# from the pool and shifted every duty downstream of them by one -- twice
+	# per pass, once as the ball left and once as it was collected. It also
+	# bypassed DUTY_RETENTION_BONUS entirely, since that only applies inside
+	# _best_for and this assigns directly.
+	#
+	# Measured over a settled passage (V0_8_5PossessionPhaseTest, paired runs
+	# against a v0.9.0 baseline worktree):
+	#
+	#   v0.9.0 baseline                     0.162  0.173  0.173  0.203
+	#   v0.9.1 with RECEIVE filled early    0.446  0.422
+	#   v0.9.1 with RECEIVE disabled        0.242  0.263  0.311
+	#   v0.9.1 with player collision off    0.436          <-- not the cause
+	#
+	# against a 0.30 changes/player/second ceiling. The collision change was
+	# the intuitive suspect and the isolation run cleared it: turning solid
+	# bodies off left churn at 0.436, essentially unchanged. It was this.
+	#
+	# Filling it last makes it an OVERRIDE rather than a reallocation: the
+	# ten other players keep whatever they were already doing, and the one
+	# man the ball is travelling to swaps his job for going to get it. That
+	# is also the more honest model of what happens on a pitch.
+	# Overriding a POSITIONAL duty is the point. Overriding one of the two
+	# duties that are themselves FACTS about a player is not: CONTEST is the
+	# man going to win the ball and FOLLOW_UP is the man who just played it,
+	# and neither stops being true because a pass is in the air. Passing the
+	# whole squad in without this filter clobbered them -- measured, it broke
+	# v0_8_6's "a player who just shot is allocated FOLLOW_UP" and its
+	# involvement-decay follow-up, which had been green a moment earlier.
+	var receive_candidates: Array = []
+	for p in players:
+		var d: int = duty_of(p)
+		if d != Duty.CONTEST and d != Duty.FOLLOW_UP:
+			receive_candidates.append(p)
+	if possession.is_loose:
+		_fill_receive(receive_candidates, players, ball)
+
 
 ## Anyone whose last kick is still in the air, in priority of how recently
 ## they played it. Not scored against other candidates like the allocated
 ## slots are -- having just played the ball is a fact about this player, not
 ## a competition they can lose to a better-placed teammate.
+## The intended receiver of a pass that is currently in the air.
+##
+## Gated on the ball actually being loose by the caller: a pass that has
+## already been collected is over, and keeping the duty alive for the rest
+## of the post-action window left a player running at a ball somebody was
+## already carrying -- which shows up directly as teammates crowding the
+## carrier (measured 2.01 within 5m against a 1.4 ceiling) and as fewer of
+## them left at a passable distance (0.8 clear options against 1.0).
+##
+## Like FOLLOW_UP this is a FACT about the player rather than a slot they
+## compete for: the ball is on its way to them.
+##
+## Applied LAST, as an override on top of a completed allocation -- see the
+## call site for the churn measurement that forced that ordering. `candidates`
+## and `players` are the same array now; the parameter is kept so the
+## "the receiver must be one of ours" invariant below still reads as a check
+## against the squad rather than against whatever pool happened to be left.
+func _fill_receive(candidates: Array, players: Array, _ball: RigidBody3D) -> void:
+	# Whose pass is still live? post_action_involvement decays over
+	# POST_ACTION_WINDOW, which is exactly "the ball I played is still in
+	# play", so no new bookkeeping is needed.
+	var receiver: FootballPlayer = null
+	var freshest := 0.0
+	for p in players:
+		if p == null or not is_instance_valid(p):
+			continue
+		if p.last_kick_kind != FootballPlayer.KickKind.PASS:
+			continue
+		var live: float = p.post_action_involvement()
+		if live <= freshest:
+			continue
+		var t: FootballPlayer = p.last_kick_target
+		if t == null or not is_instance_valid(t) or t == p:
+			continue
+		# Never the goalkeeper. Their positioning is deliberately owned by
+		# AIController.update_goalkeeper rather than by the duty system, and
+		# conscripting them into a run at the ball took them 19.4m off their
+		# line -- caught by v0_8_5's "goalkeepers still hold their line".
+		if t.is_goalkeeper:
+			continue
+		# ...and never a FORWARD.
+		#
+		# v0.9.1. A forward is the most advanced player on the side, so the
+		# ball is nearly always behind them: standing one down to go and
+		# collect a pass costs the run they were making, and because a pass
+		# is in the air almost continuously it cost the attacking line
+		# outright. Measured on v0_8_3's "forwards hold a clearly advanced
+		# line", 3 runs per build:
+		#
+		#   v0.9.0 baseline                  63%  (failed 1 of 4)
+		#   RECEIVE for every role       0-48%, then 20% with a retreat cap
+		#   RECEIVE excluding forwards   68%, 78%, 68%
+		#
+		# Capping how far back the duty could pull them (RECEIVE_MAX_DROP)
+		# was tried first and moved the line by one point, because the
+		# problem is not WHERE the duty aims a forward but that it stands
+		# them down from an advancing run at all.
+		#
+		# It also delivers MORE passes, which is the opposite of the trade
+		# this looked like (diag_pass_receiver, 90s of AI play):
+		#
+		#   RECEIVE for every role      15 of 59 reached the intended man (25%)
+		#   RECEIVE excluding forwards  20 of 46 reached the intended man (43%)
+		#
+		# Pulling the striker back removed the outlet and crowded the middle,
+		# so more passes were cut out. The duty keeps doing its job for the
+		# midfielders and defenders it was written for; a forward still
+		# receives passes, they simply are not taken off their run to do it.
+		if FormationManager.role_category(t.formation_role) == "FWD":
+			continue
+		# The invariant this milestone asks for, enforced where the duty is
+		# handed out as well as where the pass is chosen: a receiver is on
+		# our side, or there is no receiver.
+		if t.team_id != p.team_id or not (t in players):
+			continue
+		if not (t in candidates):
+			continue
+		freshest = live
+		receiver = t
+	if receiver != null:
+		# An override, not an allocation: nobody is removed from any pool,
+		# so no other player's duty moves as a side effect of this one.
+		_assign(receiver, Duty.RECEIVE)
+
+
 func _fill_follow_up(available: Array, _ball: RigidBody3D) -> void:
 	var recent: Array = []
 	for p in available:

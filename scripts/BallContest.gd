@@ -103,6 +103,79 @@ const BEATEN_MAX_CLOSING_DOT := 0.15
 ## defender is behind the play, not removed from it, and can recover.
 const BEATEN_PROGRESS_SCALE := 0.25
 
+## ---- The contact envelope a tackle must actually land inside (v0.9.1) ----
+##
+## CHALLENGE_RANGE is an AWARENESS/pressure radius: it decides who is
+## contesting at all, and 2.4m is right for that -- a defender closing from
+## two metres is applying real pressure. It is the wrong number for the
+## moment the ball is actually POKED away, and using it for both is what QA
+## saw as "defenders kick the ball from a visually unrealistic position".
+##
+## A tackle now has to LAND inside a physical envelope, measured from the
+## body that has to reach.
+##
+## CORRECTED, v0.9.1. The first version of this number was
+##
+##   capsule radius (0.40) + a leg's reach (0.55) + ball radius (0.16) = 1.11
+##
+## which models a player reaching for a ball lying in open space. That is not
+## what a tackle is. In a tackle the CARRIER'S BODY is between the challenger
+## and the ball, and as of this milestone bodies are solid -- so the
+## challenger's centre can never come within 0.80m of the carrier's centre,
+## and the ball is a further 0.4-1.2m beyond that. challenge_rate() already
+## knew this (see its proximity term, which measures against 0.8m rather than
+## against zero for exactly this reason); the envelope did not, and the two
+## contradicted each other.
+##
+## Measured (diag_tackle_reach) in the canonical duel the regression suites
+## construct -- challenger one metre behind a stationary carrier whose ball is
+## 0.4m in front of them:
+##
+##   carrier -> ball        0.40m
+##   challenger -> carrier  1.00m   (cannot be less than 0.80m)
+##   challenger -> ball     1.40m   <-- outside the old 1.11m envelope
+##   progress               5.33 against the 0.80 required, and STILL no
+##                          tackle, on every frame for six seconds
+##
+## That is the most ordinary tackle in football and it had become impossible.
+## It took three regression assertions with it: v0_8_4's "a sustained
+## challenge on a stationary carrier completes as a tackle" and its cooldown
+## follow-up, and v0_8_8's "a challenger who actually reaches the ball can
+## still win it".
+##
+## The number is now DERIVED from the two constants that bound the geometry
+## rather than from an idealised leg:
+##
+##   minimum body separation (0.80, two 0.4m capsules touching)
+##   + the furthest the ball can be and still be the carrier's
+##     (FootballPlayer.POSSESSION_CONTACT_RADIUS, 1.20)
+##   = 2.00m
+##
+## In words: you may take the ball off someone if you are close enough to be
+## touching them and the ball is still within their own possession radius.
+## Anything beyond that is not a tackle, and it stays well inside
+## CHALLENGE_RANGE (2.40m), so "awareness is wider than action" still holds --
+## which is what the milestone actually asked for.
+##
+## Note what this gate is NOT doing: it is not the thing that stops pokes from
+## silly distances. challenge_rate() already scales with distance and returns
+## zero beyond CHALLENGE_RANGE, and measured over a 180s match
+## (diag_contact_envelope) pokes landed at a maximum of 0.42m centre-to-ball
+## with acquisitions capping at 1.30m -- the envelope was never the binding
+## constraint in live play. It is a backstop against a degenerate case, not
+## the mechanism.
+const POKE_REACH := 2.00
+
+## How far past the requirement a challenge may bank. A little over 1.0 so a
+## challenger who fills their progress on the frame before they arrive still
+## lands the tackle, without a stalled challenge accumulating indefinitely.
+const PROGRESS_OVERFILL := 1.25
+
+## ...and you cannot poke a ball that is behind you. Dot of the challenger's
+## own heading against the direction to the ball; slightly negative so a
+## defender turning onto it still counts, but one running away does not.
+const POKE_MIN_FACING := -0.15
+
 ## How long the loser cannot re-establish control after being tackled.
 ## This is the part that actually breaks the sticky-ball problem: the
 ## dribble spring is gated on this same cooldown, so for this window the
@@ -180,7 +253,32 @@ static func resolve(carrier: FootballPlayer, players: Array, ball: RigidBody3D, 
 			p.challenge_progress = maxf(0.0, p.challenge_progress - CHALLENGE_DECAY_RATE * delta)
 			continue
 
-		p.challenge_progress += rate * delta
+		# v0.9.1: the frame a challenge BEGINS -- progress crossing up from
+		# zero -- is where a tackle animation has to start, because by the
+		# time progress completes the outcome is already decided. Fired from
+		# here rather than from the completion in _apply_tackle for exactly
+		# that reason: the two are different moments and an animation needs
+		# the earlier one.
+		if p.challenge_progress <= 0.0 and not p.challenge_started.get_connections().is_empty():
+			p.challenge_started.emit({
+				"kind": "challenge",
+				"target": carrier,
+				"position": p.global_position,
+				"direction": (ball.global_position - p.global_position).normalized(),
+				"strength": rate,
+			})
+
+		# Capped. A challenge that is full but cannot land -- the challenger
+		# is out of reach, see POKE_REACH -- used to keep accumulating
+		# forever: measured at 5.33 against the 0.80 required, and climbing,
+		# six seconds into a duel that was never going to resolve. Nothing
+		# reads progress above the requirement, so the excess was pure lie in
+		# the state, and it meant a defender who finally DID arrive brought a
+		# tackle that had been "ready" for several seconds rather than one
+		# they had just earned. It also makes challenge_progress meaningful
+		# to an animation layer, which wants a 0..1 wind-up.
+		p.challenge_progress = minf(p.challenge_progress + rate * delta,
+			CHALLENGE_TIME_REQUIRED * PROGRESS_OVERFILL)
 
 		# v0.9.0: ...unless the carrier has just gone the other way. See
 		# BEATEN_BY_TURN_WINDOW.
@@ -194,8 +292,62 @@ static func resolve(carrier: FootballPlayer, players: Array, ball: RigidBody3D, 
 	if winner == null or best_progress < CHALLENGE_TIME_REQUIRED:
 		return null
 
+	# v0.9.1: a full challenge still has to be within PHYSICAL REACH to
+	# actually take the ball -- see POKE_REACH. Progress is deliberately
+	# left intact: the defender has done the work and lands the tackle on
+	# the frame they genuinely get there.
+	if not within_poke_envelope(winner, ball):
+		return null
+
 	_apply_tackle(carrier, winner, ball)
 	return winner
+
+
+## Is `challenger` physically able to touch the ball right now?
+##
+## Separated from challenge_rate on purpose: that function answers "are you
+## contesting", which may legitimately be true from two metres away. This
+## answers "can your foot reach it", which is the only question that should
+## gate a ball actually being poked.
+static func within_poke_envelope(challenger: FootballPlayer, ball: RigidBody3D) -> bool:
+	var to_ball: Vector3 = ball.global_position - challenger.global_position
+	to_ball.y = 0.0
+	var dist: float = to_ball.length()
+	if dist > POKE_REACH:
+		return false
+	if dist < 0.01:
+		return true
+	# Facing: a defender cannot poke a ball behind them -- but this is only
+	# asked of a defender who is MOVING, because only then is there a
+	# trustworthy answer.
+	#
+	# v0.9.1, corrected twice. The first version fell back to
+	# global_transform.basis.z for a stationary challenger; the body never
+	# rotates (only the model does), so that read the spawn orientation. The
+	# second used facing_direction(), which is the real visual facing but is
+	# only updated while a player is turning toward somewhere they are going
+	# -- for a defender standing still it holds whatever it last happened to
+	# be, which is 0 (world +Z) for anyone who has not moved.
+	#
+	# Measured (diag_tackle_reach), challenger stationary one metre behind a
+	# carrier whose ball is 0.4m in front of them, i.e. the ball lies at -Z:
+	# dot(+Z, -Z) = -1, so the envelope answered false on every frame for six
+	# seconds while the challenge sat full. Widening POKE_REACH from 1.11m to
+	# 2.00m changed nothing, which is what proved the distance was never the
+	# blocker. It cost three regression assertions: v0_8_4's "a sustained
+	# challenge on a stationary carrier completes as a tackle" and its
+	# cooldown follow-up, and v0_8_8's "a challenger who actually reaches the
+	# ball can still win it".
+	#
+	# Nothing is lost by asking it only of a moving player. "Are you actually
+	# going at the ball rather than standing near it" is already answered,
+	# properly and continuously, by challenge_rate()'s `closing` term -- so
+	# for the case this gate was written to catch (a defender running the
+	# other way) the rate has already collapsed long before completion.
+	var heading := Vector3(challenger.velocity.x, 0.0, challenger.velocity.z)
+	if heading.length() < 0.5:
+		return true
+	return heading.normalized().dot(to_ball / dist) >= POKE_MIN_FACING
 
 
 ## How fast `challenger` is filling their challenge against `carrier` right

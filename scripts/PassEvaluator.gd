@@ -198,6 +198,32 @@ const ROLL_OFFSET := 0.924
 ## defensive shape. 4.0 was the first value tried and it broke that
 ## assertion 4 runs in 5 -- kept here so the trade is visible rather than
 ## rediscovered.
+##
+## v0.9.1 RE-MEASURED END TO END, and left alone. The brief asks for the
+## arrival to be checked across the whole range and for a distance-sensitive
+## model if one constant cannot serve it. It already is one -- the launch
+## speed is solved per pass, above -- and measured live rather than
+## predicted (diag_human_pass, ball tracked from the boot to the receiver's
+## contact radius):
+##
+##   scenario              launch   arrives   in control
+##    4m lateral            5.8      4.8       yes
+##    9m forward            8.7      3.3       yes
+##    9m lateral            8.7      3.3       yes
+##    9m diagonal           8.7      3.3       yes
+##    9m forward, pressed   8.7      3.3       yes
+##   16m forward           11.0      3.8       yes
+##   16m diagonal          11.0      3.8       yes
+##   16m forward, pressed  11.0      4.0       yes
+##
+## Arrival sits in a 3.3-4.8 m/s band across a 4x spread of distances, with
+## no dependence on direction and none on whether the passer was pressed,
+## and the receiver controlled the ball in every case. Note the two numbers
+## above that are NOT what the solve asked for: 16m wants 12.9 m/s and gets
+## PASS_SPEED_MAX, yet still arrives at 3.8 -- the clamp is not costing
+## anything at this range, because the roll model says an 11 m/s ball runs
+## 17.7m. That is why the cap is left where it is instead of being raised
+## into the shot band to satisfy an equation.
 const PASS_ARRIVAL_SPEED := 3.4
 ## Ceiling on how far a moving receiver may be led, as a fraction of the
 ## pass distance -- see _lead_point.
@@ -244,13 +270,22 @@ class Option extends RefCounted:
 ## the score, it just stops excluding teammates outright.
 ## `aimed` marks a pass the HUMAN deliberately aimed with the stick, which
 ## is scored on an entirely different weighting -- see W_ALIGNMENT_AIMED.
+## v0.9.1: `trace`, when a non-null Array is supplied, is filled with one
+## Dictionary per teammate considered -- name, distance, alignment with the
+## aim, openness, whether the lane is blocked, the score, and (for anyone
+## rejected) the reason. It is a pure out-parameter: nothing in the scoring
+## reads it, and passing nothing leaves this function byte-for-byte the same
+## decision it was. It exists because the brief asks for the human pass chain
+## to be visible end to end, and "which teammates were even in the running"
+## cannot be reconstructed from the chosen option alone.
 static func best_option(
 	passer: FootballPlayer,
 	aim_dir: Vector3,
 	forward_axis: Vector3,
 	plan: TeamPlan = null,
 	min_alignment: float = -1.0,
-	aimed: bool = false
+	aimed: bool = false,
+	trace: Array = []
 ) -> Option:
 	var best: Option = null
 	var aim_n: Vector3 = aim_dir.normalized() if aim_dir.length() > 0.01 else Vector3.ZERO
@@ -262,16 +297,29 @@ static func best_option(
 	for mate in passer.teammates:
 		if mate == passer or mate == null or not is_instance_valid(mate):
 			continue
+		# INVARIANT (v0.9.1): a pass candidate is a TEAMMATE. `passer.teammates`
+		# is wired once by MatchManager and never rebuilt, but a stale or
+		# mis-wired context would otherwise turn straight into a pass to an
+		# opponent -- the exact defect this milestone exists to make
+		# impossible. Checked here, at generation, rather than as a late veto
+		# on the chosen option, so an opponent never enters the candidate set
+		# to be scored in the first place.
+		if mate.team_id != passer.team_id:
+			_trace_drop(trace, mate, "not a teammate (team %d vs %d)" % [mate.team_id, passer.team_id])
+			continue
 		# Never pass to a teammate who cannot legally be in the play.
 		if FormationManager.is_behind_goal_line(mate.global_position):
+			_trace_drop(trace, mate, "behind the goal line")
 			continue
 		var to_mate: Vector3 = mate.global_position - passer.global_position
 		to_mate.y = 0.0
 		var dist: float = to_mate.length()
 		if dist < min_dist or dist > max_dist:
+			_trace_drop(trace, mate, "distance %.2fm outside [%.1f, %.1f]" % [dist, min_dist, max_dist])
 			continue
 		var dir: Vector3 = to_mate / dist
 		if aim_n != Vector3.ZERO and min_alignment > -1.0 and aim_n.dot(dir) < min_alignment:
+			_trace_drop(trace, mate, "outside the aim cone (dot %.2f < %.2f)" % [aim_n.dot(dir), min_alignment])
 			continue
 
 		var score := 0.0
@@ -303,6 +351,19 @@ static func best_option(
 				score += DUTY_RUN_BEHIND_BONUS
 			if _lane_blocked(passer.global_position, dir, dist, passer.opponents):
 				score -= BLOCKED_LANE_PENALTY
+
+		if trace != null:
+			trace.append({
+				"name": mate.name,
+				"team_id": mate.team_id,
+				"role": mate.formation_role,
+				"kept": true,
+				"distance": dist,
+				"alignment": aim_n.dot(dir) if aim_n != Vector3.ZERO else 0.0,
+				"openness": _openness(mate.global_position, passer.opponents),
+				"lane_blocked": _lane_blocked(passer.global_position, dir, dist, passer.opponents),
+				"score": score,
+			})
 
 		if best == null or score > best.score:
 			var opt := Option.new()
@@ -340,7 +401,31 @@ static func best_option(
 		if lead_opt != null and (best == null or lead_opt.score > best.score):
 			best = lead_opt
 
+	# INVARIANT (v0.9.1): whatever comes out of here is on the passer's team.
+	# The generation loop above already guarantees it; this is the assertion
+	# that says so out loud, and it covers _lead_option too -- a lead ball
+	# aims at a POINT, and the point must still belong to a teammate. If this
+	# ever trips, the bug is upstream in the candidate set or in the match
+	# context, and the trace tells you which.
+	if best != null and best.target != null and is_instance_valid(best.target) \
+		and best.target.team_id != passer.team_id:
+		push_error("PassEvaluator: chose an opponent as receiver (%s, team %d, passer team %d)" % [
+			best.target.name, best.target.team_id, passer.team_id])
+		return null
+
 	return best
+
+
+static func _trace_drop(trace: Array, mate: FootballPlayer, reason: String) -> void:
+	if trace == null:
+		return
+	trace.append({
+		"name": mate.name,
+		"team_id": mate.team_id,
+		"role": mate.formation_role,
+		"kept": false,
+		"reason": reason,
+	})
 
 
 ## A pass played into the space AHEAD of `mate` rather than at their feet.

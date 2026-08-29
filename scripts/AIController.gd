@@ -115,6 +115,32 @@ const PRESS_CONTACT_RANGE := 0.8
 ## see the sprint override. Far enough out that the race is decided, close
 ## enough in that the final stride is controlled rather than an overshoot.
 const CONTEST_SPRINT_MIN_DISTANCE := 2.0
+
+## Furthest ahead a receiver projects the ball when running to meet a pass.
+## Bounded so a ball that has nearly stopped does not aim them at a point
+## far up the pitch -- see the RECEIVE duty target.
+const RECEIVE_MAX_LEAD_TIME := 1.2
+
+## How far back down the pitch going to meet a pass may pull a player.
+##
+## v0.9.1. A receiver moving to the ball is the whole point of the duty, but
+## a FORWARD is normally the most advanced player on the team, so the ball is
+## almost always BEHIND them -- and the first version of the RECEIVE target
+## steered straight at it with no retreat guard, while every other support
+## duty has one (see LANE_MAX_RETREAT). Every pass to a forward therefore
+## dragged them back down the pitch, and because a pass is in the air almost
+## continuously (measured: 69 receive spells over 54s of settled play,
+## median 0.8s each) the attacking line simply stopped existing.
+##
+## Measured on v0_8_3's "forwards hold a clearly advanced line", 3-4 runs per
+## build:
+##   v0.9.0 baseline              fails 1 of 4, 63% of frames
+##   v0.9.1 with RECEIVE          fails 4 of 4 -- 40%, 0%, 48%, 40%
+##   v0.9.1, RECEIVE disabled     PASSES 3 of 3 at 100%
+##
+## Coming short a few metres to show for the ball is real football; abandoning
+## the line is not. This caps the former.
+const RECEIVE_MAX_DROP := 5.0
 # ---- Lane-aware off-ball positioning (see _lane_aware_target) ----
 ## Points sampled in a ring around the duty's own target. Kept small: this
 ## runs per supporting player per frame and the ring only has to find a
@@ -135,6 +161,13 @@ const LANE_W_SHAPE := 0.75
 const LANE_W_CROWD := 0.60
 ## Teammates nearer than this to a candidate count as crowding it.
 const LANE_CROWD_RADIUS := 5.0
+
+## Two players making advancing runs must not aim at the same point. Sized at
+## the distance below which the v0.9.1 diagnostic counted a pair as genuinely
+## converged rather than merely sharing a channel -- see the rejection in
+## _lane_aware_target. Deliberately smaller than LANE_CROWD_RADIUS: this is
+## the hard floor under a soft preference, not a replacement for it.
+const MIN_ADVANCING_SEPARATION := 3.0
 ## How far back down the pitch a lane adjustment may take a player from the
 ## position their duty chose. Small: coming a little short to show for the
 ## ball is football, dropping out of the attacking line is not.
@@ -477,7 +510,11 @@ static func update_player(
 	# reads as oscillation (measured 0.179 direction changes per player per
 	# second against a 0.15 baseline, with the forward line otherwise
 	# healthy). The race is won in the approach, not the last stride.
-	if effective_plan != null and effective_plan.duty_of(player) == TeamPlan.Duty.CONTEST \
+	# v0.9.1: a RECEIVER races for the ball on the same terms as a
+	# contester. The opposing contester is already sprinting at it; a
+	# receiver who jogs loses every pass to them by construction.
+	var _duty_now: int = effective_plan.duty_of(player) if effective_plan != null else -1
+	if (_duty_now == TeamPlan.Duty.CONTEST or _duty_now == TeamPlan.Duty.RECEIVE) \
 		and not player.has_possession \
 		and player.global_position.distance_to(ball.global_position) > CONTEST_SPRINT_MIN_DISTANCE:
 		player.sprint_requested = true
@@ -632,6 +669,47 @@ static func _duty_target(
 			# the other three duties.
 			return Vector3(x, shape.y, shape.z)
 
+		TeamPlan.Duty.RECEIVE:
+			# v0.9.1: go and MEET the ball, do not wait on a support spot.
+			#
+			# This duty is the missing half of a pass -- see
+			# TeamPlan._fill_receive. The target is where the ball will be,
+			# not where it is: a rolling ball covers real ground during the
+			# time it takes to get to it, and steering at its current
+			# position means arriving permanently behind it.
+			var b_vel := Vector3(ball.linear_velocity.x, 0.0, ball.linear_velocity.z)
+			var to_ball_r: Vector3 = ball_pos - player.global_position
+			to_ball_r.y = 0.0
+			# Rough time-to-meet from the closing speed, bounded so a nearly
+			# stopped ball does not project a target off the pitch.
+			var close_speed: float = maxf(player.base_speed, 1.0)
+			var meet_t: float = clampf(to_ball_r.length() / close_speed, 0.0, RECEIVE_MAX_LEAD_TIME)
+			var meet: Vector3 = ball_pos + b_vel * meet_t
+			meet.y = shape.y
+			# ...but do not abandon the attacking line to do it. Anything
+			# further back than RECEIVE_MAX_DROP along the team's forward
+			# axis is a retreat, not a run to meet the ball: the player comes
+			# as short as the cap allows and lets the ball come the rest of
+			# the way. Without this a forward -- who is by definition ahead of
+			# the ball -- was pulled backwards by every pass played to them.
+			# Measured against the player's SHAPE position, not their live
+			# one. Capping against global_position ratchets: the limit is
+			# recomputed every frame from wherever the player now stands, so
+			# the target stays permanently 5m behind them and walks them all
+			# the way back to the ball anyway. Measured with that mistake in
+			# place, v0_8_3's forward line read a flat 19% -- better than the
+			# 0-48% with no cap at all, and nowhere near the 100% that
+			# disabling the duty gives. `shape` is the formation-derived point
+			# for this player and does not move with them, so it is a real
+			# anchor.
+			var fwd_r: Vector3 = plan.forward_axis() if plan != null else Vector3.ZERO
+			if fwd_r != Vector3.ZERO:
+				var drop: float = fwd_r.dot(shape - meet)
+				if drop > RECEIVE_MAX_DROP:
+					meet += fwd_r * (drop - RECEIVE_MAX_DROP)
+					meet.y = shape.y
+			return FormationManager.clamp_to_playable(meet)
+
 		TeamPlan.Duty.FOLLOW_UP:
 			# The move this player started is still live, so their job IS the
 			# move -- see the allocation comment in TeamPlan. Eased toward
@@ -714,6 +792,11 @@ static func _lane_aware_target(
 	anchor.y = base_target.y
 	var best: Vector3 = anchor
 	var best_score: float = -INF
+	# Best candidate that was rejected only for sitting on another advancing
+	# player's target -- used if every sample is rejected, so a boxed-in
+	# player still gets a point rather than falling through to the anchor.
+	var fallback: Vector3 = anchor
+	var fallback_score: float = -INF
 	var fwd: Vector3 = plan.forward_axis()
 
 	# Two rings. One ring is not enough to get out from behind a screen:
@@ -802,10 +885,58 @@ static func _lane_aware_target(
 			var drift: float = candidate.distance_to(player.ai_target) / LANE_SAMPLE_RADIUS_WIDE
 			score += LANE_W_STICKY * (1.0 - clampf(drift, 0.0, 1.0))
 
+		# v0.9.1: two advancing players may not aim at the same POINT.
+		#
+		# The crowding term above is a weight, and a weight can be outvoted:
+		# when the opposition leaves exactly one open lane, LANE_W_CLEAR and
+		# LANE_W_OPEN both reward it strongly enough for two players to pick
+		# it despite the penalty. Solid bodies (v0.9.1) made that common --
+		# players no longer pass through one another, so they bunch, and a
+		# bunched side sees fewer distinct openings.
+		#
+		# Measured over a live match: 31-59 samples per run of two PUSH_UP
+		# players whose targets were within 0.5m in the attacking lane, of
+		# which 55-71% were also within 3m in FULL separation -- i.e. genuinely
+		# standing on the same spot, not a full-back overlapping behind a
+		# midfielder at a different depth. v0_8_6's "two advancing players
+		# never target the same lane" caught it 3 runs in 6, against 0 in 6
+		# at the v0.9.0 baseline.
+		#
+		# A separation this basic should be a rule rather than a preference,
+		# so a candidate that lands on another advancing teammate's target is
+		# rejected outright. `fallback` keeps the best rejected candidate, so
+		# a player boxed in on every sample still gets their duty's point
+		# instead of nothing.
+		var nearest_advancing := INF
+		for mate in teammates:
+			if mate == player or mate == null or not is_instance_valid(mate) or mate.is_goalkeeper:
+				continue
+			if mate.ai_target == Vector3.ZERO:
+				continue
+			var mate_duty: int = plan.duty_of(mate)
+			if mate_duty != TeamPlan.Duty.PUSH_UP and mate_duty != TeamPlan.Duty.RUN_BEHIND:
+				continue
+			nearest_advancing = minf(nearest_advancing, candidate.distance_to(mate.ai_target))
+		if nearest_advancing < MIN_ADVANCING_SEPARATION:
+			# Rejected -- but keep the one that gets FURTHEST from the other
+			# runner, not the one that scores best. When a side is boxed in,
+			# every sample can be too close and both players fall back; a
+			# score-ranked fallback then picks the SAME point for both, which
+			# is exactly the converged pair this rule exists to prevent
+			# (measured: two PUSH_UP players on identical targets, gap
+			# 0.00m). Ranking the fallback by separation guarantees they at
+			# least spread as far as the geometry allows.
+			if nearest_advancing > fallback_score:
+				fallback_score = nearest_advancing
+				fallback = candidate
+			continue
+
 		if score > best_score:
 			best_score = score
 			best = candidate
 
+	if best_score == -INF and fallback_score > -INF:
+		return fallback
 	return best
 
 

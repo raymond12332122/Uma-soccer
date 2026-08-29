@@ -34,6 +34,72 @@ extends CharacterBody3D
 ##   foot            -- "left"/"right", chosen from which side the ball sat
 signal ball_touched(info: Dictionary)
 
+## v0.9.1: the rest of the animation-facing event surface.
+##
+## `ball_touched` covers the instant of CONTACT, which is the frame an
+## animation has to be ALREADY in -- a foot does not arrive at the ball on the
+## frame it is asked to. These four cover the moments before and after, so a
+## clip can be started with lead time and blended out on completion:
+##
+##   action_started    -- intent committed; the wind-up may begin. Fires on
+##                        the same frame as the contact today (the simulation
+##                        has no wind-up), so a listener that needs anticipation
+##                        should start its clip here and let ball_touched drive
+##                        the plant.
+##   action_released   -- the ball is gone and the follow-through owns the body
+##   challenge_started -- a defender has begun building challenge progress
+##                        against a carrier; the tackle animation starts here
+##                        and the outcome is not known yet
+##   possession_changed -- gained/lost, for a settle/react clip
+##
+## Same one-way rule as ball_touched: the simulation emits and never reads.
+##
+## `info` fields, all optional to a listener:
+##   kind      -- TouchKind for the action signals; "gained"/"lost" for
+##                possession_changed
+##   direction -- unit Vector3 the ball was/will be sent in
+##   strength  -- launch speed in m/s (0 where not applicable)
+##   target    -- the intended receiver for a pass, else null
+##   position  -- the player's world position at the event
+signal action_started(info: Dictionary)
+signal action_released(info: Dictionary)
+signal challenge_started(info: Dictionary)
+signal possession_changed(info: Dictionary)
+
+## v0.9.1: the full decision trace for one pass, emitted by execute_pass().
+##
+## Diagnostic and test surface only -- nothing in the simulation reads it.
+## The brief asks for the whole chain to be visible in one record rather than
+## re-derived from separate log lines, so every stage a pass goes through is
+## here: what the human aimed, who was considered and why each was kept or
+## dropped, what was chosen, the geometry of the error between intent and
+## outcome, and the launch velocity actually applied to the ball.
+##
+##   aim              -- the raw aim vector (human stick / AI facing)
+##   aimed            -- true for a human-aimed pass (hard cone applied)
+##   candidates       -- Array of per-teammate Dictionaries, see
+##                       PassEvaluator.best_option's `trace`
+##   considered       -- how many teammates survived every filter
+##   target           -- the chosen receiver (null = no-target knock)
+##   target_name      -- its name, for log lines
+##   kind             -- PassEvaluator.PassKind of the chosen option
+##   score            -- the chosen option's score
+##   distance         -- passer-to-receiver distance, m
+##   aim_point        -- where the ball was actually aimed (includes lead)
+##   angular_error    -- degrees between the raw aim and the kick direction;
+##                       this is the assist, and it must stay small
+##   kick_direction   -- the unit direction the impulse was applied along
+##   requested_speed  -- the launch speed the model asked for, m/s
+##   actual_speed     -- the ball's speed on the frame after the impulse.
+##                       Necessarily NOT known at emit time: the signal fires
+##                       just before the impulse so the requested speed is
+##                       still the live one, and this field is written into
+##                       the same Dictionary one physics frame later. A
+##                       listener that keeps the Dictionary sees it appear; a
+##                       listener that copies the value out immediately reads
+##                       zero.
+signal pass_attempted(info: Dictionary)
+
 ## What kind of contact a `ball_touched` event describes.
 enum TouchKind {
 	DRIBBLE,    ## ordinary knock-on in the direction of travel
@@ -394,7 +460,26 @@ const PASS_LIFT := 0.05
 
 # ---- Pass assist tunables (see _get_pass_direction / _find_pass_target) ----
 const PASS_ASSIST_MAX_DISTANCE := 26.0
-const PASS_ASSIST_MIN_ALIGNMENT := 0.25  ## cos(~75deg) -- candidate must be roughly ahead of the aim direction
+## cos(60deg) -- a candidate must be roughly where the player is pointing.
+##
+## v0.9.1: was 0.25, i.e. a 76-degree cone. Measured (diag_human_pass, the
+## aim-cone sweep): with the ball at his feet and the stick held dead
+## forward, a teammate 72 degrees off to the left was still selected, and
+## because an aimed pass then goes 92% of the way onto the chosen man (see
+## PASS_ASSIST_BLEND_AIMED) the ball left the boot 66 degrees away from where
+## the player pointed. That is not assistance, it is the game overruling the
+## input, and it is the concrete mechanism behind "the human PASS still does
+## not feel right".
+##
+## The blend is deliberately NOT the lever here. Intent is expressed by which
+## teammate you point at, so once one is chosen the ball should go to them
+## accurately; softening the blend instead would make every pass miss by a
+## proportion of its own aim error, which is worse. The cone is what decides
+## whether the player pointed at that man at all, and 76 degrees is not
+## pointing at anyone. Measured across the sweep at the new value: 20/40/60
+## degrees off still select and are struck accurately, 72 and 80 fall through
+## to an honest knock in the direction actually aimed.
+const PASS_ASSIST_MIN_ALIGNMENT := 0.50
 const PASS_ASSIST_BLEND := 0.7           ## 0 = pure raw aim, 1 = dead-on at the chosen teammate
 ## v0.8.6: how much of an AIMED human pass goes dead at the teammate the
 ## player picked out. Deliberately near 1: having made alignment decide WHO
@@ -794,6 +879,8 @@ func is_heavy_touch() -> bool:
 ## blocks re-acquiring it (and, because the dribble spring is gated on the
 ## same cooldown, stops the ball being pulled straight back to their feet).
 func notify_dispossessed(cooldown: float) -> void:
+	if has_possession:
+		_emit_possession_changed("lost", "dispossessed")
 	has_possession = false
 	possession_time = 0.0
 	challenge_progress = 0.0
@@ -1083,6 +1170,25 @@ func _update_animation_state() -> void:
 func _get_aim_direction() -> Vector3:
 	if move_input.length() > 0.15:
 		return Vector3(move_input.x, 0.0, move_input.y).normalized()
+	return facing_direction()
+
+
+## Which way this player is actually LOOKING, as a unit vector on the ground.
+##
+## v0.9.1. Necessary because the BODY does not turn: _facing_angle is applied
+## to `model.rotation.y`, so the CharacterBody3D's own basis keeps whatever
+## orientation it was spawned with, for the whole match. Anything outside
+## this script that reached for global_transform.basis.z to find a facing was
+## therefore reading the spawn orientation rather than the player.
+##
+## That is not hypothetical -- BallContest.within_poke_envelope was written
+## that way, and it silently refused legitimate tackles by any stationary
+## defender whose ball happened to lie on the wrong side of world +Z.
+## Measured: v0_8_4's "a sustained challenge on a stationary carrier
+## completes as a tackle" and v0_8_8's "a challenger who actually reaches the
+## ball can still win it" both went red, in constructed duels where the
+## defender was demonstrably on top of the ball.
+func facing_direction() -> Vector3:
 	return Vector3(sin(_facing_angle), 0.0, cos(_facing_angle))
 
 
@@ -1177,6 +1283,7 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 		# radius instead would cry wolf on every touch the grace absorbs.
 		if has_possession:
 			just_lost_possession_window = _MOMENTARY_TRIGGER_WINDOW
+			_emit_possession_changed("lost", "ball_gone")
 		has_possession = false
 		return
 
@@ -1218,6 +1325,7 @@ func _update_possession(sprinting: bool, stamina_ratio: float = 1.0, delta: floa
 	_possession_grace_timer = POSSESSION_GRACE
 	if not has_possession:
 		possession_time = 0.0
+		_emit_possession_changed("gained", "collected")
 	has_possession = true
 
 	# v0.8.3: a heavy touch used to cut the steering force to exactly zero
@@ -1687,7 +1795,8 @@ func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis
 		effective_plan = team_plan
 	if axis == Vector3.ZERO and effective_plan != null:
 		axis = effective_plan.forward_axis()
-	var option: PassEvaluator.Option = PassEvaluator.best_option(self, aim, axis, effective_plan, min_alignment, aimed)
+	var trace: Array = []
+	var option: PassEvaluator.Option = PassEvaluator.best_option(self, aim, axis, effective_plan, min_alignment, aimed, trace)
 	if option == null:
 		# Nothing worth playing to -- knock it into the aimed direction
 		# rather than swallowing the input.
@@ -1700,7 +1809,9 @@ func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis
 		# ball". A pass with no target is a knock into space, and should
 		# look like one.
 		last_kick_target = null
-		_apply_kick_impulse(ball, PASS_NO_TARGET_SPEED * pass_speed_scale, false, aim)
+		var no_target_speed: float = PASS_NO_TARGET_SPEED * pass_speed_scale
+		_emit_pass_trace(ball, aim, aimed, trace, null, aim, no_target_speed)
+		_apply_kick_impulse(ball, no_target_speed, false, aim)
 		return
 
 	var to_point: Vector3 = option.aim_point - global_position
@@ -1722,7 +1833,78 @@ func execute_pass(min_alignment: float = PASS_ASSIST_MIN_ALIGNMENT, forward_axis
 	# one played to feet, and so a future animation or commentary layer has
 	# the distinction available without re-deriving it.
 	last_pass_kind = option.kind
+	_emit_pass_trace(ball, aim, aimed, trace, option, dir, option.speed * pass_speed_scale)
 	_apply_kick_impulse(ball, option.speed * pass_speed_scale, false, dir)
+
+
+## v0.9.1: publish the whole pass chain as one record -- see `pass_attempted`.
+##
+## Called immediately BEFORE the impulse so the record can carry the requested
+## launch speed, then completed one physics frame later with the ball's actual
+## speed. The two are separate numbers on purpose: the brief asks whether the
+## velocity the model asked for is the velocity the ball leaves with, and the
+## only honest way to answer that is to measure the ball, not to restate the
+## input.
+func _emit_pass_trace(
+	ball: RigidBody3D,
+	aim: Vector3,
+	aimed: bool,
+	trace: Array,
+	option: PassEvaluator.Option,
+	kick_dir: Vector3,
+	requested_speed: float
+) -> void:
+	if pass_attempted.get_connections().is_empty():
+		return
+	var kept := 0
+	for c in trace:
+		if c.get("kept", false):
+			kept += 1
+	var aim_n: Vector3 = aim.normalized() if aim.length() > 0.01 else Vector3.ZERO
+	var info := {
+		"passer": name,
+		"team_id": team_id,
+		"position": global_position,
+		"aim": aim_n,
+		"aimed": aimed,
+		"candidates": trace,
+		"considered": kept,
+		"target": option.target if option != null else null,
+		"target_name": option.target.name if option != null and option.target != null else "",
+		"target_team_id": option.target.team_id if option != null and option.target != null else -1,
+		"kind": option.kind if option != null else -1,
+		"score": option.score if option != null else 0.0,
+		"distance": option.distance if option != null else 0.0,
+		"aim_point": option.aim_point if option != null else Vector3.ZERO,
+		"kick_direction": kick_dir,
+		"angular_error": rad_to_deg(aim_n.angle_to(kick_dir)) if aim_n != Vector3.ZERO else 0.0,
+		"requested_speed": requested_speed,
+		"actual_speed": 0.0,
+	}
+	pass_attempted.emit(info)
+	_fill_actual_speed(ball, info)
+
+
+func _fill_actual_speed(ball: RigidBody3D, info: Dictionary) -> void:
+	await get_tree().physics_frame
+	if is_instance_valid(ball):
+		info["actual_speed"] = Vector2(ball.linear_velocity.x, ball.linear_velocity.z).length()
+
+
+## v0.9.1: one place that says "this player's relationship with the ball just
+## changed", for a settle-the-ball or lost-it reaction clip. Every site that
+## flips has_possession routes through here rather than each growing its own
+## emit, so the signal cannot drift out of step with the flag.
+func _emit_possession_changed(what: String, reason: String = "") -> void:
+	if possession_changed.get_connections().is_empty():
+		return
+	possession_changed.emit({
+		"kind": what,
+		"reason": reason,
+		"position": global_position,
+		"velocity": velocity,
+		"possession_time": possession_time,
+	})
 
 
 ## `aim_dir_override` is how an AI shot says WHERE it is shooting. Without
@@ -1871,6 +2053,21 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 	# brief requires to stay clearly different -- had started to cross.
 	# Momentum from running onto the ball is already accounted for above,
 	# deliberately and only along the aim.
+	# v0.9.1: the wind-up hook. The simulation strikes the ball on the same
+	# frame the intent is formed -- there is no anticipation phase in the
+	# physics, and adding one would change gameplay timing, which this
+	# milestone explicitly must not do. So this fires here, one call ahead of
+	# the contact, and an animation layer that wants lead time takes it from
+	# here while ball_touched drives the actual foot plant.
+	if not action_started.get_connections().is_empty():
+		action_started.emit({
+			"kind": TouchKind.SHOT if is_shot else TouchKind.PASS,
+			"direction": aim_dir,
+			"strength": launch_speed,
+			"target": last_kick_target,
+			"position": global_position,
+		})
+
 	var current_horizontal := Vector3(ball.linear_velocity.x, 0.0, ball.linear_velocity.z)
 	var delta_v: Vector3 = aim_dir * launch_speed - current_horizontal
 	# A pass is a GROUND pass -- it stays on the deck, which is both what a
@@ -1893,6 +2090,14 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 	post_action_kind = last_kick_kind
 	post_action_timer = POST_ACTION_WINDOW
 
+	# v0.9.1: playing the ball is the commonest way to stop having it, so the
+	# possession event has to fire here as well as on the two paths in
+	# _update_possession. The reason distinguishes it: an animation layer
+	# wants a settle-or-react clip when the ball is TAKEN, and nothing extra
+	# when the player deliberately played it -- the kick's own
+	# action_started/action_released already own that moment.
+	if has_possession:
+		_emit_possession_changed("lost", "kicked")
 	has_possession = false
 	_control_lost_timer = 0.0
 	_possession_cooldown_timer = possession_release_cooldown
@@ -1900,6 +2105,17 @@ func _apply_kick_impulse(ball: RigidBody3D, speed: float, is_shot: bool, aim_dir
 
 	if is_shot:
 		_pending_shot_check_timer = _SHOT_MISS_CHECK_DELAY
+
+	# v0.9.1: the follow-through hook. The ball has left; from here the body
+	# is on its own and a clip can blend back to locomotion.
+	if not action_released.get_connections().is_empty():
+		action_released.emit({
+			"kind": TouchKind.SHOT if is_shot else TouchKind.PASS,
+			"direction": aim_dir,
+			"strength": launch_speed,
+			"target": last_kick_target,
+			"position": global_position,
+		})
 
 	if animation_controller:
 		animation_controller.play_action("shoot" if is_shot else "pass")

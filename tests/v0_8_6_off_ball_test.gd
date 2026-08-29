@@ -132,7 +132,27 @@ func _test_play_continuation_after_a_ball_action() -> void:
 		await get_tree().physics_frame
 
 	# --- a player who just PASSED ---
+	#
+	# v0.9.1: pick a player who is NOT the nominated ball-winner. CONTEST is
+	# allocated before FOLLOW_UP and outranks it by design -- going to win
+	# the ball back matters more than following up your own pass -- so
+	# asserting FOLLOW_UP on a fixed index only worked while that index
+	# happened not to be the contester. Enabling player-vs-player collision
+	# in v0.9.1 moved everybody, and home_players[9] became the contester:
+	# measured, duty=0 (CONTEST) on three runs out of three, while the
+	# equivalent check for a player who just SHOT still passed. The
+	# assertion is about a passer not being left as a COVER_SPACE leftover,
+	# so it now picks a passer for whom that question is actually live.
 	var passer: FootballPlayer = main.home_players[9]
+	var _ball_pos: Vector3 = main.ball.global_position
+	var _furthest := -1.0
+	for cand in main.home_players:
+		if cand.is_goalkeeper:
+			continue
+		var d: float = cand.global_position.distance_to(_ball_pos)
+		if d > _furthest:
+			_furthest = d
+			passer = cand
 	var home_slot: Vector3 = FormationManager.get_world_position(passer.formation_slot, 0)
 	passer.post_action_timer = FootballPlayer.POST_ACTION_WINDOW
 	passer.post_action_kind = FootballPlayer.KickKind.PASS
@@ -229,6 +249,8 @@ func _test_live_match_off_ball_behaviour() -> void:
 	var reversals := 0
 	var moving_frames := 0
 	var last_target: Dictionary = {}
+	## Frames since each player was reset -- see the step measurement below.
+	var since_reset: Dictionary = {}
 	var last_dir: Dictionary = {}
 	var last_pos: Dictionary = {}
 	for p in mids:
@@ -278,7 +300,28 @@ func _test_live_match_off_ball_behaviour() -> void:
 			deepest = maxf(deepest, absf(p.ai_target.x))
 			if FormationManager.is_behind_goal_line(p.ai_target):
 				behind_goal += 1
-			if last_target.has(id):
+			# v0.9.1: do not measure ACROSS A RESET.
+			#
+			# AIController deliberately skips the rate limit when
+			# player.ai_state < 0 (see `discontinuous`), which
+			# FootballPlayer.reset_intent() sets, which
+			# MatchManager._reset_all_players() calls after a GOAL. The
+			# smoothed point then jumps straight to the player's formation
+			# slot, which is 16-27m away -- by design, so a stale pre-kickoff
+			# target is not dragged into the new situation.
+			#
+			# This loop used to sample straight through that. Measured
+			# (diag_target_step) over two runs: 19 of 19 oversized steps fell
+			# within 3 frames of a reset and NONE were unexplained, so the
+			# limiter was never being bypassed -- a goal was simply scored
+			# during the sampling window. The assertion is about a steered
+			# point oscillating in open play, and it now measures that
+			# instead of the kickoff. The 0.253m limit is unchanged.
+			if p.ai_state < 0:
+				since_reset[id] = 0
+			else:
+				since_reset[id] = since_reset.get(id, 9999) + 1
+			if last_target.has(id) and since_reset.get(id, 9999) > 3:
 				worst_step = maxf(worst_step, last_target[id].distance_to(p.ai_smoothed_target))
 			last_target[id] = p.ai_smoothed_target
 			var v := Vector2(p.velocity.x, p.velocity.z)
@@ -442,6 +485,26 @@ func _test_human_pass_produces_teammate_directed_velocity() -> void:
 	# own comment says it is trying to avoid.
 	passer.move_input = Vector2.ZERO
 	for i in range(30):
+		await get_tree().physics_frame
+
+	# v0.9.1: PLACE the passer relative to the teammate rather than trusting
+	# a timed walk to have left them in front of one.
+	#
+	# Players collide with each other from v0.9.1 (FootballPlayer.tscn's
+	# mask omitted the player layer, so twenty-two bodies used to pass
+	# straight through one another). The walk above used to carry the passer
+	# THROUGH the mate; move_and_slide now slides them AROUND that body and
+	# they overshoot past it. Measured here: aim (0.71, 0, -0.71) against a
+	# teammate lying at (-0.71, 0, 0.71) -- dot -1.00, the mate exactly
+	# behind the passer, so no candidate was inside the aim cone and the
+	# pass correctly fell through to its no-target knock. The geometry this
+	# block needs is "a teammate ahead of me"; it is now set up directly
+	# instead of being a side effect of walking.
+	var aim_dir := Vector3(0.7, 0.0, -0.7).normalized()
+	passer.global_position = mate.global_position - aim_dir * 6.0
+	passer.global_position.y = mate.global_position.y
+	passer.velocity = Vector3.ZERO
+	for i in range(20):
 		await get_tree().physics_frame
 	var feet: Vector3 = passer.global_position + Vector3(0.5, 0.35, -0.5)
 	PhysicsServer3D.body_set_state(ball.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), feet))
@@ -665,7 +728,15 @@ func _test_possession_stealing_still_works() -> void:
 	add_child(ball)
 	await get_tree().physics_frame
 
+	# v0.9.1: let each body settle before adding the next. Players collide
+	# with one another from v0.9.1, and two CharacterBody3Ds created in the
+	# same frame are both resolved by the solver before either has taken a
+	# physics step -- measured here, the carrier was displaced from x=0 onto
+	# the thief at x=1.6 on the very first frame, and the pair then separated
+	# to 3.90/2.50. Spawning them a frame apart gives each a settled
+	# transform to be resolved against.
 	var carrier: FootballPlayer = _spawn(0, Vector3(0, 1, 0), "CM")
+	await get_tree().physics_frame
 	var thief: FootballPlayer = _spawn(1, Vector3(1.6, 1, 0), "CB")
 	await get_tree().physics_frame
 	carrier.set_match_context([carrier], [thief])

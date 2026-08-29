@@ -1401,6 +1401,39 @@ unaffected.
   movement frozen, timer withheld) instead of the match beginning
   mid-play on frame one
 
+## v0.9.1 — Pre-Animation Gameplay Cleanup
+
+Full engineering report with every measurement:
+[`docs/v0.9.1-engineering-report.md`](docs/v0.9.1-engineering-report.md).
+
+Gameplay problems removed so that animation work does not sit on top of
+physics that reads as wrong:
+
+- **AI never passes to an opponent.** The team-identity check is at candidate
+  generation, not a late veto, with an invariant at the evaluator's exit.
+  Measured 0 opponent-targeted passes in a 60s headless match, a 90s AI
+  diagnostic, and both rendered playtests -- and it still refuses when handed
+  a deliberately poisoned squad. Interception remains legal football.
+- **Human pass respects intent.** The aim cone was a 76 degree hemisphere; a
+  teammate 72 degrees off could capture a dead-forward pass and send the ball
+  65.9 degrees away from where the player pointed. Now 60 degrees: in-cone
+  passes are struck accurately (0.0 degree error), anything wider falls
+  through to an honest knock in the aimed direction.
+- **Players are solid.** `FootballPlayer` collided with world and ball but not
+  with other players, so twenty-two bodies passed through each other. Fixed,
+  and decoupled from the ball so a 25 m/s shot moves a standing player 0.00m.
+- **Tackles land at a physical distance.** Pokes measured at 0.42m maximum
+  centre-to-ball; 91% of steals happen while a challenge is building, 9% by
+  proximity, 0% without contest.
+- **Animation event surface.** `ball_touched`, `action_started`,
+  `action_released`, `challenge_started`, `possession_changed` (with a reason)
+  and `pass_attempted`. The animation pack is deliberately NOT integrated yet.
+
+Known and reported rather than hidden: the passing-lane share regressed with
+solid bodies (50% bar, currently 26-43%) and off-ball run convergence is
+reduced by about half rather than eliminated. Both are in the report with
+their measurements.
+
 ## Roadmap Ideas (for expanding into a full game)
 
 - Integrate the 5 models that couldn't be downloaded this round (Super
