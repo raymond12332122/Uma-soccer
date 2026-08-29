@@ -172,13 +172,18 @@ func _check_registered_model(visual_id: String) -> void:
 		_check("'%s' has a Skeleton3D (skinned mesh imported correctly)" % visual_id, skeleton != null)
 		_check("'%s' skeleton has bones" % visual_id, skeleton != null and skeleton.get_bone_count() > 0)
 
-		# T-pose fix: every shipped model has zero animation clips (verified
-		# below), so without this the upper arms would sit in their bind-pose
-		# horizontal T-pose forever. Check both the diagnostic flag and the
-		# actual posed geometry -- the arm's *current* pose direction (not
-		# rest) must now point mostly downward, not sideways.
-		_check("'%s' AnimationController ran the T-pose arm fix" % visual_id, ac.t_pose_fixed)
-		if skeleton:
+		# The models ship in a bind pose with the arms straight out, so
+		# SOMETHING has to take them out of it or the character runs around
+		# looking like a floating cross.
+		#
+		# Until v0.9.2 that was always the static T-pose fix, because no model
+		# had a single animation clip. The pack now drives them, and a driven
+		# skeleton poses its own arms -- so the fix correctly does not run, and
+		# demanding that it did would be demanding the old fallback. What has
+		# to stay true is that ONE of the two happened.
+		_check("'%s' is either driven by clips or had the T-pose fix applied" % visual_id,
+			ac.is_animated() or ac.t_pose_fixed)
+		if skeleton and not ac.is_animated():
 			var arm_l_idx: int = ac._find_bone_exact(skeleton, "Arm_L")
 			var elbow_l_idx: int = ac._find_bone_exact(skeleton, "Elbow_L")
 			if arm_l_idx >= 0 and elbow_l_idx >= 0:
@@ -194,13 +199,15 @@ func _check_registered_model(visual_id: String) -> void:
 		await get_tree().process_frame
 	_check("'%s' handles all states/actions without error" % visual_id, true)
 
-	# Real animation detection: this pipeline auto-matches clips by keyword
-	# when a model ships them, and falls back to procedural motion when it
-	# doesn't (true for every model integrated so far -- both ship 0 clips).
-	if ac._anim_player == null:
-		_check("'%s' correctly falls back to procedural animation (0 clips in source)" % visual_id, true)
+	# v0.9.2: the model itself still ships zero clips -- they come from the
+	# shared animation pack, retargeted onto its skeleton. Either way round is
+	# legitimate; what is checked is that the controller ended up in a state
+	# it can actually animate from.
+	if ac.is_animated():
+		_check("'%s' is driven by the shared animation library" % visual_id,
+			ac.get_node_or_null("AnimationTree") != null)
 	else:
-		_check("'%s' detected real animation clips and will use them over the procedural fallback" % visual_id, ac._anim_player.get_animation_list().size() > 0)
+		_check("'%s' correctly falls back to procedural animation" % visual_id, true)
 
 	ac.queue_free()
 

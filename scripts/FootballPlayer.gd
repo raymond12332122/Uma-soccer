@@ -594,6 +594,11 @@ var ai_smoothed_target: Vector3 = Vector3.ZERO
 ## nothing in the simulation branches on it.
 var gk_intent: int = 0
 
+## v0.9.2: the intent the keeper's dive/block animation was last fired for, so
+## a keeper holding SAVE across many frames restarts the clip once, not once
+## per frame. Visual bookkeeping only.
+var _last_gk_intent: int = -1
+
 ## v0.9.1.1: the FULL carrier decision, every time one is made.
 ##
 ## Diagnostic and test surface only; nothing in the simulation reads it. The
@@ -712,6 +717,52 @@ func _ready() -> void:
 	if control_indicator:
 		control_indicator.visible = false
 
+	_connect_animation_events()
+
+
+## v0.9.2: let the animation layer listen to the events v0.9.1 already emits.
+##
+## Deliberately a subscription rather than calls added at the emit sites. The
+## rule those signals were written under -- "the simulation emits and never
+## reads" -- is what keeps the animation from becoming a second physics
+## system (brief section 3), and it only holds if the physics code stays
+## unaware of who is listening. Nothing below can influence the ball.
+func _connect_animation_events() -> void:
+	if animation_controller == null:
+		return
+	ball_touched.connect(_on_touch_animate)
+	challenge_started.connect(_on_challenge_animate)
+
+
+## ONE gameplay contact produces ONE animation request (brief section 8).
+##
+## Plain DRIBBLE knock-ons are deliberately NOT given an action clip. They
+## fire every 0.3-0.5s while carrying, and the shortest usable touch clip in
+## the pack still runs 0.45s, so a full-body clip per knock-on would replace
+## the run cycle almost continuously -- the carrier would stop looking like a
+## person running and start looking like a person repeatedly kneeing the air.
+## The run cycle already contains a foot cycle. TURN and STOP are real,
+## distinct and comparatively rare events, and do get their own clip.
+func _on_touch_animate(info: Dictionary) -> void:
+	match int(info.get("kind", -1)):
+		TouchKind.PASS:
+			animation_controller.play_action("pass")
+		TouchKind.SHOT:
+			animation_controller.play_action("shoot")
+		TouchKind.STOP:
+			animation_controller.play_action("trap")
+		TouchKind.TURN:
+			animation_controller.play_action("touch")
+
+
+## A challenge is the one outfield action with real lead time: BallContest
+## emits this when progress starts building, well before the outcome is
+## known, so the tackle clip can play its wind-up honestly.
+func _on_challenge_animate(_info: Dictionary) -> void:
+	var moving: float = Vector2(velocity.x, velocity.z).length()
+	animation_controller.play_action(
+		"challenge_slide" if moving > base_speed * 0.85 else "challenge")
+
 
 func apply_player_data(data: PlayerData) -> void:
 	player_data = data
@@ -743,6 +794,7 @@ func apply_player_data(data: PlayerData) -> void:
 
 	if animation_controller:
 		animation_controller.set_visual(data.visual_id)
+		animation_controller.set_keeper(is_goalkeeper)
 
 	personality = PersonalityProfiles.get_profile(data.visual_id)
 
@@ -1181,6 +1233,13 @@ func _update_personality_bookkeeping(delta: float) -> void:
 func _update_animation_state() -> void:
 	if animation_controller == null:
 		return
+	# v0.9.2 (brief section 5): the animation layer is driven by what the
+	# CharacterBody actually did this frame, not by the input that asked for
+	# it and not by a state name. A player being shoved backwards while
+	# facing forwards gets the backpedal clip because that is what is
+	# happening to them.
+	animation_controller.set_motion(velocity)
+	_update_keeper_animation()
 	if personality_visual_state_override != "":
 		animation_controller.set_state(personality_visual_state_override)
 		return
@@ -1197,6 +1256,54 @@ func _update_animation_state() -> void:
 	else:
 		state = "walk"
 	animation_controller.set_state(state)
+
+
+## v0.9.2 (brief section 26): the keeper's DECISIONS are untouched. This reads
+## the intent AIController already computed and shows it; a dive fires when
+## the keeper commits to SAVE, a block when it commits to BLOCK, and nothing
+## fires for POSITION, CLOSE_ANGLE or ATTACK_LOOSE_BALL, which are just
+## running and are already covered by locomotion.
+##
+## Firing on the TRANSITION, not on the state, is what stops a keeper holding
+## SAVE for half a second from restarting the dive clip thirty times.
+func _update_keeper_animation() -> void:
+	if not is_goalkeeper:
+		return
+	if gk_intent == _last_gk_intent:
+		return
+	_last_gk_intent = gk_intent
+	match gk_intent:
+		AIController.GKIntent.SAVE:
+			# Which way to dive comes from where the ball actually is
+			# relative to the way the keeper is facing.
+			animation_controller.play_action(
+				"save_right" if _ball_is_to_the_right() else "save_left")
+		AIController.GKIntent.BLOCK:
+			animation_controller.play_action("block")
+
+
+## Sign of the ball's offset across the keeper's facing direction.
+func _ball_is_to_the_right() -> bool:
+	var ball: RigidBody3D = _known_ball
+	if ball == null:
+		return true
+	return player_right().dot(ball.global_position - global_position) >= 0.0
+
+
+## The player's own RIGHT on the ground plane.
+##
+## v0.9.2: right = forward x up. Godot is right-handed with a node's forward
+## at -Z, and this project faces players along +Z instead, so the model's axes
+## run opposite to the usual reading and the character's right is -X when
+## facing +Z -- not +X, which is what the obvious perpendicular gives.
+##
+## The distinction is invisible until something is authored for a real
+## anatomical side. Both callers are: which foot a touch reads as, and which
+## way a keeper dives. Getting it backwards would have every keeper dive away
+## from the ball.
+func player_right() -> Vector3:
+	var facing := facing_direction()
+	return Vector3(-facing.z, 0.0, facing.x)
 
 
 func _get_aim_direction() -> Vector3:
@@ -1240,9 +1347,8 @@ func _emit_touch(kind: int, direction: Vector3, strength: float, ball: RigidBody
 	# Which foot the contact reads as: the ball's side relative to the way
 	# the player is facing. An animation layer needs this to pick a clip;
 	# nothing in the physics uses it.
-	var facing := Vector3(sin(_facing_angle), 0.0, cos(_facing_angle))
 	var side: Vector3 = ball.global_position - global_position
-	var right := Vector3(facing.z, 0.0, -facing.x)
+	var right: Vector3 = player_right()
 	ball_touched.emit({
 		"kind": kind,
 		"point": ball.global_position,

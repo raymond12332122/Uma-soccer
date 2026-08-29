@@ -7,18 +7,38 @@ extends Node3D
 ##
 ##   set_visual(visual_id)   -- (re)builds the displayed character
 ##   set_state(state)        -- continuous locomotion/possession state
-##   play_action(action)     -- one-shot triggered action
+##   set_motion(velocity)    -- the body's actual ground velocity
+##   play_action(action)     -- one-shot gameplay intent
 ##   set_team_color(color)   -- team tint (placeholder capsule only; a
 ##                              real character keeps its authored textures)
 ##
-## It never needs to know whether the current visual has real animation
-## clips. If a model ships clips whose names loosely match a requested
-## state/action (see STATE_KEYWORDS/ACTION_KEYWORDS), they're used
-## automatically. If not -- exactly the case for the first integrated
-## model, which has zero animations -- this falls back to lightweight
-## procedural motion (bob/lean/pulse) so the game is never silently
-## static. Swapping in a properly-animated model later is a data change
-## (CharacterRegistry) plus clip-name matching; no FootballPlayer changes.
+## Every one of those is an INTENT. No call site anywhere names a clip, picks
+## a blend weight or sets a playback rate; this file owns all of that, and
+## AnimationSet owns which clip an intent resolves to. That boundary is the
+## point of brief section 4: gameplay says "pass", not "play kick_03".
+##
+## v0.9.2 puts a real AnimationTree behind that interface:
+##
+##   Idle ------\
+##               Blend2 (Loco) ---\
+##   Move -> TimeScale -/          OneShot (Shot) --> output
+##   Action ----------------------/
+##
+## Move is an eight-point directional blend space driven by the CharacterBody's
+## own velocity, expressed in the model's local frame. TimeScale sets playback
+## rate from ground speed so the feet keep up. OneShot layers a gameplay
+## action over the top and takes itself off again when the clip ends, which is
+## what makes "one gameplay contact, one animation" true by construction
+## rather than by bookkeeping (section 8).
+##
+## GAMEPLAY REMAINS AUTHORITATIVE. Nothing here writes to the CharacterBody,
+## the ball, or any gameplay state; the ground travel baked into the clips is
+## removed at library build time (see AnimationLibraryCache). The animation
+## layer reads the simulation and never the other way round.
+##
+## If the pack is unavailable, or the visual is the placeholder capsule, this
+## falls back to the lightweight procedural motion it used before v0.9.2, so
+## the game is never silently static (section 24).
 
 @export var target_height: float = 1.6
 ## Extra correction if a model's own "front" doesn't already face +Z after
@@ -26,24 +46,8 @@ extends Node3D
 ## true for the model shipped in v0.4, verified against its rig data.
 @export var facing_correction_degrees: float = 0.0
 
-const STATE_KEYWORDS := {
-	"idle": ["idle"],
-	"walk": ["walk"],
-	"run": ["run", "jog"],
-	"sprint": ["sprint", "dash"],
-	"dribble": ["dribble"],
-	"sitting": ["sit"],
-}
-const ACTION_KEYWORDS := {
-	"pass": ["pass"],
-	"shoot": ["shoot", "kick"],
-	"celebration": ["celebrat", "cheer", "goal"],
-	"tackle": ["tackle", "slide"],
-	"look_around": ["look"],
-	"excited_reaction": ["excite", "hype"],
-	"frustrated_reaction": ["frustrat", "annoy"],
-	"victory_pose": ["victory", "pose", "triumph"],
-}
+## Kept for the procedural fallback path only. With real clips loaded, states
+## are resolved through the blend space from measured velocity instead.
 const PULSE_DURATIONS := {
 	"pass": 0.3,
 	"shoot": 0.4,
@@ -56,12 +60,18 @@ const PULSE_DURATIONS := {
 }
 
 var _visual_root: Node3D = null
-var _anim_player: AnimationPlayer = null
-var _state_clip_map: Dictionary = {}
-var _action_clip_map: Dictionary = {}
+var _tree: AnimationTree = null
+var _action_node: AnimationNodeAnimation = null
 var _uses_real_model: bool = false
+## True once the AnimationTree is built and driving a real skeleton.
+var _animated: bool = false
+var _is_keeper: bool = false
+## Ground speed this character's gait covers at 1x playback, in m/s. Measured
+## per rig (see AnimationSet); the roster mean until a visual is assigned.
+var _natural_speed: float = AnimationSet.RENDERED_NATURAL_SPEED
 
 var _current_state: String = "idle"
+var _motion := Vector3.ZERO
 var _procedural_time: float = 0.0
 var _pulse_kind: String = ""
 var _pulse_time: float = -1.0
@@ -74,6 +84,12 @@ var last_measured_height: float = 0.0
 ## for the current real-model visual (see _setup_real_model).
 var t_pose_fixed: bool = false
 
+## Diagnostic only -- how many action clips this controller has fired, and
+## the last intent it resolved. The v0.9.2 tests assert one contact produces
+## exactly one of these.
+var actions_fired: int = 0
+var last_action: String = ""
+
 ## Relaxed-hang target direction for the upper arm bone, in skeleton-local
 ## space (Y-up, confirmed empirically for every currently-integrated
 ## model). X is mirrored per side; a small outward/forward bias keeps the
@@ -84,14 +100,17 @@ const _TPOSE_UPPER_ARM_TARGET := Vector3(0.18, -1.0, 0.08)
 func set_visual(visual_id: String) -> void:
 	if _visual_root:
 		_visual_root.queue_free()
+	if _tree:
+		_tree.queue_free()
 	_visual_root = null
-	_anim_player = null
-	_state_clip_map.clear()
-	_action_clip_map.clear()
+	_tree = null
+	_action_node = null
+	_animated = false
 	_pulse_kind = ""
 	_pulse_time = -1.0
 	t_pose_fixed = false
 
+	_natural_speed = AnimationSet.natural_speed(visual_id)
 	var scene: PackedScene = CharacterRegistry.get_scene(visual_id)
 	if scene:
 		_uses_real_model = true
@@ -103,6 +122,22 @@ func set_visual(visual_id: String) -> void:
 
 func supports_team_tint() -> bool:
 	return not _uses_real_model
+
+
+## True when a real AnimationTree is driving a real skeleton, i.e. what the
+## player is doing is being shown by clips rather than by the procedural
+## fallback. Read by tests and by the section 32 counts.
+func is_animated() -> bool:
+	return _animated
+
+
+## Goalkeepers idle differently and have their own action vocabulary.
+func set_keeper(is_keeper: bool) -> void:
+	if _is_keeper == is_keeper:
+		return
+	_is_keeper = is_keeper
+	if _animated:
+		_apply_idle_clip()
 
 
 func set_team_color(color: Color) -> void:
@@ -117,29 +152,54 @@ func set_team_color(color: Color) -> void:
 	mesh.set_surface_override_material(0, mat)
 
 
+## The body's actual ground velocity, in world space. Section 5: locomotion is
+## driven by what the CharacterBody is really doing, never by what the input
+## asked for or by what state machine a designer imagined.
+func set_motion(velocity: Vector3) -> void:
+	_motion = velocity
+
+
 ## Continuous locomotion/possession state, called every physics frame by
 ## FootballPlayer. Cheap to call redundantly -- no-ops if unchanged.
+##
+## With clips loaded this is advisory: the blend space reads velocity, so
+## "run" and "sprint" are the same clip at different rates and the state name
+## only decides the special cases (a scripted sit, say).
 func set_state(state: String) -> void:
 	if state == _current_state:
 		return
 	_current_state = state
-	if _anim_player and _state_clip_map.has(state):
-		_anim_player.play(_state_clip_map[state])
 
 
-## One-shot triggered action (pass/shoot/celebration/tackle).
+## One-shot gameplay intent. `action` is a semantic name from AnimationSet --
+## "pass", "shoot", "challenge", "save_left" -- never a clip.
 func play_action(action: String) -> void:
-	if _anim_player and _action_clip_map.has(action):
-		_anim_player.play(_action_clip_map[action])
-		return
+	var intent: String = AnimationSet.REACTIONS.get(action, action)
+	if _animated and _action_node != null:
+		var entry: Dictionary = AnimationSet.action(intent)
+		if not entry.is_empty():
+			_action_node.animation = intent
+			var shot := _tree.tree_root.get_node("Shot") as AnimationNodeOneShot
+			shot.fadein_time = entry["fade_in"]
+			shot.fadeout_time = entry["fade_out"]
+			_tree.set("parameters/Shot/request", AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE)
+			actions_fired += 1
+			last_action = intent
+			return
 	_pulse_kind = action
 	_pulse_time = 0.0
+	actions_fired += 1
+	last_action = action
 
 
 func _process(delta: float) -> void:
 	if _visual_root == null:
 		return
 	_procedural_time += delta
+
+	if _animated:
+		_drive_tree()
+		return
 
 	if _pulse_time >= 0.0:
 		_pulse_time += delta
@@ -151,14 +211,44 @@ func _process(delta: float) -> void:
 			_apply_action_pulse(_pulse_kind, _pulse_time / duration)
 			return
 
-	# Real clips (once a model ships them) drive the visual on their own;
-	# procedural motion is purely the fallback for a state with no clip.
-	if _anim_player and _state_clip_map.has(_current_state):
-		_visual_root.position = Vector3.ZERO
-		_visual_root.rotation = Vector3.ZERO
-		return
-
 	_apply_state_procedural(_current_state)
+
+
+## Feed the blend space from the body's real velocity.
+##
+## The velocity is rotated into the MODEL's frame, so the blend point means
+## "how much of this is forward and how much is sideways from where the
+## character is looking" -- which is what the eight clips actually are. A
+## player running north while facing east strafes, and it comes out of this
+## without a single special case (section 6).
+func _drive_tree() -> void:
+	var planar := Vector3(_motion.x, 0.0, _motion.z)
+	var speed: float = planar.length()
+
+	# Rotated into the frame the model FACES, taken from this node rather than
+	# from the model instance: the instance carries the height-normalisation
+	# scale, and inverting a scaled basis is a needless source of error when
+	# the parent already holds the clean facing rotation.
+	var local: Vector3 = global_transform.basis.orthonormalized().inverse() * planar
+	# x is the character's own right (see AnimationSet.MODEL_RIGHT), which is
+	# NOT the model's +X.
+	var dir := Vector2(AnimationSet.MODEL_RIGHT.x * local.x, local.z)
+	if dir.length() > 0.001:
+		dir = dir.normalized()
+	_tree.set("parameters/Move/blend_position", dir)
+
+	var move_amount: float = clampf(
+		(speed - AnimationSet.IDLE_SPEED)
+		/ maxf(AnimationSet.FULL_MOVE_SPEED - AnimationSet.IDLE_SPEED, 0.01), 0.0, 1.0)
+	_tree.set("parameters/Loco/blend_amount", move_amount)
+
+	# Rate is what keeps the feet with the ground. Clamped: past the top of
+	# the band a jog clip stops reading as running, and the game's 8.5 m/s
+	# sprint is about three times the clip's natural speed, so the clamp IS
+	# reached and sprinting does slide. Measured, reported, not hidden.
+	var rate: float = clampf(speed / maxf(_natural_speed, 0.01),
+		AnimationSet.RATE_MIN, AnimationSet.RATE_MAX)
+	_tree.set("parameters/MoveScale/scale", rate)
 
 
 func _apply_state_procedural(state: String) -> void:
@@ -259,54 +349,109 @@ func _setup_real_model(scene: PackedScene) -> void:
 	else:
 		push_warning("AnimationController: could not measure a sane height (%f) for model, leaving scale untouched" % measured_height)
 
-	if facing_correction_degrees != 0.0:
-		instance.rotate_y(deg_to_rad(facing_correction_degrees))
+	# Section 18: ONE place decides which way a model faces. The correction is
+	# a measured property of the rig plus the pack (see
+	# AnimationSet.MODEL_YAW_OFFSET_DEGREES), not a per-character fudge
+	# scattered through scene files.
+	var yaw: float = facing_correction_degrees + AnimationSet.MODEL_YAW_OFFSET_DEGREES
+	if yaw != 0.0:
+		instance.rotate_y(deg_to_rad(yaw))
 
-	_anim_player = _find_animation_player(instance)
-	if _anim_player == null or _anim_player.get_animation_list().is_empty():
-		_anim_player = null
-	else:
-		_build_clip_maps()
+	var skeleton: Skeleton3D = _find_skeleton(instance)
+	if skeleton != null and _build_tree(skeleton):
+		_animated = true
+		return
 
 	# Every currently-integrated model ships in a bind pose (T-pose: arms
-	# straight out horizontally) with zero animation clips, so without this
-	# every character would stand/run around looking like a floating cross.
-	# Only relevant on the no-real-clips path -- a model with real clips
-	# handles its own posing once played.
-	if _anim_player == null:
-		var skeleton: Skeleton3D = _find_skeleton(instance)
-		if skeleton:
-			_fix_tpose_arms(skeleton)
-			t_pose_fixed = true
+	# straight out horizontally), so without this a character with no clips
+	# would stand and run around looking like a floating cross. Only reached
+	# on the no-clips path -- a driven skeleton poses itself.
+	if skeleton:
+		_fix_tpose_arms(skeleton)
+		t_pose_fixed = true
 
 
-func _build_clip_maps() -> void:
-	for clip_name in _anim_player.get_animation_list():
-		var lower: String = clip_name.to_lower()
-		for state in STATE_KEYWORDS:
-			if _state_clip_map.has(state):
-				continue
-			for keyword in STATE_KEYWORDS[state]:
-				if lower.contains(keyword):
-					_state_clip_map[state] = clip_name
-					break
-		for action in ACTION_KEYWORDS:
-			if _action_clip_map.has(action):
-				continue
-			for keyword in ACTION_KEYWORDS[action]:
-				if lower.contains(keyword):
-					_action_clip_map[action] = clip_name
-					break
+## Build this player's AnimationTree over the shared clip library.
+##
+## The tree's root_node is the skeleton's PARENT, because the pack's track
+## paths are 'Skeleton3D:<bone>' and every character keeps a node called
+## Skeleton3D at that level (the retarget config deliberately leaves
+## make_unique off for exactly this reason). That is what lets 22 players and
+## 11 different rigs share one untouched library instead of each needing its
+## own track paths rewritten.
+func _build_tree(skeleton: Skeleton3D) -> bool:
+	var lib: AnimationLibrary = AnimationLibraryCache.get_library()
+	if lib == null or lib.get_animation_list().is_empty():
+		return false
+
+	var tree := AnimationTree.new()
+	tree.name = "AnimationTree"
+	add_child(tree)
+	tree.add_animation_library("", lib)
+	tree.root_node = tree.get_path_to(skeleton.get_parent())
+	tree.callback_mode_process = AnimationMixer.ANIMATION_CALLBACK_MODE_PROCESS_IDLE
+
+	var blend := AnimationNodeBlendTree.new()
+
+	var idle := AnimationNodeAnimation.new()
+	blend.add_node("Idle", idle, Vector2(0, 0))
+
+	var move := AnimationNodeBlendSpace2D.new()
+	move.min_space = Vector2(-1.2, -1.2)
+	move.max_space = Vector2(1.2, 1.2)
+	move.snap = Vector2(0.1, 0.1)
+	move.sync = true
+	for clip in AnimationSet.LOCOMOTION:
+		var point := AnimationNodeAnimation.new()
+		point.animation = AnimationLibraryCache._key(clip)
+		move.add_blend_point(point, AnimationSet.LOCOMOTION[clip])
+	# A ninth point at the centre. The eight real clips form a ring, and
+	# Godot's triangulation of a ring can leave the middle uncovered; the
+	# centre is blended out by Loco anyway, so which clip sits there does not
+	# matter, only that the space is defined everywhere.
+	var centre := AnimationNodeAnimation.new()
+	centre.animation = AnimationLibraryCache._key("jog forward")
+	move.add_blend_point(centre, Vector2.ZERO)
+	blend.add_node("Move", move, Vector2(0, 150))
+
+	var scale := AnimationNodeTimeScale.new()
+	blend.add_node("MoveScale", scale, Vector2(250, 150))
+
+	var loco := AnimationNodeBlend2.new()
+	loco.sync = true
+	blend.add_node("Loco", loco, Vector2(450, 60))
+
+	var action := AnimationNodeAnimation.new()
+	blend.add_node("Action", action, Vector2(450, 260))
+
+	var shot := AnimationNodeOneShot.new()
+	shot.mix_mode = AnimationNodeOneShot.MIX_MODE_BLEND
+	blend.add_node("Shot", shot, Vector2(650, 150))
+
+	blend.connect_node("MoveScale", 0, "Move")
+	blend.connect_node("Loco", 0, "Idle")
+	blend.connect_node("Loco", 1, "MoveScale")
+	blend.connect_node("Shot", 0, "Loco")
+	blend.connect_node("Shot", 1, "Action")
+	blend.connect_node("output", 0, "Shot")
+
+	tree.tree_root = blend
+	tree.active = true
+
+	_tree = tree
+	_action_node = action
+	_apply_idle_clip()
+	return true
 
 
-func _find_animation_player(node: Node) -> AnimationPlayer:
-	if node is AnimationPlayer:
-		return node
-	for child in node.get_children():
-		var found: AnimationPlayer = _find_animation_player(child)
-		if found:
-			return found
-	return null
+func _apply_idle_clip() -> void:
+	if _tree == null or _tree.tree_root == null:
+		return
+	var idle := _tree.tree_root.get_node("Idle") as AnimationNodeAnimation
+	if idle == null:
+		return
+	idle.animation = AnimationLibraryCache._key(
+		AnimationSet.IDLE_CLIP_KEEPER if _is_keeper else AnimationSet.IDLE_CLIP)
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:
@@ -324,24 +469,27 @@ func _find_skeleton(node: Node) -> Skeleton3D:
 ## *only* bone touched: rotating just the shoulder joint's own transform
 ## carries the elbow/wrist/fingers (its children) rigidly along via normal
 ## skeleton hierarchy evaluation -- no separate per-bone position/rotation
-## bookkeeping needed, and nothing to get out of sync. Every
-## currently-integrated model shares one rig convention (verified: same
-## bone names, same near-identical T-pose rest direction on all 11), so
-## one fixed target direction generalizes across the whole roster without
-## per-character special-casing.
+## bookkeeping needed, and nothing to get out of sync.
 ##
-## A static pose fix, not an animation -- legs are already in a natural
-## standing position at rest (not spread) and are left untouched. Full
-## walk/run gait animation is intentionally out of scope here; see the
-## README's Roadmap.
+## A static pose fix, not an animation, and since v0.9.2 only the FALLBACK
+## for a rig with no clips available. Bone names are the humanoid profile's,
+## because import-time retargeting renames every mapped bone -- 'Arm_L_0267'
+## became 'LeftUpperArm'. The old prefix form is still tried second so a rig
+## that somehow arrives un-retargeted is not left as a floating cross.
 func _fix_tpose_arms(skeleton: Skeleton3D) -> void:
-	_fix_upper_arm(skeleton, "Arm_L", Vector3(_TPOSE_UPPER_ARM_TARGET.x, _TPOSE_UPPER_ARM_TARGET.y, _TPOSE_UPPER_ARM_TARGET.z))
-	_fix_upper_arm(skeleton, "Arm_R", Vector3(-_TPOSE_UPPER_ARM_TARGET.x, _TPOSE_UPPER_ARM_TARGET.y, _TPOSE_UPPER_ARM_TARGET.z))
+	_fix_upper_arm(skeleton, "LeftUpperArm", "LeftLowerArm", "Arm_L", "Elbow_L",
+		Vector3(_TPOSE_UPPER_ARM_TARGET.x, _TPOSE_UPPER_ARM_TARGET.y, _TPOSE_UPPER_ARM_TARGET.z))
+	_fix_upper_arm(skeleton, "RightUpperArm", "RightLowerArm", "Arm_R", "Elbow_R",
+		Vector3(-_TPOSE_UPPER_ARM_TARGET.x, _TPOSE_UPPER_ARM_TARGET.y, _TPOSE_UPPER_ARM_TARGET.z))
 
 
-func _fix_upper_arm(skeleton: Skeleton3D, bone_prefix: String, target_dir_local: Vector3) -> void:
-	var bone_idx: int = _find_bone_exact(skeleton, bone_prefix)
-	var child_idx: int = _find_bone_exact(skeleton, bone_prefix.replace("Arm_", "Elbow_"))
+func _fix_upper_arm(skeleton: Skeleton3D, profile_bone: String, profile_child: String,
+		legacy_bone: String, legacy_child: String, target_dir_local: Vector3) -> void:
+	var bone_idx: int = skeleton.find_bone(profile_bone)
+	var child_idx: int = skeleton.find_bone(profile_child)
+	if bone_idx < 0 or child_idx < 0:
+		bone_idx = _find_bone_exact(skeleton, legacy_bone)
+		child_idx = _find_bone_exact(skeleton, legacy_child)
 	if bone_idx < 0 or child_idx < 0:
 		return
 
@@ -359,13 +507,12 @@ func _fix_upper_arm(skeleton: Skeleton3D, bone_prefix: String, target_dir_local:
 	skeleton.set_bone_global_pose_override(bone_idx, Transform3D(new_basis, self_rest.origin), 1.0, true)
 
 
-## Exact-match bone lookup: skeleton bone names are "<prefix>_<numeric
-## suffix>" (e.g. "Arm_L_0267"), where the suffix varies per model/import
-## and isn't meaningful -- but several *other* real bones share the same
-## prefix as a plain string (e.g. "Wrist_L_IK_Handle_0302" also starts
-## with "Wrist_L_"), so a plain begins_with() would be ambiguous. Requiring
-## the remainder after "<prefix>_" to be purely numeric picks the actual
-## bone and rejects those IK/Handle helper bones.
+## Exact-match bone lookup for the pre-retarget naming convention:
+## "<prefix>_<numeric suffix>" (e.g. "Arm_L_0267"), where the suffix varies
+## per model and isn't meaningful -- but several *other* real bones share the
+## same prefix as a plain string (e.g. "Wrist_L_IK_Handle_0302"), so a plain
+## begins_with() would be ambiguous. Requiring the remainder to be purely
+## numeric picks the actual bone and rejects those IK/Handle helpers.
 func _find_bone_exact(skeleton: Skeleton3D, prefix: String) -> int:
 	var want: String = prefix + "_"
 	for i in range(skeleton.get_bone_count()):
@@ -377,12 +524,26 @@ func _find_bone_exact(skeleton: Skeleton3D, prefix: String) -> int:
 	return -1
 
 
-## Bind-pose bounding-box height of every mesh under `root`, in the
-## model's own imported units. Uses each Mesh *resource's* AABB rather
-## than the node's cached visual AABB, since the resource's bounds are
-## valid immediately (baked in at import) without waiting on a render
-## frame -- important because this runs synchronously during spawn.
+## Rendered height of the model, in the units it will be displayed at. Uses
+## each Mesh *resource's* AABB rather than the node's cached visual AABB,
+## since the resource's bounds are valid immediately (baked in at import)
+## without waiting on a render frame -- important because this runs
+## synchronously during spawn.
+##
+## A SKINNED mesh is not drawn where its node sits. Its vertices go through
+## the skin's bind pose and then the bones, so the node transform says almost
+## nothing about the size on screen, and the bind pose's scale says everything.
+## On this roster that scale is 0.01: the mesh resources measure ~21 units
+## tall and render at ~0.21. Measuring by node transform alone therefore
+## reported a height a hundred times too large, and the auto-fit divided by
+## it -- every character would have spawned about 1.6cm tall. (That is a
+## v0.9.2 regression from turning on retarget/rest_fixer/apply_node_transforms,
+## which rebaked where those transforms live; the character pipeline suite
+## caught it, which is what its bind-pose height check is for.)
 func _measure_height(root: Node) -> float:
+	var skeleton: Skeleton3D = _find_skeleton(root)
+	var bind_scale: float = _skin_bind_scale(skeleton)
+
 	var aabb := AABB()
 	var first := true
 	var stack: Array = [root]
@@ -390,7 +551,14 @@ func _measure_height(root: Node) -> float:
 		var node: Node = stack.pop_back()
 		if node is MeshInstance3D and node.mesh:
 			var local_aabb: AABB = node.mesh.get_aabb()
-			var world_aabb: AABB = _transform_aabb(node.global_transform, local_aabb)
+			var xform: Transform3D = node.global_transform
+			if (node as MeshInstance3D).skin != null:
+				# Skinned: the bind pose carries the scale the vertices are
+				# really drawn at, and the skeleton node's own transform
+				# carries the rest.
+				var skel_basis: Basis = skeleton.global_transform.basis if skeleton else Basis.IDENTITY
+				xform = Transform3D(skel_basis.scaled(Vector3.ONE * bind_scale), Vector3.ZERO)
+			var world_aabb: AABB = _transform_aabb(xform, local_aabb)
 			if first:
 				aabb = world_aabb
 				first = false
@@ -399,6 +567,19 @@ func _measure_height(root: Node) -> float:
 		for child in node.get_children():
 			stack.append(child)
 	return aabb.size.y
+
+
+## Uniform scale baked into a skeleton's skin bind poses, i.e. how much the
+## mesh's own units are shrunk on their way to bone space. 1.0 when there is
+## no skin to ask.
+func _skin_bind_scale(skeleton: Skeleton3D) -> float:
+	if skeleton == null:
+		return 1.0
+	for c in skeleton.get_children():
+		var mi := c as MeshInstance3D
+		if mi != null and mi.skin != null and mi.skin.get_bind_count() > 0:
+			return mi.skin.get_bind_pose(0).basis.get_scale().y
+	return 1.0
 
 
 func _transform_aabb(xform: Transform3D, aabb: AABB) -> AABB:
