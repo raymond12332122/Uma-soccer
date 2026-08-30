@@ -23,6 +23,7 @@ func _ready() -> void:
 	await _test_anticipation()
 	await _test_intercept_stands_in_the_lane()
 	await _test_rest_defence_refuses_to_be_pulled()
+	await _test_camera_stays_inside_the_bowl()
 	print("V1_0_AI: ==== %d passed, %d failed ====" % [_passed, _failed])
 	get_tree().quit(1 if _failed > 0 else 0)
 
@@ -297,6 +298,95 @@ func _test_rest_defence_refuses_to_be_pulled() -> void:
 		_check(FormationManager.role_category(p.formation_role) == "DEF",
 			"rest defence is a defender's job, not a forward's")
 	await _teardown(ctx)
+
+
+# ---------------------------------------------------------------------------
+# The camera containment that fixed the visual artifact
+# ---------------------------------------------------------------------------
+
+## Does the SHIPPED follow logic ever leave the bowl?
+##
+## The pose sweep proved the clamp works when it is applied; this proves the
+## follow logic actually applies it, over a real match, with the real ball and
+## the real player switching. It runs HEADLESS on purpose: CameraController
+## works on idle frames, which run without a renderer, so what would have been
+## an hours-long rendered capture is a minute of simulation -- and it becomes a
+## permanent regression test rather than a one-off diagnostic.
+##
+## The second assertion matters as much as the first. A camera that satisfies
+## its limits by refusing to follow the ball is not a fix, so this also checks
+## the ball stays within a sane distance of the camera's focus.
+func _test_camera_stays_inside_the_bowl() -> void:
+	var main: Node3D = MainScene.instantiate()
+	add_child(main)
+	for i in range(60):
+		await get_tree().physics_frame
+
+	var rig: Node3D = main.get_node("CameraRig")
+	var cam: Camera3D = rig.get_node("Camera3D")
+	var ball: RigidBody3D = main.ball
+
+	# The camera follows lerp(controlled player, ball, 0.28), so it only
+	# approaches the limits when the PLAYER does. Headless, the controlled
+	# player receives no input and stands still: a first version of this test
+	# measured the camera reaching x 17.38 while the ball reached 28.84, so the
+	# clamp never bit and the assertion passed without testing anything.
+	#
+	# So the controlled player is driven to each byline in turn, which is
+	# exactly what a human does and exactly when the artifact appeared.
+	var human: FootballPlayer = main.player_controller.controlled_player
+	main.player_controller.set_physics_process(false)
+
+	var min_x := INF
+	var max_x := -INF
+	var min_z := INF
+	var worst_ball_gap := 0.0
+	var ball_reach_x := 0.0
+	var human_reach_x := 0.0
+	var frames: int = 45 * 60
+	for i in range(frames):
+		# Quarter of the run at each extreme, so both bylines and the far
+		# touchline are visited.
+		var phase: int = (i * 4) / frames
+		match phase:
+			0: human.move_input = Vector2(1.0, 0.0)
+			1: human.move_input = Vector2(-1.0, 0.0)
+			2: human.move_input = Vector2(1.0, -0.6)
+			_: human.move_input = Vector2(-1.0, -0.6)
+		human.sprint_requested = true
+		await get_tree().physics_frame
+		var p: Vector3 = cam.global_position
+		min_x = minf(min_x, p.x)
+		max_x = maxf(max_x, p.x)
+		min_z = minf(min_z, p.z)
+		human_reach_x = maxf(human_reach_x, absf(human.global_position.x))
+		ball_reach_x = maxf(ball_reach_x, absf(ball.global_position.x))
+		worst_ball_gap = maxf(worst_ball_gap,
+			Vector2(ball.global_position.x - p.x, ball.global_position.z - p.z).length())
+
+	var limit: float = CameraController.CAMERA_X_LIMIT
+	var zlimit: float = CameraController.CAMERA_Z_FORWARD_LIMIT
+	print("V1_0_AI: [camera] reached x %.2f..%.2f, z min %.2f over 45 s" % [
+		min_x, max_x, min_z])
+	print("V1_0_AI: [camera] limits |x| <= %.2f, z >= %.2f; player reached |x| = %.2f, ball |x| = %.2f" % [
+		limit, zlimit, human_reach_x, ball_reach_x])
+	# The clamp only bites near the ends, so the FOLLOW TARGET has to actually
+	# get there or the containment assertion means nothing. This guard is what
+	# caught the first version of this test passing vacuously.
+	_check(human_reach_x > limit + 1.0,
+		"the controlled player genuinely ran past the camera limit (|x| %.2f > %.2f)" % [
+			human_reach_x, limit])
+	_check(max_x <= limit + 0.01 and min_x >= -limit - 0.01,
+		"...and the shipped follow logic still never left the bowl along the goal axis")
+	_check(min_z >= zlimit - 0.01,
+		"...nor pushed into the stand it is facing (z min %.2f)" % min_z)
+	_check(worst_ball_gap < 40.0,
+		"...while the ball stayed in a sane relationship to the camera (worst %.1f m)" % worst_ball_gap)
+
+	main.get_parent().remove_child(main)
+	main.queue_free()
+	for i in range(3):
+		await get_tree().physics_frame
 
 
 func _distance_to_segment(p: Vector3, a: Vector3, b: Vector3) -> float:
