@@ -78,7 +78,8 @@ static func _build() -> void:
 			continue
 		loaded.append(clip)
 
-	for clip in [AnimationSet.IDLE_CLIP, AnimationSet.IDLE_CLIP_KEEPER]:
+	for clip in [AnimationSet.IDLE_CLIP, AnimationSet.IDLE_CLIP_KEEPER,
+			AnimationSet.IDLE_CLIP_KEEPER_ALT]:
 		var a: Animation = _load_clip(clip)
 		if a == null:
 			missing.append(clip)
@@ -90,27 +91,35 @@ static func _build() -> void:
 			continue
 		loaded.append(clip)
 
-	# --- actions: cropped to the window that is actually played, once each ---
+	# --- actions: cropped to the window that is actually played ---
+	#
+	# Keyed by INTENT AND VARIANT, not by clip: several intents legitimately
+	# offer more than one clip for variety, and two intents can share one
+	# source file cut differently -- 'pass' and 'shoot' are both the penalty
+	# kick, with a shorter and a longer follow-through.
 	var action_keys: Array = []
-	for table in [AnimationSet.ACTIONS, AnimationSet.KEEPER_ACTIONS]:
-		for intent in table:
-			var entry: Dictionary = table[intent]
-			var a: Animation = _load_clip(entry["clip"])
+	for intent in AnimationSet.INTENTS:
+		var entry: Dictionary = AnimationSet.INTENTS[intent]
+		var options: Array = entry["clips"]
+		for i in range(options.size()):
+			var opt: Dictionary = options[i]
+			var a: Animation = _load_clip(opt["clip"])
 			if a == null:
-				missing.append(entry["clip"])
+				missing.append(opt["clip"])
 				continue
 			_flatten_ground_translation(a)
-			var start: float = entry["start"]
+			var start: float = opt["start"]
 			if start == AnimationSet.WIND_UP:
 				start = 0.0
-			_crop(a, start, entry["tail"])
+			_crop(a, start, opt["tail"])
 			a.loop_mode = Animation.LOOP_NONE
-			if lib.add_animation(intent, a) != OK:
-				missing.append(intent + " (rejected)")
+			var key: String = AnimationSet.variant_key(intent, i)
+			if lib.add_animation(key, a) != OK:
+				missing.append(key + " (rejected)")
 				continue
-			action_keys.append(intent)
-			if not (entry["clip"] in loaded):
-				loaded.append(entry["clip"])
+			action_keys.append(key)
+			if not (opt["clip"] in loaded):
+				loaded.append(opt["clip"])
 
 	_library = lib
 	_report = {

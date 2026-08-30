@@ -599,6 +599,11 @@ var gk_intent: int = 0
 ## per frame. Visual bookkeeping only.
 var _last_gk_intent: int = -1
 
+## How far away the ball has to be before a keeper with nothing to do starts
+## organising the defence rather than standing. Comfortably outside the
+## penalty area, so it never competes with a real threat.
+const GK_ORGANISE_DISTANCE := 22.0
+
 ## v0.9.1.1: the FULL carrier decision, every time one is made.
 ##
 ## Diagnostic and test surface only; nothing in the simulation reads it. The
@@ -610,6 +615,43 @@ var _last_gk_intent: int = -1
 ## defenders_near, keeper_dist, pressure, opportunity, options (an Array of
 ## {action, utility, reason}), chosen, chosen_reason.
 signal decision_made(info: Dictionary)
+
+## v0.9.2.1: a committed slide tackle finished, with what it actually did.
+##
+##   outcome / outcome_name  SlideTackle.Outcome
+##   target                  the carrier it was aimed at
+##   played_ball             did the leg reach the ball
+##   hit_player              was there significant body contact
+##
+## The outcome is decided by measured geometry in SlideTackle, never by which
+## animation played.
+signal slide_resolved(info: Dictionary)
+
+## v0.9.2.1: this player was fouled and is going down. The foul FOUNDATION
+## (brief section 8): the event is emitted and logged, and a full referee,
+## free-kick and card system is deliberately not built here.
+signal fouled(info: Dictionary)
+
+# --- committed slide tackle state (see SlideTackle) ---
+var is_sliding: bool = false
+var slide_time: float = 0.0
+var slide_direction: Vector3 = Vector3.ZERO
+var slide_target: FootballPlayer = null
+var slide_played_ball: bool = false
+var slide_hit_player: bool = false
+var slide_cooldown: float = 0.0
+## Time still spent on the floor after a slide, before input resumes.
+var slide_recovery: float = 0.0
+## Time still spent knocked over after being fouled.
+var stumble_time: float = 0.0
+## Diagnostic only -- the last outcome this player's slide produced.
+var last_slide_outcome: int = SlideTackle.Outcome.NONE
+## Speed the slide is committing along slide_direction, bled off by drag.
+##
+## Read by SlideTackle instead of `velocity`, because move_and_slide
+## overwrites velocity with what the body ACHIEVED -- which is near zero on
+## the frame two capsules collide, exactly when a challenge is hardest.
+var slide_speed: float = 0.0
 
 ## The last decision record, kept so a scenario test can inspect it without
 ## connecting a signal.
@@ -732,6 +774,7 @@ func _connect_animation_events() -> void:
 		return
 	ball_touched.connect(_on_touch_animate)
 	challenge_started.connect(_on_challenge_animate)
+	possession_changed.connect(_on_possession_animate)
 
 
 ## ONE gameplay contact produces ONE animation request (brief section 8).
@@ -743,16 +786,62 @@ func _connect_animation_events() -> void:
 ## person running and start looking like a person repeatedly kneeing the air.
 ## The run cycle already contains a foot cycle. TURN and STOP are real,
 ## distinct and comparatively rare events, and do get their own clip.
+## Ball height at contact that reads as a header rather than a foot strike,
+## and the band below it that reads as a volley. Measured against the 1.6m
+## character height the whole game is calibrated around.
+const HEADER_CONTACT_HEIGHT := 1.15
+const VOLLEY_CONTACT_HEIGHT := 0.55
+
+
 func _on_touch_animate(info: Dictionary) -> void:
+	var height: float = (info.get("point", global_position) as Vector3).y
+	var pace: float = Vector2(velocity.x, velocity.z).length()
 	match int(info.get("kind", -1)):
 		TouchKind.PASS:
-			animation_controller.play_action("pass")
+			animation_controller.play_action(
+				"distribute_pass" if is_goalkeeper else _strike_intent(height, pace, false))
 		TouchKind.SHOT:
-			animation_controller.play_action("shoot")
+			# A keeper with the ball clears it; update_goalkeeper routes that
+			# through execute_shot, so this is the keeper's distribution.
+			animation_controller.play_action(
+				"distribute_kick" if is_goalkeeper else _strike_intent(height, pace, true))
 		TouchKind.STOP:
-			animation_controller.play_action("trap")
+			if not is_goalkeeper:
+				animation_controller.play_action("trap")
 		TouchKind.TURN:
-			animation_controller.play_action("touch")
+			if not is_goalkeeper:
+				animation_controller.play_action("touch")
+
+
+## Which strike the contact was, from where the ball actually was and how fast
+## the player was going -- not from which button produced it. A ball at head
+## height is headed whether it was meant as a pass or a shot.
+func _strike_intent(height: float, pace: float, is_shot: bool) -> String:
+	if height >= HEADER_CONTACT_HEIGHT:
+		return "header"
+	if is_shot and height >= VOLLEY_CONTACT_HEIGHT:
+		return "shoot_volley"
+	if is_shot and pace > base_speed * 0.7:
+		return "shoot_running"
+	return "shoot" if is_shot else "pass"
+
+
+## Gaining the ball is worth showing: an outfield player brings a moving ball
+## under control, a keeper gathers it.
+func _on_possession_animate(info: Dictionary) -> void:
+	if str(info.get("kind", "")) != "gained":
+		return
+	if is_goalkeeper:
+		# Off the ground is a catch; along the ground is a scoop.
+		var ball: RigidBody3D = _known_ball
+		var high: bool = ball != null and ball.global_position.y > VOLLEY_CONTACT_HEIGHT
+		animation_controller.play_action("catch" if high else "scoop")
+		return
+	# Only worth a settle animation if the ball actually arrived at pace; a
+	# ball already at your feet does not need receiving.
+	var ball_ref: RigidBody3D = _known_ball
+	if ball_ref != null and _relative_ball_speed(ball_ref) > CONTROLLED_BALL_SPEED * 0.5:
+		animation_controller.play_action("receive")
 
 
 ## A challenge is the one outfield action with real lead time: BallContest
@@ -892,6 +981,13 @@ func set_controlled_visual(is_controlled: bool) -> void:
 ## gated, and never measured the acquisition frame itself.
 func notify_possession_won_from_opponent() -> void:
 	if animation_controller == null:
+		return
+	# v0.9.2.1: a keeper who takes the ball off an opponent has already
+	# played a catch or a scoop from possession_changed, and "tackle" is an
+	# OUTFIELD intent -- asking for it here was the one real role leak the
+	# live-match check found, which is exactly the class of mistake the role
+	# gate exists to catch rather than to hide.
+	if is_goalkeeper:
 		return
 	# A notably competitive/aggressive character reacts more visibly to
 	# winning the ball than a plain "tackle" animation implies.
@@ -1065,6 +1161,19 @@ func _physics_process(delta: float) -> void:
 	var sprint_bonus: float = (sprint_speed - base_speed) * lerp(0.4, 1.0, stamina_ratio)
 	var target_speed: float = (base_speed + sprint_bonus) if sprinting else base_speed
 	var effective_acceleration: float = acceleration * lerp(0.7, 1.0, stamina_ratio)
+
+	# v0.9.2.1: a committed slide, and being knocked over, both take the body
+	# away from input for a moment. Handled here rather than by zeroing
+	# move_input elsewhere so there is ONE place that decides what the body
+	# is doing, and so a slide keeps carrying its momentum instead of
+	# stopping dead. Commitment is the point (brief section 10): a tackler
+	# who can still steer mid-slide cannot be beaten by a change of
+	# direction, and then dribbling past a defender is impossible.
+	if is_sliding or slide_recovery > 0.0 or stumble_time > 0.0:
+		_drive_committed_body(delta)
+		return
+
+
 	var direction := Vector3.ZERO if movement_locked else Vector3(move_input.x, 0.0, move_input.y)
 
 	if direction.length() > 0.01:
@@ -1271,6 +1380,7 @@ func _update_keeper_animation() -> void:
 		return
 	if gk_intent == _last_gk_intent:
 		return
+	var previous: int = _last_gk_intent
 	_last_gk_intent = gk_intent
 	match gk_intent:
 		AIController.GKIntent.SAVE:
@@ -1280,6 +1390,136 @@ func _update_keeper_animation() -> void:
 				"save_right" if _ball_is_to_the_right() else "save_left")
 		AIController.GKIntent.BLOCK:
 			animation_controller.play_action("block")
+		AIController.GKIntent.CLOSE_ANGLE:
+			# Shuffling across to narrow the angle, not a committed dive.
+			animation_controller.play_action(
+				"sidestep_right" if _ball_is_to_the_right() else "sidestep_left")
+		AIController.GKIntent.RECOVER:
+			animation_controller.play_action("place_ball")
+		AIController.GKIntent.POSITION:
+			# Coming off a committed save without the ball means it went past:
+			# that is the keeper being beaten, and it has its own clip.
+			if previous == AIController.GKIntent.SAVE and not has_possession:
+				animation_controller.play_action("gk_miss")
+			elif _ball_is_far_upfield():
+				# Play is nowhere near: organise the defence. This is the
+				# keeper's most common state by far and it used to be a
+				# static idle.
+				animation_controller.play_action("gk_organise")
+		_:
+			# ATTACK_LOOSE_BALL is running, which locomotion already covers.
+			pass
+
+
+## Is play far enough away that the keeper has nothing to react to?
+func _ball_is_far_upfield() -> bool:
+	var ball: RigidBody3D = _known_ball
+	if ball == null:
+		return true
+	return global_position.distance_to(ball.global_position) > GK_ORGANISE_DISTANCE
+
+
+## Move the body while it is not taking input: mid-slide, recovering from one,
+## or knocked over.
+##
+## Momentum is preserved and bled off rather than cancelled -- a slide that
+## stopped dead would be a pose, not a slide, and the carrier could not run
+## past a committed defender. Gravity and move_and_slide still run, so the
+## body stays on the floor and keeps colliding with everyone normally.
+func _drive_committed_body(delta: float) -> void:
+	if is_sliding:
+		slide_speed = maxf(0.0, slide_speed - SlideTackle.SLIDE_DRAG * delta)
+		velocity.x = slide_direction.x * slide_speed
+		velocity.z = slide_direction.z * slide_speed
+	else:
+		# Down, or picking yourself up: no self-propulsion at all.
+		#
+		# The timers are counted down HERE, by the player itself, rather than
+		# by SlideTackle.update. A knocked-over player must get back up
+		# because time passed, not because some other system happened to be
+		# running that frame -- section 9 is explicit that no reaction may
+		# permanently freeze a player, and a timer owned by someone else is
+		# exactly how that happens.
+		var was_down: bool = stumble_time > 0.0 or slide_recovery > 0.0
+		stumble_time = maxf(0.0, stumble_time - delta)
+		slide_recovery = maxf(0.0, slide_recovery - delta)
+		velocity.x = move_toward(velocity.x, 0.0, deceleration * 2.0 * delta)
+		velocity.z = move_toward(velocity.z, 0.0, deceleration * 2.0 * delta)
+		# The moment the last timer runs out, get up. Fired here so the
+		# recovery clip plays exactly once, on the frame control returns,
+		# rather than every frame the player happens to be down.
+		if was_down and stumble_time <= 0.0 and slide_recovery <= 0.0 and animation_controller:
+			animation_controller.play_action("get_up")
+
+	if is_on_floor():
+		velocity.y = 0.0
+	else:
+		velocity.y -= gravity * delta
+	move_and_slide()
+	_update_animation_state()
+
+
+## Commit to a slide tackle at `target`. The direction is locked in HERE and
+## never revisited, which is what gives the carrier something to beat.
+func begin_slide(target: FootballPlayer) -> void:
+	if is_sliding:
+		return
+	var to_target: Vector3 = target.global_position - global_position
+	to_target.y = 0.0
+	if to_target.length() < 0.01:
+		return
+	# Aim at where the carrier is GOING, not where they are: a slide that
+	# aims at the current position always arrives behind a moving player.
+	var lead: Vector3 = to_target + Vector3(target.velocity.x, 0.0, target.velocity.z) * 0.18
+	is_sliding = true
+	slide_direction = lead.normalized()
+	slide_target = target
+	slide_time = 0.0
+	slide_played_ball = false
+	slide_hit_player = false
+	slide_speed = SlideTackle.SLIDE_SPEED
+	_facing_angle = atan2(slide_direction.x, slide_direction.z)
+	model.rotation.y = _facing_angle
+	challenge_started.emit({
+		"kind": "slide",
+		"target": target,
+		"position": global_position,
+		"direction": slide_direction,
+		"strength": 1.0,
+	})
+	if animation_controller:
+		animation_controller.play_action("challenge_slide")
+
+
+## Knocked over. Temporary by construction: `stumble_time` counts down and
+## nothing else can extend it, so a fouled player always gets back up
+## (brief section 9 -- no reaction may permanently freeze control or AI).
+func begin_stumble(duration: float) -> void:
+	stumble_time = maxf(stumble_time, duration)
+	move_input = Vector2.ZERO
+	sprint_requested = false
+	if animation_controller:
+		animation_controller.play_action("tripped")
+	fouled.emit({
+		"position": global_position,
+		"duration": duration,
+	})
+
+
+## Called by SlideTackle when a committed slide produces its outcome.
+func notify_slide_resolved(outcome: int, target: FootballPlayer) -> void:
+	last_slide_outcome = outcome
+	slide_target = null
+	if outcome == SlideTackle.Outcome.CLEAN:
+		notify_contest_won()
+	slide_resolved.emit({
+		"outcome": outcome,
+		"outcome_name": SlideTackle.outcome_name(outcome),
+		"target": target,
+		"position": global_position,
+		"played_ball": slide_played_ball,
+		"hit_player": slide_hit_player,
+	})
 
 
 ## Sign of the ball's offset across the keeper's facing direction.

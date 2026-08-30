@@ -151,6 +151,18 @@ func _physics_process(delta: float) -> void:
 		possessing_team = -1
 		is_loose = true
 
+	# v0.9.2.1: committed slides advance and resolve on their own measured
+	# geometry, independently of the progress-based challenge above. Run
+	# unconditionally -- outside the "there is a carrier" branch -- because a
+	# slide already in flight has to finish, and the slide/stumble timers have
+	# to keep counting down, whether or not anyone currently has the ball.
+	# A player left mid-slide because possession changed would never stand up.
+	if SlideTackle.update(_tracked_players, _ball, delta) > 0:
+		if current_carrier != null and current_carrier.stumble_time > 0.0:
+			current_carrier = null
+			possessing_team = -1
+			is_loose = true
+
 	time_since_last_team_change += delta
 	_update_phase(current_carrier)
 	_update_team_possession(current_carrier, delta)

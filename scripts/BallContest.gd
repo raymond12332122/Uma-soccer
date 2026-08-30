@@ -171,6 +171,7 @@ const POKE_REACH := 2.00
 ## lands the tackle, without a stalled challenge accumulating indefinitely.
 const PROGRESS_OVERFILL := 1.25
 
+
 ## ...and you cannot poke a ball that is behind you. Dot of the challenger's
 ## own heading against the direction to the ball; slightly negative so a
 ## defender turning onto it still counts, but one running away does not.
@@ -248,9 +249,27 @@ static func resolve(carrier: FootballPlayer, players: Array, ball: RigidBody3D, 
 			p.challenge_progress = maxf(0.0, p.challenge_progress - CHALLENGE_DECAY_RATE * delta)
 			continue
 
+		if p.is_sliding or p.slide_recovery > 0.0 or p.stumble_time > 0.0:
+			# A committed slide is resolved by SlideTackle on its own
+			# geometry. Letting it also build ordinary challenge progress
+			# would give one action two separate chances at the ball.
+			p.challenge_progress = maxf(0.0, p.challenge_progress - CHALLENGE_DECAY_RATE * delta)
+			continue
+
 		var rate: float = challenge_rate(p, carrier, ball)
 		if rate <= 0.0:
 			p.challenge_progress = maxf(0.0, p.challenge_progress - CHALLENGE_DECAY_RATE * delta)
+			continue
+
+		# v0.9.2.1: commit to a SLIDE when pressing is not going to be enough.
+		# A defender who has been working at a challenge, is carrying real
+		# speed at the carrier, and still cannot get a foot to the ball is
+		# exactly the situation a slide tackle exists for. Deliberately not
+		# "slide at random": the condition IS the reason, and the outcome is
+		# then decided by geometry rather than by having slid.
+		if not within_poke_envelope(p, ball) and SlideTackle.can_commit(p, carrier):
+			p.begin_slide(carrier)
+			p.challenge_progress = 0.0
 			continue
 
 		# v0.9.1: the frame a challenge BEGINS -- progress crossing up from

@@ -49,9 +49,12 @@ func _test_library() -> void:
 		"library builds and is not empty")
 	_check(report.get("clips_missing", ["?"]).is_empty(),
 		"no clip failed to load or was rejected: %s" % [report.get("clips_missing")])
-	# Nine locomotion/idle entries plus one per action intent.
-	var want: int = AnimationSet.LOCOMOTION.size() + 2 \
-		+ AnimationSet.ACTIONS.size() + AnimationSet.KEEPER_ACTIONS.size()
+	# Locomotion and idles, plus one entry per intent VARIANT: several
+	# intents offer more than one clip for variety, so the count is over
+	# variants and not over intents.
+	var want: int = AnimationSet.LOCOMOTION.size() + 3
+	for intent in AnimationSet.INTENTS:
+		want += AnimationSet.INTENTS[intent]["clips"].size()
 	_check(lib.get_animation_list().size() == want,
 		"library holds every mapped entry (%d of %d)" % [lib.get_animation_list().size(), want])
 	# Section 20: this is paid once for all 22 players, so it needs to stay
@@ -68,9 +71,9 @@ func _test_clip_names_resolve() -> void:
 	for clip in AnimationSet.all_mapped_clips():
 		if not ResourceLoader.exists("%s/%s.fbx" % [SOURCE_DIR, clip]):
 			bad.append(clip)
-	for clip in AnimationSet.UNUSED:
+	for clip in AnimationSet.DEFERRED:
 		if not ResourceLoader.exists("%s/%s.fbx" % [SOURCE_DIR, clip]):
-			bad.append(clip + " (unused)")
+			bad.append(clip + " (deferred)")
 	_check(bad.is_empty(), "every clip named in AnimationSet exists: %s" % [bad])
 
 
@@ -90,16 +93,16 @@ func _test_every_pack_clip_classified() -> void:
 			if not d.current_is_dir() and n.to_lower().ends_with(".fbx"):
 				count += 1
 				var clip: String = n.substr(0, n.length() - 4)
-				if not (clip in mapped) and not AnimationSet.UNUSED.has(clip):
+				if not (clip in mapped) and not AnimationSet.DEFERRED.has(clip):
 					unclassified.append(clip)
 			n = d.get_next()
 		d.list_dir_end()
 	_check(count > 0, "pack is present (%d clips)" % count)
 	_check(unclassified.is_empty(),
-		"every pack clip is either mapped or documented as unused: %s" % [unclassified])
-	_check(mapped.size() + AnimationSet.UNUSED.size() == count,
-		"mapped (%d) + unused (%d) accounts for all %d" % [
-			mapped.size(), AnimationSet.UNUSED.size(), count])
+		"every pack clip is either mapped or documented as deferred: %s" % [unclassified])
+	_check(mapped.size() + AnimationSet.DEFERRED.size() == count,
+		"mapped (%d) + deferred (%d) accounts for all %d" % [
+			mapped.size(), AnimationSet.DEFERRED.size(), count])
 
 
 ## Section 3. The pack's jog carries the hips 2.15m per cycle. If that
@@ -137,19 +140,21 @@ func _test_no_ground_translation() -> void:
 func _test_actions_cropped() -> void:
 	var lib: AnimationLibrary = AnimationLibraryCache.get_library()
 	var bad: Array = []
-	for table in [AnimationSet.ACTIONS, AnimationSet.KEEPER_ACTIONS]:
-		for intent in table:
-			if not lib.has_animation(intent):
-				bad.append(intent + " missing")
+	for intent in AnimationSet.INTENTS:
+		var options: Array = AnimationSet.INTENTS[intent]["clips"]
+		for i in range(options.size()):
+			var key: String = AnimationSet.variant_key(intent, i)
+			if not lib.has_animation(key):
+				bad.append(key + " missing")
 				continue
-			var anim: Animation = lib.get_animation(intent)
-			var want: float = table[intent]["tail"]
+			var anim: Animation = lib.get_animation(key)
+			var want: float = options[i]["tail"]
 			if anim.length > want + 0.02:
-				bad.append("%s is %.2fs, table says %.2fs" % [intent, anim.length, want])
+				bad.append("%s is %.2fs, table says %.2fs" % [key, anim.length, want])
 			if anim.length < 0.10:
-				bad.append("%s cropped to %.2fs, nothing to see" % [intent, anim.length])
+				bad.append("%s cropped to %.2fs, nothing to see" % [key, anim.length])
 			if anim.loop_mode != Animation.LOOP_NONE:
-				bad.append(intent + " loops")
+				bad.append(key + " loops")
 	_check(bad.is_empty(), "every action is cropped to its declared window: %s" % [bad])
 
 
@@ -229,8 +234,8 @@ func _test_in_match() -> void:
 		# delta, and a headless run's process frames are far shorter than
 		# 1/60s -- counting frames here waited about a fiftieth of the clip
 		# and then reported that the animation had failed to end.
-		var tail: float = AnimationSet.ACTIONS["pass"]["tail"] \
-			+ AnimationSet.ACTIONS["pass"]["fade_out"] + 0.40
+		var tail: float = AnimationSet.INTENTS["pass"]["clips"][0]["tail"] \
+			+ AnimationSet.INTENTS["pass"]["fade_out"] + 0.40
 		await get_tree().create_timer(tail).timeout
 		_check(not tree.get("parameters/Shot/active"),
 			"and lets go of the body once the clip ends")
@@ -238,6 +243,11 @@ func _test_in_match() -> void:
 	# Every OTHER intent a live match can reach, asserted by name. Without
 	# this the report's ACTIVE count would be a claim about which code paths
 	# exist rather than about which ones resolve to a real clip.
+	# Velocity is zeroed first because v0.9.2.1 picks the strike from what the
+	# player is DOING: a shot taken at pace resolves to 'shoot_running'. That
+	# is the intended behaviour, but it makes the probe depend on whatever the
+	# match happened to be doing, which is a flaky test rather than a feature.
+	subject.velocity = Vector3.ZERO
 	for probe in [
 		[FootballPlayer.TouchKind.STOP, "trap"],
 		[FootballPlayer.TouchKind.SHOT, "shoot"],
@@ -251,6 +261,18 @@ func _test_in_match() -> void:
 		})
 		_check(ac.actions_fired == before + 1 and ac.last_action == probe[1],
 			"a %s contact resolves to '%s' (got '%s')" % [probe[0], probe[1], ac.last_action])
+
+	# ...and the same contact taken at pace is a different strike.
+	subject.velocity = subject.facing_direction() * (subject.base_speed + 1.0)
+	before = ac.actions_fired
+	subject.ball_touched.emit({
+		"kind": FootballPlayer.TouchKind.SHOT, "point": subject.global_position,
+		"direction": Vector3.FORWARD, "strength": 15.0, "distance": 0.4,
+		"player_velocity": subject.velocity, "foot": "right",
+	})
+	_check(ac.actions_fired == before + 1 and ac.last_action == "shoot_running",
+		"a shot taken at pace is a running strike ('%s')" % ac.last_action)
+	subject.velocity = Vector3.ZERO
 
 	# A challenge picks its clip from how fast the challenger is going.
 	subject.velocity = Vector3.ZERO
@@ -328,9 +350,13 @@ func _test_in_match() -> void:
 			keeper._update_keeper_animation()
 		_check(kac.actions_fired == n1,
 			"holding SAVE does not restart the dive every frame (%d extra)" % (kac.actions_fired - n1))
+		# v0.9.2.1: coming off a committed SAVE without the ball means the
+		# keeper was beaten, and that now has its own clip rather than
+		# silently returning to idle.
 		keeper.gk_intent = AIController.GKIntent.POSITION
 		keeper._update_keeper_animation()
-		_check(kac.actions_fired == n1, "returning to POSITION plays no clip of its own")
+		_check(kac.actions_fired == n1 + 1 and kac.last_action == "gk_miss",
+			"a keeper beaten after committing to a save shows it ('%s')" % kac.last_action)
 
 	main.queue_free()
 	await get_tree().physics_frame

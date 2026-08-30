@@ -66,6 +66,10 @@ var _uses_real_model: bool = false
 ## True once the AnimationTree is built and driving a real skeleton.
 var _animated: bool = false
 var _is_keeper: bool = false
+## Which half of the clip database this player may draw from.
+var _role: int = AnimationSet.Role.OUTFIELD
+## Rotates the clip picked for intents that offer more than one.
+var _variant_turn: int = 0
 ## Ground speed this character's gait covers at 1x playback, in m/s. Measured
 ## per rig (see AnimationSet); the roster mean until a visual is assigned.
 var _natural_speed: float = AnimationSet.RENDERED_NATURAL_SPEED
@@ -84,11 +88,33 @@ var last_measured_height: float = 0.0
 ## for the current real-model visual (see _setup_real_model).
 var t_pose_fixed: bool = false
 
+## How far past the skeleton's rest extent the render bounds are grown, as a
+## fraction of the rig's height. A dive throws a keeper's arm well clear of
+## anything in the rest pose, and hair, skirts and tails are not mapped bones.
+const BOUNDS_MARGIN := 0.30
+
+## Diagnostic only (read by tests) -- the bounds handed to the renderer for
+## the current visual, in skeleton-local units. See _fix_render_bounds().
+var last_render_bounds := AABB()
+
+## Test-only lever: skip the render-bounds correction, restoring the v0.9.2
+## behaviour. It exists so the artifact fix can be demonstrated as a
+## controlled A/B on the same seeded match rather than by comparing two
+## screenshots from different runs. Never set in shipped code.
+static var force_legacy_bounds := false
+
 ## Diagnostic only -- how many action clips this controller has fired, and
 ## the last intent it resolved. The v0.9.2 tests assert one contact produces
 ## exactly one of these.
 var actions_fired: int = 0
 var last_action: String = ""
+
+## Diagnostic only -- how many intents were refused because they belong to the
+## other role, and the last one. In a correct build these stay at zero; the
+## v0.9.2.1 suite asserts it, so a role leak fails a test instead of showing
+## up as a striker diving.
+var refusals: int = 0
+var last_refusal: String = ""
 
 ## Relaxed-hang target direction for the upper arm bone, in skeleton-local
 ## space (Y-up, confirmed empirically for every currently-integrated
@@ -132,7 +158,13 @@ func is_animated() -> bool:
 
 
 ## Goalkeepers idle differently and have their own action vocabulary.
+##
+## This is the ONE place a player's animation role is decided, and it is
+## decided from the gameplay role rather than from anything the animation
+## layer knows. Everything else -- which clips are selectable, which idle
+## loops, which intents are refused -- follows from it.
 func set_keeper(is_keeper: bool) -> void:
+	_role = AnimationSet.Role.GOALKEEPER if is_keeper else AnimationSet.Role.OUTFIELD
 	if _is_keeper == is_keeper:
 		return
 	_is_keeper = is_keeper
@@ -173,12 +205,31 @@ func set_state(state: String) -> void:
 
 ## One-shot gameplay intent. `action` is a semantic name from AnimationSet --
 ## "pass", "shoot", "challenge", "save_left" -- never a clip.
+##
+## ROLE IS ENFORCED HERE, and it is a refusal rather than a fallback. An
+## outfield player asking for "save_left" plays nothing at all and the refusal
+## is counted, because the alternative -- quietly substituting a procedural
+## pulse -- would hide the bug that human QA reported instead of preventing
+## it. A striker must not dive, and if some future call site asks one to, the
+## refusal counter says so out loud.
 func play_action(action: String) -> void:
-	var intent: String = AnimationSet.REACTIONS.get(action, action)
+	var intent: String = AnimationSet.ALIASES.get(action, action)
+	if AnimationSet.INTENTS.has(intent) and not AnimationSet.allowed(intent, _role):
+		refusals += 1
+		last_refusal = intent
+		push_warning("AnimationController: '%s' is not available to this role" % intent)
+		return
+
 	if _animated and _action_node != null:
-		var entry: Dictionary = AnimationSet.action(intent)
+		var entry: Dictionary = AnimationSet.resolve(intent, _role)
 		if not entry.is_empty():
-			_action_node.animation = intent
+			var options: int = entry["clips"].size()
+			# Rotate through the variants so repeated events do not look
+			# identical. Per controller, so two players side by side are not
+			# in lockstep either.
+			var pick: int = _variant_turn % options if options > 0 else 0
+			_variant_turn += 1
+			_action_node.animation = AnimationSet.variant_key(intent, pick)
 			var shot := _tree.tree_root.get_node("Shot") as AnimationNodeOneShot
 			shot.fadein_time = entry["fade_in"]
 			shot.fadeout_time = entry["fade_out"]
@@ -186,6 +237,10 @@ func play_action(action: String) -> void:
 			actions_fired += 1
 			last_action = intent
 			return
+
+	# No clip for this intent (or no library at all): the procedural pulse
+	# still gives the player something to see. Reactions like "celebration"
+	# live here permanently -- the pack has nothing for them.
 	_pulse_kind = action
 	_pulse_time = 0.0
 	actions_fired += 1
@@ -358,6 +413,8 @@ func _setup_real_model(scene: PackedScene) -> void:
 		instance.rotate_y(deg_to_rad(yaw))
 
 	var skeleton: Skeleton3D = _find_skeleton(instance)
+	if skeleton != null:
+		_fix_render_bounds(skeleton)
 	if skeleton != null and _build_tree(skeleton):
 		_animated = true
 		return
@@ -369,6 +426,48 @@ func _setup_real_model(scene: PackedScene) -> void:
 	if skeleton:
 		_fix_tpose_arms(skeleton)
 		t_pose_fixed = true
+
+
+## Tell the renderer how big this character actually is.
+##
+## THE v0.9.2 VISUAL ARTIFACT. Every character was reporting a ~190 metre
+## bounding volume to the renderer, and the black shapes sweeping across the
+## pitch were the directional light's shadow being fitted around them.
+##
+## A skinned mesh's vertices reach their final position through the SKIN:
+## world = bone_global_pose * bind_pose * vertex. On these rigs the mesh
+## resources are authored around 21 units tall and the bind pose carries a
+## 0.01 scale that brings them back to metres. But an AABB is never skinned.
+## Godot bounds a MeshInstance3D by mesh.get_aabb() through the node
+## transform, which does not include the bind pose -- so the bounds come out
+## 100x too large, and the height-normalisation scale (7.38x here) multiplies
+## that again.
+##
+## It only became visible in v0.9.2 because retargeting's apply_node_transforms
+## rebaked the meshes into that 21-unit space; before it they were already in
+## metres and the accidental agreement held.
+##
+## The fix is to state the real bounds rather than to hide anything: the
+## skeleton's own rest extent, grown generously so a dive or an outstretched
+## leg still falls inside it. Bounds that are too small pop geometry in and
+## out at the screen edge, so the margin is deliberate.
+func _fix_render_bounds(skeleton: Skeleton3D) -> void:
+	if force_legacy_bounds:
+		return
+	var count: int = skeleton.get_bone_count()
+	if count == 0:
+		return
+	var bounds := AABB(skeleton.get_bone_global_rest(0).origin, Vector3.ZERO)
+	for b in range(count):
+		bounds = bounds.expand(skeleton.get_bone_global_rest(b).origin)
+	# Room for limbs thrown out well past the rest pose (a keeper's dive is
+	# the extreme) plus hair, skirts and tails, which are not bones we map.
+	bounds = bounds.grow(maxf(bounds.size.y, 0.01) * BOUNDS_MARGIN)
+	for child in skeleton.get_children():
+		var mi := child as MeshInstance3D
+		if mi != null:
+			mi.custom_aabb = bounds
+	last_render_bounds = bounds
 
 
 ## Build this player's AnimationTree over the shared clip library.
