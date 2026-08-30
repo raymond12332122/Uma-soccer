@@ -317,6 +317,14 @@ const SUPPORT_WIDE_TOUCHLINE := 0.85  ## fraction of half-width to hold
 const RUN_BEHIND_DEPTH := 3.0         ## metres beyond the opponents' last line
 const RUN_BEHIND_MAX_AHEAD := 16.0    ## never further ahead of the ball than a ball can travel
 const MARK_GOALSIDE := 2.0
+## How far an interceptor commits from its shape position onto the lane it is
+## cutting. Not 1.0: an interceptor is still part of the block, and one that
+## abandons its position entirely has traded one hole for another.
+const INTERCEPT_COMMITMENT := 0.75
+## How far up the pitch a REST_DEFENCE player may ever be, measured from its
+## own goal along the forward axis. This is the line they hold; the entire
+## content of the duty is refusing to be pulled past it.
+const REST_DEFENCE_MAX_DEPTH := 20.0
 ## How far BEHIND play a supporting shape-holder sits while our team is
 ## attacking. Keeps them level with the move without arriving inside the
 ## carrier's own space -- support, not a crowd.
@@ -775,6 +783,40 @@ static func _duty_target(
 			var spot: Vector3 = opponent.global_position + _safe_normalize(goalward) * MARK_GOALSIDE
 			spot.y = shape.y
 			return shape.lerp(spot, 0.7)
+
+		TeamPlan.Duty.INTERCEPT:
+			# Stand IN the pass. The point was chosen at team level (see
+			# TeamPlan._fill_intercept) so the lane does not change identity
+			# between being picked and being walked to.
+			#
+			# Blended toward shape rather than taken raw: an interceptor is
+			# still a member of the defensive block, and one who abandons
+			# their position entirely to stand in a lane has traded one hole
+			# for another.
+			var lane_point = plan.intercept_points.get(player.get_instance_id())
+			if lane_point == null:
+				return _cover_space_target(shape, ball_pos, own_goal_pos, plan, category)
+			var cut: Vector3 = lane_point
+			cut.y = shape.y
+			var held: Vector3 = shape.lerp(cut, INTERCEPT_COMMITMENT)
+			var clamped_cut: Vector3 = FormationManager.clamp_to_playable(held)
+			clamped_cut.y = shape.y
+			return clamped_cut
+
+		TeamPlan.Duty.REST_DEFENCE:
+			# Hold the line and DO NOT engage. The whole content of this duty
+			# is refusing to be pulled forward, so its target deliberately
+			# ignores the ball's lateral position and tracks only the depth of
+			# the line -- which is what stops a back four from being walked up
+			# the pitch one player at a time.
+			var line: Vector3 = _cover_space_target(shape, ball_pos, own_goal_pos, plan, category)
+			var fwd_sign: float = signf(fwd.x)
+			# Never further forward than our own last line plus a small step:
+			# the rest defence IS the last line.
+			var cap: float = own_goal_pos.x + fwd_sign * REST_DEFENCE_MAX_DEPTH
+			if (line.x - cap) * fwd_sign > 0.0:
+				line.x = cap
+			return line
 
 	return _cover_space_target(shape, ball_pos, own_goal_pos, plan, category)
 

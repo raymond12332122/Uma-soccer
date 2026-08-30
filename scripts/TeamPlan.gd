@@ -51,7 +51,57 @@ enum Duty {
 	FOLLOW_UP,      ## just played the ball -- stay in the move you started
 	PUSH_UP,        ## off the ball: advance into space, offer a lane
 	RECEIVE,        ## a pass is on its way to me -- go and meet it
+	## ---- AI 2.0; appended so previously stored duty ints keep their meaning
+	INTERCEPT,      ## stand in the pass they want to play, not next to the ball
+	REST_DEFENCE,   ## deliberately does NOT engage: holds the line behind everything
 }
+
+
+## ---- Defending as a unit rather than as ten ball-chasers ----
+##
+## CONTEST, PRESS_SUPPORT, MARK and COVER_SPACE already gave the side a
+## presser, a second man, man-markers and a shape. Two things a defending side
+## does were missing, and both are things a player does INSTEAD of going near
+## the ball -- which is exactly the behaviour QA describes as absent.
+##
+##   INTERCEPT     occupy the lane the carrier wants to play, so the pass is
+##                 not on. It is a midfielder's job and it is the most visible
+##                 single piece of "the midfield is participating".
+##   REST_DEFENCE  the deepest players stay deep ON PURPOSE. Without it the
+##                 whole back line is eligible to be pulled forward by any
+##                 duty that scores on proximity, which is what makes a
+##                 defence look like it is chasing.
+##
+## Both are capped hard. A side with four players standing in lanes has nobody
+## pressing, which is a different kind of bad football.
+const MAX_INTERCEPT := 2
+const MAX_REST_DEFENCE := 2
+## Test-only lever: allocate neither of the two new defensive duties, restoring
+## the pre-AI-2.0 defensive shape. It exists so their effect can be measured as
+## a paired A/B on the same build rather than argued from a single run of a
+## noisy live-match statistic. Always true in normal play.
+static var unit_defending_enabled := true
+## An interceptor only exists while the opposition genuinely has the ball --
+## there is no lane to cut on a ball nobody controls. Deliberately loose: the
+## block already only runs when we do NOT have the ball, so this only has to
+## exclude the moments we are still committed to attacking.
+const INTERCEPT_MIN_INTENT := 0.25
+## What a lane in open midfield is worth relative to the same lane into our own
+## box. Not zero: cutting a pass out before it becomes dangerous is the whole
+## job. See the measured correction in _fill_intercept.
+const DANGER_FLOOR := 0.40
+## How far along a candidate lane the interceptor stands, as a fraction.
+## Nearer the receiver than the passer: standing on the carrier's toes is
+## pressing, not intercepting.
+const INTERCEPT_LANE_FRACTION := 0.62
+## A lane is only worth cutting if it actually threatens us.
+const INTERCEPT_MIN_THREAT := 0.18
+## Below this the ball is not going anywhere and there is no line to cut; it is
+## a loose ball for CONTEST to go and win.
+const TRAVELLING_MIN_SPEED := 3.0
+## How near the ball's projected arrival an opponent has to be before we treat
+## the ball as running TO them rather than merely rolling.
+const TRAVELLING_RECEIVER_RADIUS := 6.0
 
 ## How fast attack_intent slews between fully-defending and fully-attacking.
 ## This is the single most important anti-oscillation mechanism in v0.8.3
@@ -221,6 +271,17 @@ var opponent_last_line_x: float = 0.0
 
 var duties: Dictionary = {}       ## instance_id -> Duty
 var mark_targets: Dictionary = {} ## instance_id -> FootballPlayer being marked
+## instance_id -> world point an INTERCEPT player is cutting off. Stored rather
+## than recomputed in the movement layer so the lane a player is standing in
+## does not change identity between the frame it was chosen and the frame it
+## is walked to.
+var intercept_points: Dictionary = {}
+
+## The shared read of the pitch this plan is reasoning from, rebuilt once per
+## team per frame by TeamController. Everything below that asks a football
+## question -- how pressured, how open, which lane, where is the ball going --
+## asks it here rather than working out its own answer.
+var perception: FootballPerception = null
 
 var _own_goal: Vector3 = Vector3.ZERO
 var _opponent_goal: Vector3 = Vector3.ZERO
@@ -316,6 +377,7 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 	var previous_marks: Dictionary = mark_targets
 	duties = {}
 	mark_targets = {}
+	intercept_points = {}
 
 	var available: Array = []
 	for p in players:
@@ -349,6 +411,21 @@ func update(players: Array, opponents: Array, ball: RigidBody3D, possession: Pos
 			if supporter != null:
 				_assign(supporter, Duty.PRESS_SUPPORT)
 				available.erase(supporter)
+
+		# 2c. Cut the pass, and hold the line.
+		#
+		# Allocated here, before the shape slots, because both are jobs a
+		# player takes INSTEAD of joining the shape -- and both have to be
+		# taken by somebody the shape would otherwise have sent toward the
+		# ball. Gated on the slewed intent like every other defensive slot so
+		# they migrate in and out rather than appearing on one frame.
+		# Deliberately NOT gated on there being a carrier: _fill_intercept
+		# handles both a carrier's pass lane and a ball already travelling, and
+		# the second case is the common one (measured: an opponent is carrying
+		# on 5.8% of team-frames).
+		if unit_defending_enabled and attack_intent < INTERCEPT_MIN_INTENT:
+			_fill_intercept(available, opponents, previous)
+			_fill_rest_defence(available, previous)
 
 	# 3/4. Attacking and defensive slots, allocated CONTINUOUSLY.
 	#
@@ -749,6 +826,186 @@ func _fill(available: Array, duty: int, count: int, previous: Dictionary, ball: 
 			return
 		_assign(best, duty)
 		available.erase(best)
+
+
+## Put somebody in the pass the carrier wants to play.
+##
+## The lane worth cutting is not "the nearest opponent" -- it is the one whose
+## receiver would hurt us most, weighted by whether the ball can actually get
+## there. Both halves matter: a dangerous receiver behind three defenders is
+## not a threat, and a wide-open receiver going nowhere is not either.
+##
+## The interceptor stands ON the lane rather than next to the receiver, which
+## is the difference between intercepting and marking, and is why this is a
+## separate duty from MARK.
+func _fill_intercept(available: Array, opponents: Array, previous: Dictionary) -> void:
+	if perception == null:
+		return
+	# MEASURED (tests/diag_intercept_gate.gd, 5400 team-frames): requiring a
+	# settled opposition carrier collapses this duty to nothing. We do not have
+	# the ball on 87.9% of frames, attack intent allows an interceptor on 45.0%
+	# -- but an opponent is actually CARRYING on only 5.8%. The ball in this
+	# game is loose far more often than it is held, so a duty that only exists
+	# during build-up play exists 0.1% of the time, which is what the first
+	# version measured.
+	#
+	# A ball travelling toward an opponent is the same football problem: there
+	# is a line the ball is going down, and standing in it is the job. So the
+	# lane is the carrier's best pass when there is a carrier, and the ball's
+	# own projected path when there is not.
+	if carrier == null or not is_instance_valid(carrier):
+		_fill_intercept_travelling(available, opponents, previous)
+		return
+	var from: Vector3 = carrier.global_position
+	var lanes: Array = []
+	for o in opponents:
+		if o == null or not is_instance_valid(o) or o == carrier or o.is_goalkeeper:
+			continue
+		var to: Vector3 = o.global_position
+		# How much would this pass advance THEM? Their attack runs against our
+		# forward axis, so progression(receiver, carrier) is their gain.
+		var gain: float = perception.progression(to, from)
+		if gain <= 0.0:
+			continue  # a backward pass for them is not a threat worth a body
+		# MEASURED CORRECTION. The first version of this multiplied straight by
+		# danger_at(receiver), which is zero beyond 22 m from our goal -- so a
+		# lane only counted once the opposition were already in our third, and
+		# the duty was allocated on 0.0% of sampled frames across a 75-second
+		# match. A pass that is not yet dangerous is exactly the pass a midfield
+		# is supposed to cut out.
+		#
+		# Progression is therefore the primary term and danger is a multiplier
+		# with a floor: a ten-metre forward pass through the middle of the pitch
+		# is worth standing in, and the same pass into our box is worth more.
+		var advance: float = clampf(gain / 15.0, 0.0, 1.0)
+		var danger: float = lerpf(DANGER_FLOOR, 1.0, perception.danger_at(to))
+		var threat: float = advance * danger
+		# Only lanes the ball could actually travel down are worth standing in.
+		threat *= perception.lane_quality(from, to)
+		if threat < INTERCEPT_MIN_THREAT:
+			continue
+		lanes.append({"threat": threat, "point":
+			from.lerp(to, INTERCEPT_LANE_FRACTION), "receiver": o})
+	if lanes.is_empty():
+		return
+	lanes.sort_custom(func(a, b): return a["threat"] > b["threat"])
+
+	var taken := 0
+	for lane in lanes:
+		if taken >= MAX_INTERCEPT or available.is_empty():
+			return
+		var point: Vector3 = lane["point"]
+		var best: FootballPlayer = null
+		var best_score := -INF
+		for p in available:
+			var cat: String = FormationManager.role_category(p.formation_role)
+			# Whoever can actually get into the lane, preferring midfielders --
+			# this is their job, and it is the participation QA cannot see.
+			var score: float = -p.global_position.distance_to(point)
+			if cat == "MID":
+				score += 4.0
+			elif cat == "DEF":
+				score += 1.0
+			else:
+				score -= 3.0  # a forward standing in a midfield lane is not defending
+			score += (p.personality.discipline - 50.0) * 0.02
+			if previous.get(p.get_instance_id(), -1) == Duty.INTERCEPT:
+				score += DUTY_RETENTION_BONUS
+			if score > best_score:
+				best_score = score
+				best = p
+		if best == null:
+			return
+		_assign(best, Duty.INTERCEPT)
+		intercept_points[best.get_instance_id()] = point
+		available.erase(best)
+		taken += 1
+
+
+## A ball already travelling toward an opponent.
+##
+## The CONTEST duty sends exactly one player AT the ball. This is deliberately
+## a different job: get in FRONT of where the ball is going, on its line,
+## between it and the opponent it is running to. One player chasing and one
+## player cutting the line off is a defensive unit; two players chasing the
+## same ball is the swarm this milestone is trying to remove.
+##
+## Capped at one, because the second body is worth more holding shape.
+func _fill_intercept_travelling(available: Array, opponents: Array, previous: Dictionary) -> void:
+	if available.is_empty():
+		return
+	var ball_dir := Vector3(perception.ball_vel.x, 0.0, perception.ball_vel.z)
+	if ball_dir.length() < TRAVELLING_MIN_SPEED:
+		return
+	# Who is the ball actually running to? The opponent nearest to where it
+	# will be, not the one nearest to where it is.
+	var arrival: Vector3 = perception.ball_future
+	var receiver: FootballPlayer = null
+	var best_gap := INF
+	for o in opponents:
+		if o == null or not is_instance_valid(o) or o.is_goalkeeper:
+			continue
+		var gap: float = o.global_position.distance_to(arrival)
+		if gap < best_gap:
+			best_gap = gap
+			receiver = o
+	if receiver == null or best_gap > TRAVELLING_RECEIVER_RADIUS:
+		return
+	# The point to stand on: short of the arrival, on the ball's own line.
+	var from := Vector3(perception.ball_pos.x, 0.0, perception.ball_pos.z)
+	var point: Vector3 = from.lerp(arrival, INTERCEPT_LANE_FRACTION)
+	point.y = receiver.global_position.y
+
+	var best: FootballPlayer = null
+	var best_score := -INF
+	for p in available:
+		var cat: String = FormationManager.role_category(p.formation_role)
+		var score: float = -p.global_position.distance_to(point)
+		if cat == "MID":
+			score += 3.0
+		elif cat == "DEF":
+			score += 1.5
+		else:
+			score -= 3.0
+		if previous.get(p.get_instance_id(), -1) == Duty.INTERCEPT:
+			score += DUTY_RETENTION_BONUS
+		if score > best_score:
+			best_score = score
+			best = p
+	if best == null:
+		return
+	_assign(best, Duty.INTERCEPT)
+	intercept_points[best.get_instance_id()] = point
+	available.erase(best)
+
+
+## Keep the deepest players deep.
+##
+## This duty's entire content is "do not go to the ball". A back line that is
+## always eligible for a proximity-scored duty gets dragged up the pitch one
+## player at a time, and the space it leaves is where goals come from. Somebody
+## has to be told to stay, and it has to be a real assignment rather than a
+## bias, or the next duty with a better score simply takes them.
+func _fill_rest_defence(available: Array, previous: Dictionary) -> void:
+	if MAX_REST_DEFENCE <= 0 or available.is_empty():
+		return
+	var fwd: float = signf(_forward_axis.x)
+	var candidates: Array = []
+	for p in available:
+		if FormationManager.role_category(p.formation_role) != "DEF":
+			continue
+		candidates.append(p)
+	if candidates.is_empty():
+		return
+	# Deepest first: the ones already holding the line are the ones to keep
+	# there, which also means this assignment barely moves anybody.
+	candidates.sort_custom(func(a, b):
+		return a.global_position.x * fwd < b.global_position.x * fwd)
+	var want: int = mini(MAX_REST_DEFENCE, maxi(1, candidates.size() / 2))
+	for i in range(mini(want, candidates.size())):
+		var p: FootballPlayer = candidates[i]
+		_assign(p, Duty.REST_DEFENCE)
+		available.erase(p)
 
 
 func _assign_markers(available: Array, opponents: Array, previous: Dictionary, previous_marks: Dictionary, max_markers: int = MAX_MARKERS) -> void:

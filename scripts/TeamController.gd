@@ -86,6 +86,21 @@ func _physics_process(delta: float) -> void:
 	# player level acting on a decision that was already made for the side
 	# as a whole, which is the structural difference between a team and 11
 	# agents that each happen to be looking at the same ball.
+	# The shared read of the pitch, built ONCE for the whole side and then used
+	# by the plan, by every duty target and by the carrier's decision.
+	#
+	# This is the structural half of "the bots do not understand football":
+	# pressure, space, lane quality and where the ball is going were each being
+	# worked out independently at several call sites with different radii and
+	# different weights, so two parts of the same team could disagree about
+	# whether a lane was open. One snapshot, one answer.
+	#
+	# Cost is O(players * opponents) once per team per frame, not per player per
+	# frame -- see FootballPerception.build.
+	plan.perception = FootballPerception.new(
+		team_id, players, opponent_team.players, ball, possession,
+		own_goal_pos, opponent_goal_pos)
+
 	plan.update(players, opponent_team.players, ball, possession, delta)
 
 	var ball_challenger: FootballPlayer = plan._contester
