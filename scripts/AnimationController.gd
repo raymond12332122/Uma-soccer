@@ -103,6 +103,40 @@ var last_render_bounds := AABB()
 ## screenshots from different runs. Never set in shipped code.
 static var force_legacy_bounds := false
 
+## v0.9.2.2 development-only animation trace (brief section 5).
+##
+## Off by default and never enabled in a shipped build. When on, every
+## selection is recorded with the role that asked, what was requested, what it
+## resolved to and why -- which is what turns "outfield players are using
+## wrong animations" from a description into something that can be traced to a
+## line of code. Metadata tests proved the role table is sound; this proves
+## what actually gets SELECTED while a match runs.
+static var debug_trace := false
+static var trace: Array = []
+const TRACE_LIMIT := 4000
+
+
+static func clear_trace() -> void:
+	trace.clear()
+
+
+static func _record(who: String, role: int, requested: String, resolved: String,
+		category: String, outcome: String) -> void:
+	if trace.size() >= TRACE_LIMIT:
+		return
+	trace.append({
+		"who": who,
+		"role": Role_name(role),
+		"requested": requested,
+		"resolved": resolved,
+		"category": category,
+		"outcome": outcome,
+	})
+
+
+static func Role_name(role: int) -> String:
+	return AnimationSet.Role.keys()[role] if role >= 0 and role < AnimationSet.Role.size() else "?"
+
 ## Diagnostic only -- how many action clips this controller has fired, and
 ## the last intent it resolved. The v0.9.2 tests assert one contact produces
 ## exactly one of these.
@@ -217,6 +251,8 @@ func play_action(action: String) -> void:
 	if AnimationSet.INTENTS.has(intent) and not AnimationSet.allowed(intent, _role):
 		refusals += 1
 		last_refusal = intent
+		if debug_trace:
+			_record(name, _role, action, intent, _category_of(intent), "REFUSED (wrong role)")
 		push_warning("AnimationController: '%s' is not available to this role" % intent)
 		return
 
@@ -236,6 +272,9 @@ func play_action(action: String) -> void:
 			_tree.set("parameters/Shot/request", AnimationNodeOneShot.ONE_SHOT_REQUEST_FIRE)
 			actions_fired += 1
 			last_action = intent
+			if debug_trace:
+				_record(name, _role, action, intent, _category_of(intent),
+					"played %s" % entry["clips"][pick]["clip"])
 			return
 
 	# No clip for this intent (or no library at all): the procedural pulse
@@ -245,6 +284,15 @@ func play_action(action: String) -> void:
 	_pulse_time = 0.0
 	actions_fired += 1
 	last_action = action
+	if debug_trace:
+		_record(name, _role, action, intent, _category_of(intent), "procedural pulse")
+
+
+## Category name for an intent, for the trace.
+func _category_of(intent: String) -> String:
+	if not AnimationSet.INTENTS.has(intent):
+		return "-"
+	return AnimationSet.Category.keys()[AnimationSet.INTENTS[intent]["category"]]
 
 
 func _process(delta: float) -> void:

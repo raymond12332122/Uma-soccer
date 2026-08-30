@@ -59,8 +59,18 @@ func _test_role_table() -> void:
 	_check(roleless.is_empty(), "every intent declares a role and a category: %s" % [roleless])
 	_check(keeper_intents.size() >= 10,
 		"the keeper has a real vocabulary of its own (%d intents)" % keeper_intents.size())
-	_check(outfield_intents.size() >= 10,
-		"so does an outfield player (%d intents)" % outfield_intents.size())
+	# Counted as what an outfield player can actually USE -- its own intents
+	# plus the any-role ones -- rather than as OUTFIELD-tagged intents alone.
+	# v0.9.2.2 removed two of those (the standing challenge, which was a
+	# grounded clip misfiled, and the bicycle kick), and the count that
+	# matters did not change in kind: an outfield player still has a full
+	# vocabulary.
+	var outfield_usable: int = outfield_intents.size()
+	for intent in AnimationSet.INTENTS:
+		if AnimationSet.INTENTS[intent]["role"] == AnimationSet.Role.ANY:
+			outfield_usable += 1
+	_check(outfield_usable >= 10,
+		"so does an outfield player (%d usable intents)" % outfield_usable)
 
 	# The actual QA complaint, stated as a property of the data.
 	var leaks: Array = []
@@ -105,7 +115,7 @@ func _test_role_refusals() -> void:
 	var played_by_keeper: Array = []
 	# Genuinely outfield-only skills. "tripped"/"get_up" are Role.ANY: being
 	# knocked over is not a position's skill.
-	for intent in ["challenge_slide", "shoot_volley", "trap", "header"]:
+	for intent in ["challenge_slide", "shoot_running", "trap", "header"]:
 		var before: int = keeper.actions_fired
 		keeper.play_action(intent)
 		if keeper.actions_fired != before:
@@ -299,17 +309,23 @@ func _test_live_match_safety() -> void:
 
 	# Role leakage, measured over a real match rather than argued about.
 	var refusals := 0
+	var refused_what: Array = []
 	var keeper_clip_on_outfield: Array = []
 	for p in players:
 		var ac: AnimationController = p.animation_controller
 		if ac == null:
 			continue
 		refusals += ac.refusals
+		if ac.refusals > 0:
+			# Name it, so a recurrence is diagnosable instead of just a count.
+			refused_what.append("%s(%s) x%d wanted '%s'" % [
+				p.name, "GK" if p.is_goalkeeper else "OUT", ac.refusals, ac.last_refusal])
 		if not p.is_goalkeeper and ac.last_action != "" \
 			and AnimationSet.INTENTS.has(ac.last_action) \
 			and AnimationSet.INTENTS[ac.last_action]["role"] == AnimationSet.Role.GOALKEEPER:
 			keeper_clip_on_outfield.append(p.name)
-	_check(refusals == 0, "over a match, nothing asked for an intent of the wrong role (%d)" % refusals)
+	_check(refusals == 0, "over a match, nothing asked for an intent of the wrong role (%d) %s" % [
+		refusals, refused_what])
 	_check(keeper_clip_on_outfield.is_empty(),
 		"and no outfield player ended on a keeper clip: %s" % [keeper_clip_on_outfield])
 

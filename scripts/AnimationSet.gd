@@ -175,11 +175,6 @@ const INTENTS := {
 		"fade_in": 0.07, "fade_out": 0.25,
 		"clips": [{"clip": "strike foward jog", "start": 0.44, "tail": 0.86}],
 	},
-	"shoot_volley": {
-		"role": Role.OUTFIELD, "category": Category.SHOT,
-		"fade_in": 0.10, "fade_out": 0.30,
-		"clips": [{"clip": "scissor kick", "start": 0.75, "tail": 1.00}],
-	},
 	"header": {
 		"role": Role.OUTFIELD, "category": Category.HEADER,
 		"fade_in": 0.08, "fade_out": 0.25,
@@ -212,20 +207,33 @@ const INTENTS := {
 	},
 
 	# --- outfield: challenging ---
-	## Challenges are the one outfield action with real lead time: BallContest
-	## emits challenge_started when progress begins building, well before the
-	## outcome is known, so these keep their wind-up.
-	"challenge": {
-		"role": Role.OUTFIELD, "category": Category.TACKLE,
-		"fade_in": 0.10, "fade_out": 0.25,
-		"clips": [{"clip": "soccer tackle (3)", "start": WIND_UP, "tail": 1.20}],
-	},
+	##
+	## ALL THREE tackle clips put the player ON THE FLOOR. Measured by
+	## tests/diag_clip_posture.gd, which samples hips height against the rig's
+	## own standing rest height across the window the game actually plays:
+	##
+	##   soccer tackle       min hips 0.16 of rest   GROUNDED
+	##   soccer tackle (3)   min hips 0.18 of rest   GROUNDED
+	##   soccer tackle (2)   min hips 0.23 of rest   GROUNDED
+	##
+	## v0.9.2 called 'soccer tackle (3)' the STANDING challenge, on the
+	## grounds that it has no root travel while the other two cover 4m. Zero
+	## travel does not mean upright: it is a tackle from a standstill that
+	## still puts the player on the ground. That misclassification is what
+	## human QA saw as outfield players in grounded, keeper-looking poses --
+	## the clip is correctly role-gated and was simply the wrong clip.
+	##
+	## So there is only ONE challenge intent now, and it means a committed
+	## slide. The pack contains no upright standing-tackle clip, so ordinary
+	## pressing plays no full-body clip at all; locomotion already shows a
+	## defender closing in. Same reasoning as dribble knock-ons.
 	"challenge_slide": {
 		"role": Role.OUTFIELD, "category": Category.TACKLE,
 		"fade_in": 0.10, "fade_out": 0.30,
 		"clips": [
 			{"clip": "soccer tackle (2)", "start": WIND_UP, "tail": 1.40},
 			{"clip": "soccer tackle", "start": WIND_UP, "tail": 1.60},
+			{"clip": "soccer tackle (3)", "start": WIND_UP, "tail": 1.20},
 		],
 	},
 
@@ -353,7 +361,8 @@ const IDLE_CLIP_KEEPER_ALT := "goalkeeper idle (2)"
 ## Older names kept working, so a call site that says "tackle" still means a
 ## challenge. Semantic aliases, not clip names.
 const ALIASES := {
-	"tackle": "challenge",
+	"tackle": "challenge_slide",
+	"challenge": "challenge_slide",
 	"slide": "challenge_slide",
 }
 
@@ -372,6 +381,7 @@ const DEFERRED := {
 	"kneeing soccerball": "0.14s after contact; the (2) variant gives 0.51s",
 	"throw in": "no throw-in state exists; the ball is never out of play yet",
 	"transition": "unidentifiable 0.77s clip, no measurable foot event",
+	"scissor kick": "a bicycle kick, hips at 0.14 of rest -- genuinely grounded. Correct for a spectacular overhead volley and wrong for the ordinary airborne-ball shot that was triggering it, which is the same 'inappropriate grounded pose' QA reported. Deferred until there is a gameplay state that means an overhead volley specifically.",
 }
 
 

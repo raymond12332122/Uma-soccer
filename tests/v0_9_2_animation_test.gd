@@ -274,18 +274,18 @@ func _test_in_match() -> void:
 		"a shot taken at pace is a running strike ('%s')" % ac.last_action)
 	subject.velocity = Vector3.ZERO
 
-	# A challenge picks its clip from how fast the challenger is going.
-	subject.velocity = Vector3.ZERO
+	# v0.9.2.2: ordinary pressure must NOT play a tackle clip. All three
+	# tackle clips are grounded (hips at 0.16-0.23 of standing rest), and
+	# firing one on every pressure event is what put outfield players on the
+	# floor for a fifth of the match.
 	before = ac.actions_fired
-	subject.challenge_started.emit({})
-	_check(ac.actions_fired == before + 1 and ac.last_action == "challenge",
-		"a standing challenge plays the standing tackle ('%s')" % ac.last_action)
-	subject.velocity = subject.facing_direction() * (subject.base_speed + 1.0)
+	subject.challenge_started.emit({"kind": "challenge"})
+	_check(ac.actions_fired == before,
+		"ordinary pressure plays no grounded tackle clip")
 	before = ac.actions_fired
-	subject.challenge_started.emit({})
+	subject.challenge_started.emit({"kind": "slide"})
 	_check(ac.actions_fired == before + 1 and ac.last_action == "challenge_slide",
-		"a challenge at speed slides in instead ('%s')" % ac.last_action)
-	subject.velocity = Vector3.ZERO
+		"a committed slide does ('%s')" % ac.last_action)
 
 	# --- locomotion follows the body's real velocity (sections 5, 6) ---
 	if tree != null:

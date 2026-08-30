@@ -787,10 +787,11 @@ func _connect_animation_events() -> void:
 ## The run cycle already contains a foot cycle. TURN and STOP are real,
 ## distinct and comparatively rare events, and do get their own clip.
 ## Ball height at contact that reads as a header rather than a foot strike,
-## and the band below it that reads as a volley. Measured against the 1.6m
-## character height the whole game is calibrated around.
+## measured against the 1.6m character height the game is calibrated around.
 const HEADER_CONTACT_HEIGHT := 1.15
-const VOLLEY_CONTACT_HEIGHT := 0.55
+## Above this the ball is off the ground -- used to tell a keeper's catch from
+## a scoop along the floor.
+const OFF_GROUND_HEIGHT := 0.55
 
 
 func _on_touch_animate(info: Dictionary) -> void:
@@ -819,8 +820,6 @@ func _on_touch_animate(info: Dictionary) -> void:
 func _strike_intent(height: float, pace: float, is_shot: bool) -> String:
 	if height >= HEADER_CONTACT_HEIGHT:
 		return "header"
-	if is_shot and height >= VOLLEY_CONTACT_HEIGHT:
-		return "shoot_volley"
 	if is_shot and pace > base_speed * 0.7:
 		return "shoot_running"
 	return "shoot" if is_shot else "pass"
@@ -834,7 +833,7 @@ func _on_possession_animate(info: Dictionary) -> void:
 	if is_goalkeeper:
 		# Off the ground is a catch; along the ground is a scoop.
 		var ball: RigidBody3D = _known_ball
-		var high: bool = ball != null and ball.global_position.y > VOLLEY_CONTACT_HEIGHT
+		var high: bool = ball != null and ball.global_position.y > OFF_GROUND_HEIGHT
 		animation_controller.play_action("catch" if high else "scoop")
 		return
 	# Only worth a settle animation if the ball actually arrived at pace; a
@@ -844,13 +843,23 @@ func _on_possession_animate(info: Dictionary) -> void:
 		animation_controller.play_action("receive")
 
 
-## A challenge is the one outfield action with real lead time: BallContest
-## emits this when progress starts building, well before the outcome is
-## known, so the tackle clip can play its wind-up honestly.
-func _on_challenge_animate(_info: Dictionary) -> void:
-	var moving: float = Vector2(velocity.x, velocity.z).length()
-	animation_controller.play_action(
-		"challenge_slide" if moving > base_speed * 0.85 else "challenge")
+## Only a COMMITTED SLIDE plays a tackle clip.
+##
+## challenge_started is emitted by BallContest whenever a defender begins
+## accumulating pressure, which happens constantly -- and every one of the
+## pack's three tackle clips puts the player on the floor (hips at 0.16-0.23
+## of standing rest, measured). v0.9.2 played one on every pressure event, so
+## outfield players spent the match dropping to the ground for nothing. Traced
+## in a live match: TACKLE was 21.5% of all animation selections and 12 of 20
+## outfield players spent time grounded, the worst 20% of the match.
+##
+## begin_slide emits the same signal with kind "slide", which is a real
+## commitment with a real cost, and that is the only case that earns a clip.
+## Ordinary pressing shows as running, because that is what it is.
+func _on_challenge_animate(info: Dictionary) -> void:
+	if str(info.get("kind", "")) != "slide":
+		return
+	animation_controller.play_action("challenge_slide")
 
 
 func apply_player_data(data: PlayerData) -> void:
@@ -989,12 +998,10 @@ func notify_possession_won_from_opponent() -> void:
 	# gate exists to catch rather than to hide.
 	if is_goalkeeper:
 		return
-	# A notably competitive/aggressive character reacts more visibly to
-	# winning the ball than a plain "tackle" animation implies.
-	if personality.competitiveness > 75.0 or personality.aggression > 75.0:
-		animation_controller.play_action("excited_reaction")
-	else:
-		animation_controller.play_action("tackle")
+	# v0.9.2.2: NOT "tackle" -- that alias resolves to the slide clips, which
+	# are grounded, and a player who has just won the ball should not drop to
+	# the floor to celebrate it. Both branches are procedural reactions.
+	animation_controller.play_action("excited_reaction")
 
 
 ## Won an actual CHALLENGE -- BallContest resolved a tackle in this player's
