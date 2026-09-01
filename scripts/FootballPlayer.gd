@@ -632,6 +632,10 @@ signal slide_resolved(info: Dictionary)
 ## free-kick and card system is deliberately not built here.
 signal fouled(info: Dictionary)
 
+## A committed goalkeeper dive resolved -- caught, parried or missed. Carries
+## the outcome so presentation can react to what actually happened.
+signal save_resolved(info: Dictionary)
+
 # --- committed slide tackle state (see SlideTackle) ---
 var is_sliding: bool = false
 var slide_time: float = 0.0
@@ -688,6 +692,21 @@ const RISING_FALLBACK := 0.55
 const RISING_MIN_HOLD := 0.10
 ## Diagnostic only -- the last outcome this player's slide produced.
 var last_slide_outcome: int = SlideTackle.Outcome.NONE
+
+## ---- The keeper's committed dive (blocker 2) ----
+##
+## Mirrors the slide: a direction locked in at commit, a reach that is a
+## segment rather than a bubble, and an outcome decided by geometry. See
+## GoalkeeperSave for the measurements that made this necessary.
+var is_diving: bool = false
+var dive_time: float = 0.0
+var dive_direction: Vector3 = Vector3.ZERO
+var save_cooldown: float = 0.0
+var last_save_outcome: int = 0
+## Speed the dive is committing along dive_direction, bled off by drag. Read
+## rather than `velocity` for the same reason slide_speed is: move_and_slide
+## overwrites velocity with what the body ACHIEVED.
+var dive_speed: float = 0.0
 ## Speed the slide is committing along slide_direction, bled off by drag.
 ##
 ## Read by SlideTackle instead of `velocity`, because move_and_slide
@@ -1221,7 +1240,7 @@ func _physics_process(delta: float) -> void:
 	# v1.0: `is_rising` joins them. Getting up is part of the same committed
 	# body -- the phase does not end when the player leaves the floor, it ends
 	# when they are back on their feet. See is_rising.
-	if is_sliding or slide_recovery > 0.0 or stumble_time > 0.0 or is_rising:
+	if is_sliding or is_diving or slide_recovery > 0.0 or stumble_time > 0.0 or is_rising:
 		_drive_committed_body(delta)
 		return
 
@@ -1483,6 +1502,13 @@ func _drive_committed_body(delta: float) -> void:
 		slide_speed = maxf(0.0, slide_speed - SlideTackle.SLIDE_DRAG * delta)
 		velocity.x = slide_direction.x * slide_speed
 		velocity.z = slide_direction.z * slide_speed
+	elif is_diving:
+		# A dive carries its committed momentum and cannot be re-aimed, for
+		# the same reason a slide cannot: a keeper who steers mid-dive cannot
+		# be beaten by a shot into the other corner.
+		dive_speed = move_toward(dive_speed, 0.0, GoalkeeperSave.DIVE_DRAG * delta)
+		velocity.x = dive_direction.x * dive_speed
+		velocity.z = dive_direction.z * dive_speed
 	else:
 		# Down, or picking yourself up: no self-propulsion at all.
 		#
@@ -1589,6 +1615,35 @@ func begin_stumble(duration: float) -> void:
 	})
 
 
+## Commit to a diving save along `direction`.
+##
+## The direction is locked in HERE and never revisited, exactly as a slide's
+## is: a keeper who can re-aim mid-dive cannot be beaten by a shot into the
+## other corner, and then shooting is pointless. The clip is chosen from which
+## way they went, so the animation reports the decision rather than making it.
+func begin_dive(direction: Vector3) -> void:
+	if direction.length() < 0.05:
+		return
+	# A dive already in flight is never re-aimed. Commitment is the whole
+	# reason a keeper can be beaten into the other corner, and without this
+	# guard a caller asking every frame would have a homing dive. The test
+	# that caught this asked for the opposite direction one frame in and got
+	# it. Same rule begin_slide already follows.
+	if is_diving:
+		return
+	is_diving = true
+	dive_time = 0.0
+	dive_speed = GoalkeeperSave.DIVE_SPEED
+	dive_direction = Vector3(direction.x, 0.0, direction.z).normalized()
+	move_input = Vector2.ZERO
+	sprint_requested = false
+	if animation_controller:
+		# Which side did they go? player_right() is the keeper's own right, so
+		# this stays correct whichever way they are facing.
+		var side: float = player_right().dot(dive_direction)
+		animation_controller.play_action("save_right" if side >= 0.0 else "save_left")
+
+
 ## Enter the rising phase: on your feet but not yet in control.
 ##
 ## The clip is fired FIRST and the hold is sized from what that clip actually
@@ -1612,7 +1667,7 @@ func _begin_rising() -> void:
 ## owned by a fall rather than by input. Read by gameplay systems that must not
 ## pick a player who cannot act, and by the recovery tests.
 func is_recovering() -> bool:
-	return stumble_time > 0.0 or slide_recovery > 0.0 or is_rising
+	return stumble_time > 0.0 or slide_recovery > 0.0 or is_rising or is_diving
 
 
 ## Clear every fall/recovery state outright.
@@ -1628,6 +1683,9 @@ func clear_recovery_state() -> void:
 	is_sliding = false
 	slide_time = 0.0
 	slide_target = null
+	is_diving = false
+	dive_time = 0.0
+	save_cooldown = 0.0
 
 
 ## Called by SlideTackle when a committed slide produces its outcome.

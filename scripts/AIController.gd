@@ -1995,6 +1995,24 @@ static func update_goalkeeper(player: FootballPlayer, ball: RigidBody3D, own_goa
 
 	match intent:
 		GKIntent.SAVE, GKIntent.BLOCK:
+			# v1.0: COMMIT TO A DIVE when the ball is genuinely arriving.
+			#
+			# Reading the shot was never the problem. Measured over 150 s
+			# matches (tests/diag_keeper_live.gd), the keeper was ALREADY in
+			# SAVE at every goal conceded, between 0.83 m and 3.10 m from the
+			# ball -- and nothing made their body stop it. Walking toward an
+			# interception point does not save a ball travelling at 13 m/s
+			# when contact needs 0.56 m and you are 0.83 m away.
+			#
+			# The dive is a committed action with a real reach, resolved by
+			# geometry; see GoalkeeperSave. It is tried first and the walk
+			# below remains the fallback, so a keeper who cannot commit still
+			# does the best positional thing.
+			if GoalkeeperSave.can_commit(player, ball, intent):
+				var dir: Vector3 = GoalkeeperSave.dive_direction(player, ball)
+				if dir != Vector3.ZERO:
+					player.begin_dive(dir)
+					return
 			# Go to where the ball WILL be, not where it is. A keeper who
 			# steers at a struck ball's current position is permanently
 			# behind it; the interception point is the whole skill.

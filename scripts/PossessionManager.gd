@@ -163,6 +163,16 @@ func _physics_process(delta: float) -> void:
 			possessing_team = -1
 			is_loose = true
 
+	# v1.0: committed goalkeeper dives resolve on the same unconditional
+	# footing, for the same reason -- a dive already in flight has to finish
+	# and its cooldown has to keep counting whoever has the ball. A save that
+	# lands takes the ball off whoever nominally had it: a caught ball is the
+	# keeper's, a parried one is nobody's.
+	if GoalkeeperSave.update(_tracked_players, _ball, delta) > 0:
+		current_carrier = null
+		possessing_team = -1
+		is_loose = true
+
 	time_since_last_team_change += delta
 	_update_phase(current_carrier)
 	_update_team_possession(current_carrier, delta)
