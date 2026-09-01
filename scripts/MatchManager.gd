@@ -348,6 +348,11 @@ func _reset_all_players() -> void:
 func _reset_player(player: FootballPlayer) -> void:
 	player.global_position = FormationManager.get_world_position(player.formation_slot, player.team_id)
 	player.velocity = Vector3.ZERO
+	# A player who was on the floor when the goal went in lines up for the
+	# restart rather than serving out a knockdown from a passage of play that
+	# no longer exists. The recovery phase is deliberately harder to leave than
+	# the old timer was, so it has to be cleared explicitly here.
+	player.clear_recovery_state()
 	player.reset_intent()
 
 

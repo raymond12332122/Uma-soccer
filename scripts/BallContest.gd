@@ -249,10 +249,15 @@ static func resolve(carrier: FootballPlayer, players: Array, ball: RigidBody3D, 
 			p.challenge_progress = maxf(0.0, p.challenge_progress - CHALLENGE_DECAY_RATE * delta)
 			continue
 
-		if p.is_sliding or p.slide_recovery > 0.0 or p.stumble_time > 0.0:
+		if p.is_sliding or p.is_recovering():
 			# A committed slide is resolved by SlideTackle on its own
 			# geometry. Letting it also build ordinary challenge progress
 			# would give one action two separate chances at the ball.
+			#
+			# v1.0: is_recovering() also covers GETTING UP, which the three
+			# separate flags did not. A player still picking themselves up was
+			# accruing challenge progress toward a tackle they were in no
+			# position to make.
 			p.challenge_progress = maxf(0.0, p.challenge_progress - CHALLENGE_DECAY_RATE * delta)
 			continue
 

@@ -191,6 +191,46 @@ func is_animated() -> bool:
 	return _animated
 
 
+## Is an action clip -- or its procedural stand-in -- still running?
+##
+## Gameplay needs this to make RECOVERY AUTHORITATIVE: a player getting up off
+## the floor must stay under the recovery's control until the recovery has
+## actually finished, and "actually finished" is a property of the animation,
+## not of a timer that was set alongside it. See
+## FootballPlayer._drive_committed_body.
+##
+## Answers for BOTH paths, because a player with no clips must not be treated
+## as permanently mid-action:
+##   real clips     -- the OneShot is still active (so half-speed playback
+##                     extends this correctly, without anyone tracking a rate)
+##   procedural     -- the pulse has not run out
+##   no visual yet  -- false, never true
+func is_action_playing() -> bool:
+	if _animated:
+		if _tree == null:
+			return false
+		return bool(_tree.get("parameters/Shot/active"))
+	return _pulse_time >= 0.0
+
+
+## How long an action is expected to take, in seconds, at normal playback.
+##
+## Used only as a SAFETY CEILING on how long gameplay will wait for
+## is_action_playing() to go false. Nothing about a reaction may freeze a
+## player permanently, so the wait is always bounded even if the OneShot never
+## reports finishing.
+func action_duration(action: String) -> float:
+	var intent: String = AnimationSet.ALIASES.get(action, action)
+	if _animated and AnimationSet.INTENTS.has(intent):
+		var entry: Dictionary = AnimationSet.resolve(intent, _role)
+		if not entry.is_empty():
+			var longest := 0.0
+			for opt in entry["clips"]:
+				longest = maxf(longest, float(opt["tail"]))
+			return longest + float(entry["fade_out"])
+	return float(PULSE_DURATIONS.get(intent, 0.0))
+
+
 ## Goalkeepers idle differently and have their own action vocabulary.
 ##
 ## This is the ONE place a player's animation role is decided, and it is
@@ -571,6 +611,18 @@ func _build_tree(skeleton: Skeleton3D) -> bool:
 	var action := AnimationNodeAnimation.new()
 	blend.add_node("Action", action, Vector2(450, 260))
 
+	# Playback rate for the ACTION branch, at 1.0 by default so this is
+	# behaviourally identical to having no node here at all.
+	#
+	# It exists so the recovery lock can be PROVEN to follow the animation
+	# rather than a timer running beside it. AnimationTree has no speed_scale
+	# in Godot 4, and the existing MoveScale only rates the locomotion branch,
+	# so without this there is no way to run a get-up at half speed and check
+	# that gameplay waits correspondingly longer -- and a claim that cannot be
+	# tested is not a claim.
+	var action_scale := AnimationNodeTimeScale.new()
+	blend.add_node("ActionScale", action_scale, Vector2(560, 260))
+
 	var shot := AnimationNodeOneShot.new()
 	shot.mix_mode = AnimationNodeOneShot.MIX_MODE_BLEND
 	blend.add_node("Shot", shot, Vector2(650, 150))
@@ -578,8 +630,9 @@ func _build_tree(skeleton: Skeleton3D) -> bool:
 	blend.connect_node("MoveScale", 0, "Move")
 	blend.connect_node("Loco", 0, "Idle")
 	blend.connect_node("Loco", 1, "MoveScale")
+	blend.connect_node("ActionScale", 0, "Action")
 	blend.connect_node("Shot", 0, "Loco")
-	blend.connect_node("Shot", 1, "Action")
+	blend.connect_node("Shot", 1, "ActionScale")
 	blend.connect_node("output", 0, "Shot")
 
 	tree.tree_root = blend

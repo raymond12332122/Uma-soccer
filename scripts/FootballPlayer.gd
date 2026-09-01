@@ -644,6 +644,48 @@ var slide_cooldown: float = 0.0
 var slide_recovery: float = 0.0
 ## Time still spent knocked over after being fouled.
 var stumble_time: float = 0.0
+
+## ---- Getting up is a phase, not a moment (blocker 3) ----
+##
+## MEASURED before this existed (tests/diag_recovery_sync.gd), on one
+## knockdown with a human holding the stick:
+##
+##   control returned at frame        77    (STUMBLE_TIME 1.30 s x 60)
+##   the get-up clip finished at      176   (its 1.65 s tail, later)
+##   desync                           99 frames
+##   distance sprinted while rising   9.68 m
+##
+## The old code counted the DOWN timers to zero, handed movement back, and
+## started `get_up` on that same frame -- so the recovery animation played
+## from frame zero while the player was already free to sprint. Ten metres of
+## running while visibly picking yourself up off the floor is the
+## "fall/collision/recovery desynchronisation" QA reported.
+##
+## So recovery is now a second, explicit phase that OWNS the body until it is
+## genuinely finished. Being down and getting up are different states with
+## different lengths, and neither is allowed to be inferred from the other.
+var is_rising: bool = false
+## How long the rising phase has run, and the hard ceiling it may not exceed.
+var rising_time: float = 0.0
+var rising_limit: float = 0.0
+
+## Ceiling multiplier and margin on the recovery hold.
+##
+## The lock follows the ANIMATION (see AnimationController.is_action_playing),
+## which is what makes half-speed playback extend it correctly without anyone
+## tracking a playback rate. But nothing in this game may freeze a player
+## permanently -- a dropped OneShot, a missing clip or a rig with no library
+## must all still get up -- so the wait is bounded. Generous enough that
+## normal and half-speed playback both finish naturally well inside it.
+const RISING_LIMIT_SCALE := 3.0
+const RISING_LIMIT_MARGIN := 0.35
+## Used when there is no animation layer at all to ask. A player with no clips
+## still spends a believable moment getting up rather than snapping upright.
+const RISING_FALLBACK := 0.55
+## Minimum hold before "the clip is not playing" is believed, for an animated
+## player. The tree advances on idle frames and this runs on physics frames, so
+## the OneShot fired on entry has not necessarily reported itself active yet.
+const RISING_MIN_HOLD := 0.10
 ## Diagnostic only -- the last outcome this player's slide produced.
 var last_slide_outcome: int = SlideTackle.Outcome.NONE
 ## Speed the slide is committing along slide_direction, bled off by drag.
@@ -1176,7 +1218,10 @@ func _physics_process(delta: float) -> void:
 	# stopping dead. Commitment is the point (brief section 10): a tackler
 	# who can still steer mid-slide cannot be beaten by a change of
 	# direction, and then dribbling past a defender is impossible.
-	if is_sliding or slide_recovery > 0.0 or stumble_time > 0.0:
+	# v1.0: `is_rising` joins them. Getting up is part of the same committed
+	# body -- the phase does not end when the player leaves the floor, it ends
+	# when they are back on their feet. See is_rising.
+	if is_sliding or slide_recovery > 0.0 or stumble_time > 0.0 or is_rising:
 		_drive_committed_body(delta)
 		return
 
@@ -1452,11 +1497,36 @@ func _drive_committed_body(delta: float) -> void:
 		slide_recovery = maxf(0.0, slide_recovery - delta)
 		velocity.x = move_toward(velocity.x, 0.0, deceleration * 2.0 * delta)
 		velocity.z = move_toward(velocity.z, 0.0, deceleration * 2.0 * delta)
-		# The moment the last timer runs out, get up. Fired here so the
-		# recovery clip plays exactly once, on the frame control returns,
-		# rather than every frame the player happens to be down.
-		if was_down and stumble_time <= 0.0 and slide_recovery <= 0.0 and animation_controller:
-			animation_controller.play_action("get_up")
+
+		if is_rising:
+			# RISING. The body is still owned by the recovery, and the recovery
+			# is owned by the animation: we hold while the clip is genuinely
+			# still playing, which is what makes a half-speed get-up hold for
+			# correspondingly longer without anyone tracking a playback rate.
+			#
+			# Bounded, always. See RISING_LIMIT_SCALE -- a reaction may never
+			# freeze a player permanently, so a clip that never reports
+			# finishing still releases at the ceiling.
+			rising_time += delta
+			var animated: bool = animation_controller != null \
+				and animation_controller.is_animated()
+			var still_playing: bool = animation_controller != null \
+				and animation_controller.is_action_playing()
+			# A floor before "not playing" is believed. The AnimationTree runs
+			# on idle frames while this runs on physics frames, so the OneShot
+			# fired by _begin_rising has not necessarily reported itself active
+			# yet -- and a naive check would read that as "already finished" and
+			# release on the first frame. With no animation layer to ask, the
+			# floor IS the whole hold.
+			var min_hold: float = RISING_MIN_HOLD if animated else RISING_FALLBACK
+			if rising_time >= rising_limit \
+				or (rising_time >= min_hold and not still_playing):
+				is_rising = false
+				rising_time = 0.0
+		elif was_down and stumble_time <= 0.0 and slide_recovery <= 0.0:
+			# The floor phase is over; the getting-up phase begins. Control is
+			# NOT returned here -- that is the whole defect this replaces.
+			_begin_rising()
 
 	if is_on_floor():
 		velocity.y = 0.0
@@ -1503,6 +1573,12 @@ func begin_slide(target: FootballPlayer) -> void:
 ## (brief section 9 -- no reaction may permanently freeze control or AI).
 func begin_stumble(duration: float) -> void:
 	stumble_time = maxf(stumble_time, duration)
+	# Knocked over again while getting up: back on the floor, and the rising
+	# phase starts over from the new knockdown rather than finishing the old
+	# one. Interrupting a recovery has to be possible -- a player caught by a
+	# second challenge mid-rise is ordinary football.
+	is_rising = false
+	rising_time = 0.0
 	move_input = Vector2.ZERO
 	sprint_requested = false
 	if animation_controller:
@@ -1511,6 +1587,47 @@ func begin_stumble(duration: float) -> void:
 		"position": global_position,
 		"duration": duration,
 	})
+
+
+## Enter the rising phase: on your feet but not yet in control.
+##
+## The clip is fired FIRST and the hold is sized from what that clip actually
+## is, so a rig with a real get-up waits for it and a rig with none waits a
+## believable moment instead of snapping upright.
+func _begin_rising() -> void:
+	is_rising = true
+	rising_time = 0.0
+	move_input = Vector2.ZERO
+	sprint_requested = false
+	var expected := RISING_FALLBACK
+	if animation_controller != null:
+		animation_controller.play_action("get_up")
+		var measured: float = animation_controller.action_duration("get_up")
+		if measured > 0.0:
+			expected = measured
+	rising_limit = expected * RISING_LIMIT_SCALE + RISING_LIMIT_MARGIN
+
+
+## True while this player is down or getting back up -- i.e. while the body is
+## owned by a fall rather than by input. Read by gameplay systems that must not
+## pick a player who cannot act, and by the recovery tests.
+func is_recovering() -> bool:
+	return stumble_time > 0.0 or slide_recovery > 0.0 or is_rising
+
+
+## Clear every fall/recovery state outright.
+##
+## For match resets and restarts: a player who was mid-recovery when play was
+## reset must be immediately available, not still serving out a knockdown from
+## a passage of play that no longer exists.
+func clear_recovery_state() -> void:
+	stumble_time = 0.0
+	slide_recovery = 0.0
+	is_rising = false
+	rising_time = 0.0
+	is_sliding = false
+	slide_time = 0.0
+	slide_target = null
 
 
 ## Called by SlideTackle when a committed slide produces its outcome.

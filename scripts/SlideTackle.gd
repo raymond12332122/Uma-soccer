@@ -104,7 +104,9 @@ const SLIDE_COOLDOWN := 1.60
 static func can_commit(tackler: FootballPlayer, carrier: FootballPlayer) -> bool:
 	if tackler == null or carrier == null or not is_instance_valid(carrier):
 		return false
-	if tackler.is_sliding or tackler.slide_cooldown > 0.0 or tackler.stumble_time > 0.0:
+	# is_recovering() rather than stumble_time alone: a player on the floor OR
+	# getting up off it cannot launch a slide.
+	if tackler.is_sliding or tackler.slide_cooldown > 0.0 or tackler.is_recovering():
 		return false
 	if tackler.is_goalkeeper or tackler.team_id == carrier.team_id:
 		return false
